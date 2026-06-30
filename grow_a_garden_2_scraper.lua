@@ -1816,6 +1816,24 @@ function getWeatherCatalogHash(catalog)
     return table.concat(parts, "|")
 end
 
+function getAuctionHash(auction)
+    if type(auction) ~= "table" or type(auction.lots) ~= "table" then return "" end
+    local parts = {}
+    for _, lot in ipairs(auction.lots) do
+        table.insert(parts, table.concat({
+            tostring(lot.lotId or ""),
+            tostring(lot.stockQuantity or lot.stock or ""),
+            tostring(lot.currentPrice or ""),
+            tostring(lot.soldOut == true),
+            tostring(lot.expired == true),
+            tostring(lot.priceUnknown == true),
+            tostring(lot.stockUnknown == true)
+        }, ":"))
+    end
+    table.sort(parts)
+    return table.concat(parts, "|")
+end
+
 function getCatalogImageByName(catalog, name)
     if not catalog or not name then return nil end
     local wantedKey = getPhaseKey(name) or normalizeName(name)
@@ -2241,6 +2259,7 @@ local function callNetworkEndpoint(endpoint, ...)
 
     local methods = { "Fire", "Invoke", "InvokeServer", "FireServer", "Call", "Request", "Send" }
     local lastError = nil
+    local firedWithoutResult = false
     for _, method in ipairs(methods) do
         local okMethod, fn = pcall(function()
             return endpoint[method]
@@ -2249,8 +2268,20 @@ local function callNetworkEndpoint(endpoint, ...)
             local ok, result = pcall(function(...)
                 return fn(endpoint, ...)
             end, ...)
-            if ok then
+            if ok and result ~= nil then
                 return true, result
+            elseif ok then
+                firedWithoutResult = true
+            end
+            lastError = result
+
+            ok, result = pcall(function(...)
+                return fn(...)
+            end, ...)
+            if ok and result ~= nil then
+                return true, result
+            elseif ok then
+                firedWithoutResult = true
             end
             lastError = result
         end
@@ -2265,6 +2296,9 @@ local function callNetworkEndpoint(endpoint, ...)
         end, ...)
     end
 
+    if firedWithoutResult then
+        return true, nil
+    end
     return false, lastError
 end
 
@@ -2476,6 +2510,16 @@ function extractAuctionStockPayload(update, maybeStock)
     local stock = update.stock or update.Stock or update.stocks or update.Stocks
     if type(stock) == "table" then
         return stock, true
+    end
+
+    for _, key in ipairs({ "data", "Data", "payload", "Payload", "result", "Result", "snapshot", "Snapshot" }) do
+        local nested = update[key]
+        if type(nested) == "table" then
+            local nestedStock, nestedReplaceAll = extractAuctionStockPayload(nested)
+            if type(nestedStock) == "table" then
+                return nestedStock, nestedReplaceAll
+            end
+        end
     end
 
     local lotId = update.lotId or update.LotId or update.lotID or update.id or update.Id
@@ -2729,7 +2773,32 @@ function getLotRarity(lot)
     return ""
 end
 
+function unwrapAuctionSnapshotPayload(payload, depth)
+    if type(payload) ~= "table" then return nil end
+    depth = depth or 0
+    if depth > 4 then return payload end
+    if type(getAuctionRawLots(payload)) == "table" or type(payload.stock) == "table" then
+        return payload
+    end
+    local nestedKeys = {
+        "snapshot", "Snapshot",
+        "data", "Data",
+        "payload", "Payload",
+        "result", "Result",
+        "auction", "Auction"
+    }
+    for _, key in ipairs(nestedKeys) do
+        local nested = payload[key]
+        if type(nested) == "table" then
+            local unwrapped = unwrapAuctionSnapshotPayload(nested, depth + 1)
+            if unwrapped then return unwrapped end
+        end
+    end
+    return payload
+end
+
 function applyAuctionSnapshot(snapshot)
+    snapshot = unwrapAuctionSnapshotPayload(snapshot)
     if type(snapshot) ~= "table" then return false end
     local incomingHasLots = type(getAuctionRawLots(snapshot)) == "table"
     if not incomingHasLots and type(snapshot.stock) ~= "table" and not latestAuctionSnapshot then
@@ -2929,6 +2998,62 @@ function getVisibleTextByNames(root, names)
     return nil
 end
 
+function getAuctionTextFrom(root)
+    if not root then return nil end
+    if root:IsA("TextLabel") or root:IsA("TextButton") then
+        local text = root.Text or ""
+        if text ~= "" then return text end
+    end
+    for _, desc in ipairs(root:GetDescendants()) do
+        if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+            local text = desc.Text or ""
+            if text ~= "" then return text end
+        end
+    end
+    return nil
+end
+
+function getAuctionTextAtPath(root, path)
+    local node = root
+    for _, name in ipairs(path) do
+        node = node and node:FindFirstChild(name)
+        if not node then return nil end
+    end
+    return getAuctionTextFrom(node)
+end
+
+function getAuctionTextByNames(root, names)
+    if not root then return nil end
+    local targets = {}
+    for _, name in ipairs(names) do
+        targets[normalizeName(name)] = true
+    end
+    if (root:IsA("TextLabel") or root:IsA("TextButton")) and targets[normalizeName(root.Name)] then
+        local text = root.Text or ""
+        if text ~= "" then return text end
+    end
+    for _, desc in ipairs(root:GetDescendants()) do
+        if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and targets[normalizeName(desc.Name)] then
+            local text = desc.Text or ""
+            if text ~= "" then return text end
+        end
+    end
+    return nil
+end
+
+function getAuctionTextMatching(root, matcher)
+    if not root then return nil end
+    for _, desc in ipairs(root:GetDescendants()) do
+        if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+            local text = desc.Text or ""
+            if text ~= "" and matcher(text, desc) then
+                return text
+            end
+        end
+    end
+    return nil
+end
+
 function hasAncestorNamed(instance, names, stopAt)
     if not instance then return false end
     local targets = {}
@@ -2977,8 +3102,8 @@ function getAuctionGuiCategory(root)
     local normalizedAttr = normalizeAuctionCategory(attr)
     if normalizedAttr then return normalizedAttr end
 
-    local text = getFirstTextByNames(root, { "Category", "Category_Text", "Type", "Type_Text", "ItemType" })
-        or getFirstTextMatching(root, function(value)
+    local text = getAuctionTextByNames(root, { "Category", "Category_Text", "Type", "Type_Text", "ItemType" })
+        or getAuctionTextMatching(root, function(value)
             return AUCTION_CATEGORY_ALIASES[normalizeName(value)] ~= nil
         end)
     return normalizeAuctionCategory(text)
@@ -3021,51 +3146,55 @@ end
 
 function textLooksLikeAuctionMoney(text)
     local raw = tostring(text or "")
-    return string.find(raw, "\194\162") ~= nil
-        or string.find(raw, "?") ~= nil
+    if raw == "" then return false end
+    if string.find(raw, "\194\162", 1, true) ~= nil then return true end
+    local compact = raw:gsub("%s+", "")
+    return compact:match("^[%d%.,]+[kKmMbBtTqQ][a-zA-Z]*$") ~= nil
 end
 
 function getAuctionGuiPriceText(root)
     if not root then return nil end
 
     local buyButton = root:FindFirstChild("BuyButton", true)
-    if buyButton and isInstanceVisible(buyButton) then
-        local text = getVisibleTextAtPath(buyButton, { "Text", "TextLabel" })
-            or getVisibleTextByNames(buyButton, { "Price", "Cost" })
-            or getVisibleTextFrom(buyButton)
+    if buyButton then
+        local text = getAuctionTextAtPath(buyButton, { "Text", "TextLabel" })
+            or getAuctionTextByNames(buyButton, { "Price", "Cost" })
+            or getAuctionTextFrom(buyButton)
         if textLooksLikeAuctionMoney(text) then return text end
     end
 
-    local direct = getVisibleTextByNames(root, { "Price", "Price_Text", "Cost", "Cost_Text" })
+    local direct = getAuctionTextByNames(root, { "Price", "Price_Text", "Cost", "Cost_Text" })
     if textLooksLikeAuctionMoney(direct) then return direct end
 
-    return getFirstTextMatching(root, function(text, desc)
+    return getAuctionTextMatching(root, function(text, desc)
         if not textLooksLikeAuctionMoney(text) then return false end
         if hasAncestorNamed(desc, { "RobuxButton", "DevProduct", "Robux" }, root) then return false end
+        if hasAncestorNamed(desc, { "RefreshIn", "Timer", "Time" }, root) then return false end
         return true
     end)
 end
 
 function getAuctionGuiStockText(root)
-    local stockText = getVisibleTextByNames(root, { "Stock_Text" })
+    local stockText = getAuctionTextByNames(root, { "Stock_Text" })
     if stockText and stockText ~= "" then return stockText end
-    return getVisibleTextByNames(root, { "StockText", "Stock" }) or ""
+    return getAuctionTextByNames(root, { "StockText", "Stock" }) or ""
 end
 
 function getAuctionGuiTimerText(root)
     if not root then return "" end
     local refreshIn = root:FindFirstChild("RefreshIn", true)
-    if refreshIn and isInstanceVisible(refreshIn) then
-        return getVisibleTextAtPath(refreshIn, { "Timer" })
-            or getVisibleTextByNames(refreshIn, { "Timer", "RefreshIn", "Text" })
-            or getVisibleTextFrom(refreshIn)
+    if refreshIn then
+        return getAuctionTextAtPath(refreshIn, { "Timer" })
+            or getAuctionTextByNames(refreshIn, { "Timer", "RefreshIn", "Text" })
+            or getAuctionTextFrom(refreshIn)
             or ""
     end
-    return getVisibleTextByNames(root, { "Timer", "Time", "RefreshIn" }) or ""
+    return getAuctionTextByNames(root, { "Timer", "Time", "RefreshIn" }) or ""
 end
 
 function parseCompactMoney(text)
     local raw = tostring(text or ""):gsub("%s+", "")
+    raw = raw:gsub("\194\162", "")
     local numberText, suffix = raw:match("([%d%.,]+)([%a]*)")
     if not numberText then return 0 end
     suffix = string.lower(suffix or "")
@@ -3093,26 +3222,46 @@ end
 function parseDurationSeconds(text)
     local raw = string.lower(tostring(text or ""))
     local total = 0
-    local hours = tonumber(raw:match("(%d+)%s*h")) or tonumber(raw:match("(%d+)%s*?")) or 0
-    local minutes = tonumber(raw:match("(%d+)%s*m")) or tonumber(raw:match("(%d+)%s*?")) or 0
-    local seconds = tonumber(raw:match("(%d+)%s*s")) or tonumber(raw:match("(%d+)%s*?")) or 0
+    local hours = tonumber(raw:match("(%d+)%s*h")) or 0
+    local minutes = tonumber(raw:match("(%d+)%s*m")) or 0
+    local seconds = tonumber(raw:match("(%d+)%s*s")) or 0
     total = hours * 3600 + minutes * 60 + seconds
     if total <= 0 then
-        local a, b = raw:match("(%d+)%s*:%s*(%d+)")
-        if a and b then
-            total = tonumber(a) * 60 + tonumber(b)
+        local a, b, c = raw:match("(%d+)%s*:%s*(%d+)%s*:%s*(%d+)")
+        if a and b and c then
+            total = tonumber(a) * 3600 + tonumber(b) * 60 + tonumber(c)
+        else
+            a, b = raw:match("(%d+)%s*:%s*(%d+)")
+            if a and b then
+                total = tonumber(a) * 60 + tonumber(b)
+            end
         end
     end
     return total
+end
+
+function parseAuctionStockText(stockText)
+    local raw = tostring(stockText or "")
+    local lowerStock = string.lower(raw)
+    local soldOut = string.find(lowerStock, "sold") ~= nil
+        or string.find(lowerStock, "out") ~= nil
+        or string.find(lowerStock, "expired") ~= nil
+    if soldOut then return 0, true end
+
+    local parsedStock = raw:match("[xX]%s*([%d,%s%.]+)")
+        or raw:match("([%d][%d,%s%.]*)")
+    if not parsedStock then return nil, false end
+
+    local cleaned = parsedStock:gsub("[%s,%.]", "")
+    local value = tonumber(cleaned)
+    if value == nil then return nil, false end
+    return math.max(0, math.floor(value)), false
 end
 
 function getAuctionDataFromGui()
     local auctionGui = PlayerGui and PlayerGui:FindFirstChild("Auction")
     if not auctionGui then return nil end
     local guiDynamicTrusted = true
-    if auctionGui:IsA("ScreenGui") and auctionGui.Enabled == false then
-        guiDynamicTrusted = false
-    end
     local frame = auctionGui:FindFirstChild("Frame", true)
     local scrollingFrame = frame and frame:FindFirstChild("ScrollingFrame", true)
     if not scrollingFrame then return nil end
@@ -3136,7 +3285,7 @@ function getAuctionDataFromGui()
             stockText = guiDynamicTrusted and getAuctionGuiStockText(main) or ""
             timerText = guiDynamicTrusted and getAuctionGuiTimerText(main) or ""
             local nameText = getFirstAttributeByNames(main, { "ItemToolTip", "DisplayName", "ItemName", "Name" })
-                or getFirstTextByNames(main, { "ItemName", "Item_Name", "Name", "Title" })
+                or getAuctionTextByNames(main, { "ItemName", "Item_Name", "Name", "Title" })
                 or card:GetAttribute("ItemToolTip")
                 or card:GetAttribute("DisplayName")
 
@@ -3147,15 +3296,7 @@ function getAuctionDataFromGui()
                     refreshAt = expiresAt
                 end
 
-                local lowerStock = string.lower(stockText)
-                local soldOut = string.find(lowerStock, "sold") ~= nil or string.find(lowerStock, "out") ~= nil
-                local stock = nil
-                local parsedStock = stockText:match("x%s*([%d,]+)") or stockText:match("([%d,]+)")
-                if parsedStock then
-                    stock = tonumber((parsedStock:gsub(",", "")))
-                elseif soldOut then
-                    stock = 0
-                end
+                local stock, soldOut = parseAuctionStockText(stockText)
 
                 local currentPrice = parseCompactMoney(priceText)
                 local cardLotId = normalizeAuctionLotId(card.Name)
@@ -3189,15 +3330,15 @@ function getAuctionDataFromGui()
 
                 if not looksLikeTemplateAuctionRow then
                     local category = getAuctionGuiCategory(main) or "Auction"
-                    local rarity = getVisibleTextAtPath(main, { "Rarity", "Rarity_Text" })
+                    local rarity = getAuctionTextAtPath(main, { "Rarity", "Rarity_Text" })
                         or getFirstAttributeByNames(main, { "ItemToolTipRarity", "Rarity" })
                         or ""
-                    local amountText = getVisibleTextAtPath(main, { "ImageDisplay", "Amount" })
+                    local amountText = getAuctionTextAtPath(main, { "ImageDisplay", "Amount" })
                     local subtitle = amountText
                         or getFirstAttributeByNames(main, { "ItemToolTipSubtitle", "Subtitle", "Amount", "Count" })
                         or ""
-                    local countText = tostring(subtitle):match("x%s*([%d,]+)") or tostring(subtitle):match("([%d,]+)")
-                    local count = countText and tonumber((countText:gsub(",", ""))) or 1
+                    local countText = tostring(subtitle):match("[xX]%s*([%d,%s%.]+)") or tostring(subtitle):match("([%d][%d,%s%.]*)")
+                    local count = countText and tonumber((countText:gsub("[%s,%.]", ""))) or 1
                     local lotName = nameText or tostring(card.Name)
                     local lot = {
                         category = category,
@@ -4485,6 +4626,7 @@ local lastPhase = nil
 local lastWeathersHash = ""
 local lastWeatherCatalogHash = ""
 local lastFruitHash = ""
+local lastAuctionHash = ""
 
 safeTaskSpawn(function()
     while true do
@@ -4496,12 +4638,15 @@ safeTaskSpawn(function()
         local freshFruits = getFruitMultipliers()
         local fh = fruitHash(freshFruits)
         local fruitChanged = (fh ~= lastFruitHash)
+        local auctionHash = getAuctionHash(getAuctionData())
+        local auctionChanged = (auctionHash ~= lastAuctionHash)
 
-        if phase ~= lastPhase or weathersHash ~= lastWeathersHash or weatherCatalogHash ~= lastWeatherCatalogHash or fruitChanged then
+        if phase ~= lastPhase or weathersHash ~= lastWeathersHash or weatherCatalogHash ~= lastWeatherCatalogHash or fruitChanged or auctionChanged then
             lastPhase = phase
             lastWeathersHash = weathersHash
             lastWeatherCatalogHash = weatherCatalogHash
             lastFruitHash = fh
+            lastAuctionHash = auctionHash
             -- Pass the freshly scraped fruit list so updateAPI doesn't re-scrape,
             -- and the data sent to the API is guaranteed current.
             updateAPI(freshFruits)
