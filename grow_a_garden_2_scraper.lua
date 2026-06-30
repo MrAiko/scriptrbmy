@@ -2055,6 +2055,19 @@ function cleanScrapedName(name)
     return str
 end
 
+local function writeDebugLog(msg)
+    pcall(function()
+        local formatted = "[" .. os.date("%H:%M:%S") .. "] " .. tostring(msg)
+        print(formatted)
+        if writefile then
+            local existing = ""
+            pcall(function() existing = readfile("scraper_debug.log") or "" end)
+            writefile("scraper_debug.log", existing .. "\n" .. formatted)
+        end
+    end)
+end
+pcall(function() if writefile then writefile("scraper_debug.log", "--- Scraper Started ---") end end)
+
 function safeRequireModule(moduleScript)
     if not moduleScript then return nil end
     local ok, result = pcall(function()
@@ -2139,12 +2152,14 @@ local function wrapRawRemote(remote)
 end
 
 local function getFallbackNetworking(serviceName)
+    writeDebugLog("getFallbackNetworking called for: " .. tostring(serviceName))
     local remotes = {}
     local ok, err = pcall(function()
         local lowerService = string.lower(serviceName)
         for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
             if desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") then
-                local fullName = string.lower(desc:GetFullName())
+                local rawFullName = desc:GetFullName()
+                local fullName = string.lower(rawFullName)
                 if string.find(fullName, lowerService) then
                     local lname = string.lower(desc.Name)
                     local key = nil
@@ -2165,15 +2180,20 @@ local function getFallbackNetworking(serviceName)
                     end
                     
                     if key then
+                        writeDebugLog("Found fallback remote: " .. rawFullName .. " -> mapped as: " .. key)
                         remotes[key] = wrapRawRemote(desc)
                     end
                 end
             end
         end
     end)
+    if not ok then
+        writeDebugLog("Error in getFallbackNetworking: " .. tostring(err))
+    end
     if next(remotes) ~= nil then
         return remotes
     end
+    writeDebugLog("No fallback remotes found for: " .. tostring(serviceName))
     return nil
 end
 
@@ -2195,7 +2215,10 @@ end
 function getAuctionNetworking()
     local networking = getNetworkingModule()
     local auction = networking and networking.Auctioneer or nil
-    if not auction then
+    if auction then
+        writeDebugLog("Auction networking obtained via Sharing Module")
+    else
+        writeDebugLog("Auction networking sharing module failed, trying fallback")
         auction = getFallbackNetworking("Auction")
     end
     return auction
@@ -3827,7 +3850,10 @@ end
 function getFruitStockNetworking()
     local networking = getNetworkingModule()
     local fruitStock = networking and networking.FruitStock or nil
-    if not fruitStock then
+    if fruitStock then
+        writeDebugLog("FruitStock networking obtained via Sharing Module")
+    else
+        writeDebugLog("FruitStock networking sharing module failed, trying fallback")
         fruitStock = getFallbackNetworking("FruitStock")
     end
     return fruitStock
