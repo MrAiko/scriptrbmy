@@ -2111,6 +2111,7 @@ local cachedAuctioneer = nil
 local cachedMailboxItemCatalog = false
 local latestAuctionSnapshot = nil
 local latestAuctionStock = {}
+local latestAuctionSoldOutPrices = {}
 local latestAuctionAt = 0
 local latestAuctionSnapshotAt = 0
 local latestAuctionStockAt = 0
@@ -2341,15 +2342,20 @@ end
 function normalizeAuctionStockValue(stock)
     if type(stock) == "table" then
         stock = stock.stock
+            or stock.value
             or stock.Stock
             or stock.quantity
             or stock.Quantity
             or stock.stockQuantity
             or stock.StockQuantity
+            or stock.remainingStock
+            or stock.StockRemaining
             or stock.count
             or stock.Count
             or stock.remaining
             or stock.Remaining
+            or stock.available
+            or stock.Available
             or stock.left
             or stock.Left
             or stock.quantityLeft
@@ -2360,6 +2366,20 @@ function normalizeAuctionStockValue(stock)
     local value = tonumber(stock)
     if value == nil then return nil end
     return math.max(0, math.floor(value))
+end
+
+function setAuctionStockMapValue(out, key, value)
+    if key == nil then return end
+    local rawKey = tostring(key)
+    if rawKey == "" then return end
+    local normalizedKey = normalizeAuctionLotId(rawKey)
+    out[rawKey] = value
+    out[normalizedKey] = value
+    local index = getAuctionLotIndex(normalizedKey)
+    if index ~= nil then
+        out[index] = value
+        out[tostring(index)] = value
+    end
 end
 
 function normalizeAuctionLotId(lotId)
@@ -2377,9 +2397,80 @@ function normalizeAuctionStockMap(stock)
     local out = {}
     if type(stock) ~= "table" then return out end
     for key, value in pairs(stock) do
-        out[normalizeAuctionLotId(key)] = value
+        setAuctionStockMapValue(out, key, value)
     end
     return out
+end
+
+function extractAuctionStockPayload(update, maybeStock)
+    if maybeStock ~= nil and type(update) ~= "table" then
+        return { [update] = maybeStock }, false
+    end
+    if type(update) ~= "table" then return nil, false end
+
+    local stock = update.stock or update.Stock or update.stocks or update.Stocks
+    if type(stock) == "table" then
+        return stock, true
+    end
+
+    local lotId = update.lotId or update.LotId or update.lotID or update.id or update.Id
+    local singleValue = normalizeAuctionStockValue(update)
+    if lotId ~= nil and singleValue ~= nil then
+        return { [lotId] = singleValue }, false
+    end
+
+    local looksLikeMap = false
+    for key, value in pairs(update) do
+        if key ~= "manifest" and key ~= "lots" and key ~= "items" and normalizeAuctionStockValue(value) ~= nil then
+            looksLikeMap = true
+            break
+        end
+    end
+    if looksLikeMap then
+        return update, true
+    end
+
+    return nil, false
+end
+
+function getAuctionStockMapValue(stockMap, lot, lotId, lotIndex, position, rawIndex)
+    if type(stockMap) ~= "table" then return nil end
+    local candidates = {}
+    local function addCandidate(value)
+        if value ~= nil then
+            table.insert(candidates, value)
+        end
+    end
+
+    addCandidate(lotId)
+    if type(lot) == "table" then
+        addCandidate(lot.lotId)
+        addCandidate(lot.id)
+        addCandidate(lot.key)
+    end
+    if lotId and lotId ~= "" then
+        addCandidate("Lot_" .. tostring(lotId))
+    end
+    addCandidate(lotIndex)
+    addCandidate(lotIndex and tostring(lotIndex) or nil)
+    addCandidate(position)
+    addCandidate(position and tostring(position) or nil)
+    addCandidate(position and position - 1 or nil)
+    addCandidate(position and tostring(position - 1) or nil)
+    addCandidate(rawIndex)
+    addCandidate(rawIndex and tostring(rawIndex) or nil)
+
+    for _, key in ipairs(candidates) do
+        if stockMap[key] ~= nil then
+            return stockMap[key]
+        end
+        local normalizedKey = normalizeAuctionLotId(key)
+        if stockMap[normalizedKey] ~= nil then
+            return stockMap[normalizedKey]
+        end
+    end
+
+    return nil
 end
 
 function getAuctionRawLots(snapshot)
@@ -2593,6 +2684,9 @@ function applyAuctionSnapshot(snapshot)
     local nextLotKey = getAuctionSnapshotLotKey(snapshot)
     local lotsChanged = previousLotKey ~= "" and nextLotKey ~= "" and previousLotKey ~= nextLotKey
     latestAuctionSnapshot = snapshot
+    if lotsChanged then
+        latestAuctionSoldOutPrices = {}
+    end
     if type(snapshot.stock) == "table" then
         latestAuctionStock = normalizeAuctionStockMap(snapshot.stock)
         latestAuctionSnapshot.stock = latestAuctionStock
@@ -2609,14 +2703,25 @@ function applyAuctionSnapshot(snapshot)
     return true
 end
 
-function applyAuctionStockUpdate(update)
-    if type(update) ~= "table" or type(update.stock) ~= "table" then return false end
-    latestAuctionStock = normalizeAuctionStockMap(update.stock)
+function applyAuctionStockUpdate(update, maybeStock)
+    local stockPayload, replaceAll = extractAuctionStockPayload(update, maybeStock)
+    if type(stockPayload) ~= "table" then return false end
+    local normalizedStock = normalizeAuctionStockMap(stockPayload)
+    if next(normalizedStock) == nil then return false end
+
+    if replaceAll or type(latestAuctionStock) ~= "table" then
+        latestAuctionStock = normalizedStock
+    else
+        for key, value in pairs(normalizedStock) do
+            latestAuctionStock[key] = value
+        end
+    end
     if latestAuctionSnapshot then
         latestAuctionSnapshot.stock = latestAuctionStock
     end
     latestAuctionStockAt = os.clock()
     latestAuctionAt = latestAuctionStockAt
+    writeDebugLog("Auction stock update applied")
     return true
 end
 
@@ -2671,13 +2776,13 @@ function connectAuctionSnapshot(onSnapshot)
         local stockEvent = auction.StockUpdate
         if stockEvent then
             if stockEvent.OnClientEvent then
-                stockEvent.OnClientEvent:Connect(function(update)
-                    if applyAuctionStockUpdate(update) and onSnapshot then onSnapshot() end
+                stockEvent.OnClientEvent:Connect(function(...)
+                    if applyAuctionStockUpdate(...) and onSnapshot then onSnapshot() end
                 end)
                 connected = true
             elseif stockEvent.Connect then
-                stockEvent:Connect(function(update)
-                    if applyAuctionStockUpdate(update) and onSnapshot then onSnapshot() end
+                stockEvent:Connect(function(...)
+                    if applyAuctionStockUpdate(...) and onSnapshot then onSnapshot() end
                 end)
                 connected = true
             end
@@ -3126,17 +3231,18 @@ function getAuctionData()
     end)
 
     for position, raw in ipairs(orderedRawLots) do
-        local lot = raw.lot
-        if type(lot) == "table" and lot.lotId then
+            local lot = raw.lot
+            if type(lot) == "table" and lot.lotId then
             local lotId = normalizeAuctionLotId(lot.lotId)
             local lotIndex = getAuctionLotIndex(lotId)
+            local rawIndex = raw.rawIndex
             local guiLot = guiLotsById[lotId]
                 or (lotIndex ~= nil and guiLotsByIndex[lotIndex] or nil)
                 or guiLotsByPosition[position]
-            local stock = latestAuctionStock and latestAuctionStock[lotId]
+            local stock = getAuctionStockMapValue(latestAuctionStock, lot, lotId, lotIndex, position, rawIndex)
             local hasLiveStock = stock ~= nil
             if stock == nil and type(snapshot.stock) == "table" then
-                stock = snapshot.stock[lotId]
+                stock = getAuctionStockMapValue(snapshot.stock, lot, lotId, lotIndex, position, rawIndex)
                 hasLiveStock = stock ~= nil
             end
             stock = normalizeAuctionStockValue(stock)
@@ -3165,9 +3271,25 @@ function getAuctionData()
             if not priceKnown then
                 currentPrice = nil
             end
+            local soldOut = (stock ~= nil and stock <= 0) or (useGuiDynamic and guiLot.soldOut == true)
+            local lotExpiresAt = getAuctionLotExpiry(lot)
+            local expired = lotExpiresAt > 0 and lotExpiresAt <= getServerNow()
+            if useGuiDynamic and guiLot.expired ~= nil then
+                expired = guiLot.expired == true
+            end
+            if soldOut and currentPrice ~= nil then
+                local frozenPrice = latestAuctionSoldOutPrices[lotId]
+                if frozenPrice == nil then
+                    latestAuctionSoldOutPrices[lotId] = currentPrice
+                    frozenPrice = currentPrice
+                end
+                currentPrice = frozenPrice
+            elseif not soldOut then
+                latestAuctionSoldOutPrices[lotId] = nil
+            end
             local stockQuantity = nil
             if not stockUnknown then
-                stockQuantity = useGuiDynamic and guiLot.stock ~= nil and guiLot.stock or (lot.stockQuantity or stock)
+                stockQuantity = hasLiveStock and stock or (useGuiDynamic and guiLot.stock ~= nil and guiLot.stock or (lot.stockQuantity or stock))
             end
             table.insert(lots, {
                 lotId = lotId,
@@ -3188,9 +3310,9 @@ function getAuctionData()
                 priceUnknown = not priceKnown,
                 robuxPrice = lot.robuxPrice,
                 rolledAt = lot.rolledAt,
-                expiresAt = useGuiDynamic and guiLot.expiresAt and guiLot.expiresAt > 0 and guiLot.expiresAt or getAuctionLotExpiry(lot),
-                soldOut = useGuiDynamic and guiLot.soldOut or nil,
-                expired = useGuiDynamic and guiLot.expired or nil,
+                expiresAt = useGuiDynamic and guiLot.expiresAt and guiLot.expiresAt > 0 and guiLot.expiresAt or lotExpiresAt,
+                soldOut = soldOut,
+                expired = expired,
                 dynamicSource = useGuiDynamic and "gui" or "snapshot"
             })
         end
