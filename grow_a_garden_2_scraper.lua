@@ -386,8 +386,8 @@ function getWeatherDataEntries()
     local shared = SharedModules or ReplicatedStorage:FindFirstChild("SharedModules")
     local weatherDataModule = shared and shared:FindFirstChild("WeatherData")
     if weatherDataModule then
-        local ok, weatherData = pcall(function() return require(weatherDataModule) end)
-        local rawData = ok and type(weatherData) == "table" and weatherData.Data or nil
+        local weatherData = safeRequireModule(weatherDataModule)
+        local rawData = type(weatherData) == "table" and weatherData.Data or nil
         if type(rawData) == "table" then
             for rawKey, item in pairs(rawData) do
                 local rawName = nil
@@ -497,23 +497,10 @@ local FALLBACK_PHASE_NAMES = {
     "Rainbow Moon", "Solar Eclipse", "Mega Moon", "MegaMoon", "Megamoon", "Moon", "Night", "Sunset", "Day"
 }
 
-local cachedTimeCycle = nil
-
 function findTimeCycleController()
-    if cachedTimeCycle and cachedTimeCycle.Parent and findChildByNormalizedName(cachedTimeCycle, { "Phases", "phases" }) then
-        return cachedTimeCycle
-    end
-    local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
-    if playerScripts then
-        local controllers = findChildByNormalizedName(playerScripts, { "Controllers", "controllers" })
-        if controllers then
-            local tc = findChildByNormalizedName(controllers, { "TimeCycleController", "timecyclecontroller", "Time Cycle Controller" })
-            if tc then
-                cachedTimeCycle = tc
-                return tc
-            end
-        end
-    end
+    -- Never touch PlayerScripts.Controllers.TimeCycleController from executor
+    -- context. Its phase modules are RobloxScript-only and can break the
+    -- game's own controller when required outside a LocalScript.
     return nil
 end
 
@@ -1444,13 +1431,6 @@ function getWeatherStateScanRoots()
     add(ReplicatedStorage:FindFirstChild("Environment"))
     add(ReplicatedStorage:FindFirstChild("ActiveWeather"))
 
-    local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
-    if playerScripts then
-        local controllers = findChildByNormalizedName(playerScripts, { "Controllers", "controllers" })
-        add(findChildByNormalizedName(controllers, { "WeatherController", "weathercontroller", "Weather Controller" }))
-        add(findChildByNormalizedName(controllers, { "EnvironmentController", "environmentcontroller", "Environment Controller" }))
-    end
-
     return roots
 end
 
@@ -1622,12 +1602,6 @@ function getWeatherCatalogScanRoots()
 
     local weatherUI = findWeatherUI()
     add(weatherUI)
-
-    local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
-    if playerScripts then
-        add(findChildByNormalizedName(playerScripts, { "Controllers", "controllers" }))
-        add(findChildByNormalizedName(playerScripts, { "WeatherController", "weathercontroller", "Weather Controller" }))
-    end
 
     add(ReplicatedStorage:FindFirstChild("Weather"))
     add(ReplicatedStorage:FindFirstChild("WeatherIcons"))
@@ -2069,8 +2043,50 @@ local function writeDebugLog(msg)
     end
 end
 
+function getInstanceFullName(instance)
+    local ok, fullName = pcall(function()
+        return instance and instance:GetFullName() or nil
+    end)
+    return ok and fullName or tostring(instance)
+end
+
+function isUnsafeModuleRequire(moduleScript)
+    if not moduleScript then return true, "missing module" end
+    local ok, reason = pcall(function()
+        if typeof(moduleScript) ~= "Instance" then
+            return "not an Instance"
+        end
+        if not moduleScript:IsA("ModuleScript") then
+            return "not a ModuleScript"
+        end
+        if Players and moduleScript:IsDescendantOf(Players) then
+            return "Players/PlayerScripts module"
+        end
+
+        local fullName = moduleScript:GetFullName()
+        if string.find(fullName, ".PlayerScripts.", 1, true)
+            or string.find(fullName, ".PlayerGui.", 1, true)
+            or string.find(fullName, "CoreGui", 1, true)
+            or string.find(fullName, "CorePackages", 1, true)
+            or string.find(fullName, "TimeCycleController", 1, true) then
+            return "client-only RobloxScript module"
+        end
+
+        return nil
+    end)
+    if not ok then
+        return true, "module check failed"
+    end
+    return reason ~= nil, reason
+end
+
 function safeRequireModule(moduleScript)
     if not moduleScript then return nil end
+    local unsafe, reason = isUnsafeModuleRequire(moduleScript)
+    if unsafe then
+        writeDebugLog("Skipped unsafe require (" .. tostring(reason) .. "): " .. getInstanceFullName(moduleScript))
+        return nil
+    end
     local ok, result = pcall(function()
         return require(moduleScript)
     end)
@@ -2116,9 +2132,12 @@ local latestAuctionAt = 0
 local latestAuctionSnapshotAt = 0
 local latestAuctionStockAt = 0
 local auctionSnapshotConnected = false
+local auctionStockConnected = false
 local auctionRequestPending = false
 local lastAuctionRequestAt = -10
 local AUCTION_REQUEST_INTERVAL = 3
+local AUCTION_STARTUP_RETRY_INTERVAL = 0.75
+local AUCTION_STARTUP_RETRY_COUNT = 24
 
 function getAuctioneerModule()
     if not cachedAuctioneer then
@@ -2801,34 +2820,38 @@ function requestAuctionSnapshot(force)
 end
 
 function connectAuctionSnapshot(onSnapshot)
-    if auctionSnapshotConnected then return end
+    if auctionSnapshotConnected and auctionStockConnected then return end
     local auction = getAuctionNetworking()
     if not auction then return end
 
-    local connected = false
+    local snapshotConnectedNow = false
+    local stockConnectedNow = false
     local ok, err = pcall(function()
-        local snapshotEvent = auction.Snapshot
+        local snapshotEvent = not auctionSnapshotConnected and auction.Snapshot or nil
         if snapshotEvent then
             if connectNetworkSignal(snapshotEvent, function(snapshot)
                 if applyAuctionSnapshot(snapshot) and onSnapshot then onSnapshot() end
             end) then
-                connected = true
+                snapshotConnectedNow = true
             end
         end
 
-        local stockEvent = auction.StockUpdate
+        local stockEvent = not auctionStockConnected and auction.StockUpdate or nil
         if stockEvent then
             if connectNetworkSignal(stockEvent, function(...)
                 if applyAuctionStockUpdate(...) and onSnapshot then onSnapshot() end
             end) then
-                connected = true
+                stockConnectedNow = true
             end
         end
     end)
 
-    auctionSnapshotConnected = ok and connected
-    if auctionSnapshotConnected then
-        writeDebugLog("Auction Snapshot/StockUpdate events connected")
+    if ok then
+        auctionSnapshotConnected = auctionSnapshotConnected or snapshotConnectedNow
+        auctionStockConnected = auctionStockConnected or stockConnectedNow
+    end
+    if snapshotConnectedNow or stockConnectedNow then
+        writeDebugLog("Auction events connected: Snapshot=" .. tostring(auctionSnapshotConnected) .. ", StockUpdate=" .. tostring(auctionStockConnected))
     end
     if DEBUG and not ok then
         warn("[Grow a Garden 2 Stocker] Failed to connect Auctioneer events: " .. tostring(err))
@@ -4380,6 +4403,27 @@ pcall(function()
 end)
 
 safeTaskSpawn(function()
+    for attempt = 1, AUCTION_STARTUP_RETRY_COUNT do
+        if latestAuctionSnapshot and type(getAuctionRawLots(latestAuctionSnapshot)) == "table" then
+            updateAPI(nil)
+            return
+        end
+        connectAuctionSnapshot(function()
+            updateAPI(nil)
+        end)
+        local gotSnapshot = requestAuctionSnapshot(true)
+        if gotSnapshot or (latestAuctionSnapshot and type(getAuctionRawLots(latestAuctionSnapshot)) == "table") then
+            writeDebugLog("Auction startup snapshot ready on attempt " .. tostring(attempt))
+            updateAPI(nil)
+            return
+        end
+        safeTaskWait(AUCTION_STARTUP_RETRY_INTERVAL)
+    end
+    writeDebugLog("Auction startup snapshot was not ready; using passive Snapshot event/polling")
+    updateAPI(nil)
+end)
+
+safeTaskSpawn(function()
     while not fruitSnapshotConnected do
         safeTaskWait(5)
         connectFruitStockSnapshot(function()
@@ -4390,20 +4434,21 @@ end)
 
 safeTaskSpawn(function()
     while not auctionSnapshotConnected do
-        safeTaskWait(5)
+        safeTaskWait(2)
         connectAuctionSnapshot(function()
             updateAPI(nil)
         end)
+        requestAuctionSnapshot(true)
     end
 end)
 
 safeTaskSpawn(function()
     while true do
-        safeTaskWait(latestAuctionSnapshot and AUCTION_REQUEST_INTERVAL or 5)
         local gotSnapshot = requestAuctionSnapshot(not latestAuctionSnapshot)
         if gotSnapshot then
             updateAPI(nil)
         end
+        safeTaskWait(latestAuctionSnapshot and AUCTION_REQUEST_INTERVAL or 1)
     end
 end)
 
