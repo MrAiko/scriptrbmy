@@ -3057,21 +3057,47 @@ function getAuctionDataFromGui()
 end
 
 function getAuctionData()
-    if not latestAuctionSnapshot or (os.clock() - latestAuctionAt) > AUCTION_REQUEST_INTERVAL then
-        requestAuctionSnapshot(false)
+    writeDebugLog("getAuctionData called")
+    local auctionGui = PlayerGui and PlayerGui:FindFirstChild("Auction")
+    local wasEnabled = false
+    if auctionGui and auctionGui:IsA("ScreenGui") then
+        wasEnabled = auctionGui.Enabled
+        if not wasEnabled then
+            writeDebugLog("Temporarily enabling Auction GUI to force refresh...")
+            auctionGui.Enabled = true
+            -- Wait a few frames for the client controller to update labels
+            safeTaskWait(0.05)
+        end
     end
+
+    local success, result = pcall(getAuctionDataFromGui)
+    
+    if auctionGui and auctionGui:IsA("ScreenGui") and not wasEnabled then
+        writeDebugLog("Disabling Auction GUI")
+        auctionGui.Enabled = false
+    end
+
+    if success and result and result.lots and #result.lots > 0 then
+        writeDebugLog("Successfully scraped " .. tostring(#result.lots) .. " lots from GUI!")
+        return result
+    end
+
+    writeDebugLog("GUI scrape returned no lots. Falling back to snapshot/original logic...")
     local snapshot = latestAuctionSnapshot
-    if type(snapshot) ~= "table" then return getAuctionDataFromGui() end
+    if type(snapshot) ~= "table" then 
+        return success and result or nil 
+    end
 
     local rawLots = snapshot.manifest and snapshot.manifest.lots
-    if type(rawLots) ~= "table" then return getAuctionDataFromGui() end
+    if type(rawLots) ~= "table" then 
+        return success and result or nil 
+    end
 
-    local guiData = getAuctionDataFromGui()
     local guiLotsById = {}
     local guiLotsByIndex = {}
     local guiLotsByPosition = {}
-    if guiData and type(guiData.lots) == "table" then
-        for position, guiLot in ipairs(guiData.lots) do
+    if result and type(result.lots) == "table" then
+        for position, guiLot in ipairs(result.lots) do
             if guiLot and guiLot.lotId then
                 local normalizedLotId = normalizeAuctionLotId(guiLot.lotId)
                 guiLotsById[normalizedLotId] = guiLot
@@ -3177,10 +3203,6 @@ function getAuctionData()
         return tostring(a.lotId or "") < tostring(b.lotId or "")
     end)
 
-    if #lots == 0 then
-        return getAuctionDataFromGui()
-    end
-
     local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds) or 0
     local rollWindowUnix = tonumber(snapshot.rollWindowUnix) or 0
     local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
@@ -3201,8 +3223,9 @@ function getAuctionData()
             refreshAt = nextLotExpiry
         end
     end
-    if guiData and tonumber(guiData.refreshAt) and tonumber(guiData.refreshAt) > serverNow then
-        refreshAt = tonumber(guiData.refreshAt)
+    local guiRefreshAt = result and tonumber(result.refreshAt) or 0
+    if guiRefreshAt > serverNow then
+        refreshAt = guiRefreshAt
     end
     if refreshAt > serverNow then
         for _, lot in ipairs(lots) do
