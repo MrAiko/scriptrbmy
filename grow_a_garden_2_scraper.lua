@@ -3376,11 +3376,20 @@ function getAuctionDataFromGui()
                         or getFirstAttributeByNames(main, { "ItemToolTipRarity", "Rarity" })
                         or ""
                     local amountText = getAuctionTextAtPath(main, { "ImageDisplay", "Amount" })
-                    local subtitle = amountText
-                        or getFirstAttributeByNames(main, { "ItemToolTipSubtitle", "Subtitle", "Amount", "Count" })
-                        or ""
-                    local countText = tostring(subtitle):match("[xX]%s*([%d,%s%.]+)") or tostring(subtitle):match("([%d][%d,%s%.]*)")
-                    local count = countText and tonumber((countText:gsub("[%s,%.]", ""))) or 1
+                    local countAttr = getFirstAttributeByNames(main, { "Amount", "Count" })
+                    local subtitleAttr = getFirstAttributeByNames(main, { "ItemToolTipSubtitle", "Subtitle" })
+
+                    local count = 1
+                    if amountText and amountText ~= "" then
+                        local countText = tostring(amountText):match("[xX]%s*([%d,%s%.]+)") or tostring(amountText):match("([%d][%d,%s%.]*)")
+                        count = countText and tonumber((countText:gsub("[%s,%.]", ""))) or 1
+                    elseif countAttr and tostring(countAttr) ~= "" then
+                        local countText = tostring(countAttr):match("[xX]%s*([%d,%s%.]+)") or tostring(countAttr):match("([%d][%d,%s%.]*)")
+                        count = countText and tonumber((countText:gsub("[%s,%.]", ""))) or 1
+                    elseif subtitleAttr and tostring(subtitleAttr) ~= "" then
+                        local countText = tostring(subtitleAttr):match("[xX]%s*([%d,%s%.]+)")
+                        count = countText and tonumber((countText:gsub("[%s,%.]", ""))) or 1
+                    end
                     local lotName = nameText or tostring(card.Name)
                     local lot = {
                         category = category,
