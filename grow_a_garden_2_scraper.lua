@@ -1,3 +1,11 @@
+-- Save the executor require locally and restore getgenv().require for game client scripts
+local require = require
+pcall(function()
+    if getgenv and getgenv().require then
+        getgenv().require = nil
+    end
+end)
+
 -- Grow a Garden 2 Stock Scraper Script (Extreme-Optimized)
 -- Run this script in a Roblox Executor (e.g. Wave, Synapse, Electron, Solara, etc.)
 
@@ -2569,6 +2577,9 @@ function requestAuctionSnapshot(force)
         if requestRemote.Fire then
             return requestRemote:Fire()
         end
+        if requestRemote.FireServer then
+            return requestRemote:FireServer()
+        end
         if requestRemote.InvokeServer then
             return requestRemote:InvokeServer()
         end
@@ -3876,6 +3887,9 @@ function requestFruitSnapshot(force)
     local ok, result = pcall(function()
         if requestRemote.Fire then
             return requestRemote:Fire()
+        end
+        if requestRemote.FireServer then
+            return requestRemote:FireServer()
         end
         if requestRemote.InvokeServer then
             return requestRemote:InvokeServer()
