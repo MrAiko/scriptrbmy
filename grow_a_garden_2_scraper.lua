@@ -2141,25 +2141,25 @@ end
 local function getFallbackNetworking(serviceName)
     local remotes = {}
     local ok, err = pcall(function()
+        local lowerService = string.lower(serviceName)
         for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
             if desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") then
-                local name = desc.Name
-                local matchService = string.find(string.lower(name), string.lower(serviceName))
-                    or (desc.Parent and string.find(string.lower(desc.Parent.Name), string.lower(serviceName)))
-                if matchService then
+                local fullName = string.lower(desc:GetFullName())
+                if string.find(fullName, lowerService) then
+                    local lname = string.lower(desc.Name)
                     local key = nil
-                    if string.lower(serviceName) == "auction" then
-                        if string.find(name, "Request") then
+                    if lowerService == "auction" then
+                        if string.find(lname, "request") then
                             key = "RequestSnapshot"
-                        elseif string.find(name, "StockUpdate") or string.find(name, "Stock") then
+                        elseif string.find(lname, "stockupdate") or string.find(lname, "stock") then
                             key = "StockUpdate"
-                        elseif string.find(name, "Snapshot") then
+                        elseif string.find(lname, "snapshot") then
                             key = "Snapshot"
                         end
-                    elseif string.lower(serviceName) == "fruitstock" then
-                        if string.find(name, "Request") then
+                    elseif lowerService == "fruitstock" then
+                        if string.find(lname, "request") then
                             key = "Request"
-                        elseif string.find(name, "Snapshot") then
+                        elseif string.find(lname, "snapshot") then
                             key = "Snapshot"
                         end
                     end
@@ -2175,6 +2175,21 @@ local function getFallbackNetworking(serviceName)
         return remotes
     end
     return nil
+end
+
+local function getDebugRemotesInfo()
+    local list = {}
+    pcall(function()
+        for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
+            if desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") then
+                local name = string.lower(desc.Name)
+                if string.find(name, "auction") or string.find(name, "fruit") or string.find(name, "stock") then
+                    table.insert(list, desc:GetFullName())
+                end
+            end
+        end
+    end)
+    return list
 end
 
 function getAuctionNetworking()
@@ -4049,7 +4064,10 @@ function updateAPI(fruitData)
             -- Seconds until the next in-game multiplier refresh (dynamic countdown).
             fruitRefreshTimer = getFruitRefreshTimer(),
             calculatorData = getCalculatorData(),
-            auction = getAuctionData()
+            auction = getAuctionData(),
+            debugSnapshot = (latestAuctionSnapshot ~= nil),
+            debugNetworking = (getAuctionNetworking() ~= nil),
+            debugRemotes = getDebugRemotesInfo()
         }
 
         safeTaskSpawn(function()
