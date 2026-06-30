@@ -21,7 +21,7 @@ local API_PASSWORD = "mySuperSecretToken123"
 local UPDATE_INTERVAL = 30       -- Fallback interval in seconds to update API
 local POLL_INTERVAL = 2.0        -- Fast state poll interval; fruit data comes from FruitStock snapshot
 local FRUIT_REQUEST_INTERVAL = 10 -- Fallback remote refresh interval if Snapshot event is missed
-local DEBUG = false              -- Set to true only to diagnose scraper issues
+local DEBUG = true              -- Set to true only to diagnose scraper issues
 local MOBILE_SAFE_MODE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 local DESTROY_WORLD_ASSETS = false -- Never destroy Workspace parts; game controllers need plant.Base etc.
 -- =================================================
