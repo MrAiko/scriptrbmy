@@ -4147,32 +4147,6 @@ local function keepGuiActiveAndHidden()
                     end
                 end)
             end)
-
-            local frame = auctionGui:WaitForChild("Frame", 10)
-            if frame then
-                pcall(function()
-                    frame.Visible = false
-                end)
-                frame:GetPropertyChangedSignal("Visible"):Connect(function()
-                    pcall(function()
-                        if frame.Visible then
-                            frame.Visible = false
-                        end
-                    end)
-                end)
-
-                pcall(function()
-                    frame.Position = UDim2.new(5, 0, 5, 0)
-                end)
-                frame:GetPropertyChangedSignal("Position"):Connect(function()
-                    pcall(function()
-                        local targetPos = UDim2.new(5, 0, 5, 0)
-                        if frame.Position ~= targetPos then
-                            frame.Position = targetPos
-                        end
-                    end)
-                end)
-            end
         end
     end)
 end
