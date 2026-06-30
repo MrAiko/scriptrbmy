@@ -2200,13 +2200,13 @@ end
 
 
 function getAuctionNetworking()
-    local auction = getFallbackNetworking("Auction")
+    local networking = getNetworkingModule()
+    local auction = networking and networking.Auctioneer or nil
     if auction then
-        writeDebugLog("Auction networking obtained via Fallback Module")
+        writeDebugLog("Auction networking obtained via Sharing Module")
     else
-        writeDebugLog("Auction networking fallback module failed, trying Sharing Module")
-        local networking = getNetworkingModule()
-        auction = networking and networking.Auctioneer or nil
+        writeDebugLog("Auction networking sharing module failed, trying fallback")
+        auction = getFallbackNetworking("Auction")
     end
     return auction
 end
@@ -3832,13 +3832,13 @@ function applyFruitSnapshot(snapshot)
 end
 
 function getFruitStockNetworking()
-    local fruitStock = getFallbackNetworking("FruitStock")
+    local networking = getNetworkingModule()
+    local fruitStock = networking and networking.FruitStock or nil
     if fruitStock then
-        writeDebugLog("FruitStock networking obtained via Fallback Module")
+        writeDebugLog("FruitStock networking obtained via Sharing Module")
     else
-        writeDebugLog("FruitStock networking fallback module failed, trying Sharing Module")
-        local networking = getNetworkingModule()
-        fruitStock = networking and networking.FruitStock or nil
+        writeDebugLog("FruitStock networking sharing module failed, trying fallback")
+        fruitStock = getFallbackNetworking("FruitStock")
     end
     return fruitStock
 end
@@ -4164,6 +4164,20 @@ safeTaskSpawn(function()
         connectAuctionSnapshot(function()
             updateAPI(nil)
         end)
+    end
+end)
+
+safeTaskSpawn(function()
+    while not latestAuctionSnapshot do
+        safeTaskWait(5)
+        requestAuctionSnapshot(true)
+    end
+end)
+
+safeTaskSpawn(function()
+    while not latestFruitEntries do
+        safeTaskWait(5)
+        requestFruitSnapshot(true)
     end
 end)
 
