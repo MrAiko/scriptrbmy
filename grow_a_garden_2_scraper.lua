@@ -2194,7 +2194,17 @@ local function wrapRawRemote(remote)
     return wrapper
 end
 
+local cachedFallbackNetworking = {}
+
 local function getFallbackNetworking(serviceName)
+    if cachedFallbackNetworking[serviceName] ~= nil then
+        if cachedFallbackNetworking[serviceName] == false then
+            return nil
+        else
+            return cachedFallbackNetworking[serviceName]
+        end
+    end
+
     writeDebugLog("getFallbackNetworking called for: " .. tostring(serviceName))
     local remotes = {}
     local ok, err = pcall(function()
@@ -2234,9 +2244,11 @@ local function getFallbackNetworking(serviceName)
         writeDebugLog("Error in getFallbackNetworking: " .. tostring(err))
     end
     if next(remotes) ~= nil then
+        cachedFallbackNetworking[serviceName] = remotes
         return remotes
     end
     writeDebugLog("No fallback remotes found for: " .. tostring(serviceName))
+    cachedFallbackNetworking[serviceName] = false
     return nil
 end
 
@@ -3303,7 +3315,8 @@ end
 function getAuctionDataFromGui()
     local auctionGui = PlayerGui and PlayerGui:FindFirstChild("Auction")
     if not auctionGui then return nil end
-    local guiDynamicTrusted = primeAuctionGuiForLiveValues()
+    local hasActiveSnapshot = latestAuctionSnapshot and (os.clock() - latestAuctionSnapshotAt) < 15
+    local guiDynamicTrusted = primeAuctionGuiForLiveValues() or not hasActiveSnapshot
     local frame = auctionGui:FindFirstChild("Frame", true)
     local scrollingFrame = frame and frame:FindFirstChild("ScrollingFrame", true)
     if not scrollingFrame then return nil end
