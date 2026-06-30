@@ -3235,15 +3235,7 @@ function isDefaultAuctionPlaceholderLot(lot)
     if type(lot) ~= "table" then return false end
     local startPrice = tonumber(lot.startPrice or lot.currentPrice or lot.price or lot.cost)
     local stockQuantity = tonumber(lot.stockQuantity or lot.stock or lot.quantity or lot.count)
-    local expiresAt = tonumber(lot.expiresAt) or 0
-    local rolledAt = tonumber(lot.rolledAt) or 0
-    local duration = expiresAt - rolledAt
-    local remaining = expiresAt - getServerNow()
-    local looksLikeThirtyMinuteTimer = (duration >= 1700 and duration <= 1900)
-        or (remaining >= 1700 and remaining <= 1900)
-    return startPrice == 100000
-        and stockQuantity == 16
-        and looksLikeThirtyMinuteTimer
+    return startPrice == 100000 and stockQuantity == 16
 end
 
 function parseCompactMoney(text)
@@ -3541,6 +3533,8 @@ function getAuctionData()
             if placeholderLot and not useGuiDynamic then
                 priceKnown = false
                 currentPrice = nil
+                stock = nil
+                hasLiveStock = false
             end
             local stockUnknown = stock == nil and (lot.stockQuantity ~= nil or placeholderLot)
             local stockUnlimited = not stockUnknown and stock == nil and lot.stockQuantity == nil
