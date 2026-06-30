@@ -2176,6 +2176,17 @@ function getLotCurrentPrice(lot)
     return math.max(0, math.floor(tonumber(lot.currentPrice or lot.price or lot.startPrice or lot.cost) or 0))
 end
 
+function hasReliableAuctionPrice(lot)
+    if type(lot) ~= "table" then return false end
+    if tonumber(lot.currentPrice or lot.price or lot.cost) then return true end
+    if not tonumber(lot.startPrice) then return false end
+    local decrementIntervalSeconds = tonumber(lot.decrementIntervalSeconds)
+    if decrementIntervalSeconds and decrementIntervalSeconds > 0 then
+        return tonumber(lot.rolledAt) ~= nil and tonumber(lot.decrementPercent) ~= nil
+    end
+    return lot.decrementIntervalSeconds ~= nil or lot.minPrice ~= nil or lot.rolledAt ~= nil
+end
+
 function normalizeAuctionStockValue(stock)
     if type(stock) == "table" then
         stock = stock.stock
@@ -2218,6 +2229,19 @@ function normalizeAuctionStockMap(stock)
         out[normalizeAuctionLotId(key)] = value
     end
     return out
+end
+
+function getAuctionSnapshotLotKey(snapshot)
+    local lots = snapshot and snapshot.manifest and snapshot.manifest.lots
+    if type(lots) ~= "table" then return "" end
+    local keys = {}
+    for _, lot in pairs(lots) do
+        if type(lot) == "table" and lot.lotId then
+            table.insert(keys, normalizeAuctionLotId(lot.lotId))
+        end
+    end
+    table.sort(keys)
+    return table.concat(keys, "|")
 end
 
 local AUCTION_CATEGORY_ALIASES = {
@@ -2374,9 +2398,17 @@ end
 
 function applyAuctionSnapshot(snapshot)
     if type(snapshot) ~= "table" then return false end
+    local previousLotKey = getAuctionSnapshotLotKey(latestAuctionSnapshot)
+    local nextLotKey = getAuctionSnapshotLotKey(snapshot)
+    local lotsChanged = previousLotKey ~= "" and nextLotKey ~= "" and previousLotKey ~= nextLotKey
     latestAuctionSnapshot = snapshot
     if type(snapshot.stock) == "table" then
         latestAuctionStock = normalizeAuctionStockMap(snapshot.stock)
+        latestAuctionSnapshot.stock = latestAuctionStock
+    elseif lotsChanged then
+        latestAuctionStock = {}
+        latestAuctionSnapshot.stock = latestAuctionStock
+    else
         latestAuctionSnapshot.stock = latestAuctionStock
     end
     latestAuctionAt = os.clock()
@@ -2724,6 +2756,10 @@ end
 function getAuctionDataFromGui()
     local auctionGui = PlayerGui and PlayerGui:FindFirstChild("Auction")
     if not auctionGui then return nil end
+    local guiDynamicTrusted = true
+    if auctionGui:IsA("ScreenGui") and auctionGui.Enabled == false then
+        guiDynamicTrusted = false
+    end
     local frame = auctionGui:FindFirstChild("Frame", true)
     local scrollingFrame = frame and frame:FindFirstChild("ScrollingFrame", true)
     if not scrollingFrame then return nil end
@@ -2731,8 +2767,8 @@ function getAuctionDataFromGui()
     local serverNow = getServerNow()
     local lots = {}
     local header = frame:FindFirstChild("Header")
-    local headerTimerText = getAuctionGuiTimerText(header)
-    local headerDuration = parseDurationSeconds(headerTimerText)
+    local headerTimerText = guiDynamicTrusted and getAuctionGuiTimerText(header) or ""
+    local headerDuration = guiDynamicTrusted and parseDurationSeconds(headerTimerText) or 0
     local refreshAt = headerDuration > 0 and (serverNow + headerDuration) or 0
 
     for _, card in ipairs(scrollingFrame:GetChildren()) do
@@ -2743,9 +2779,9 @@ function getAuctionDataFromGui()
             end)
             local stockText = getFirstTextByNames(main, { "Stock_Text", "StockText", "Stock" }) or ""
             local timerText = getFirstTextByNames(main, { "RefreshIn", "Timer", "Time" }) or ""
-            priceText = getAuctionGuiPriceText(main)
-            stockText = getAuctionGuiStockText(main)
-            timerText = getAuctionGuiTimerText(main)
+            priceText = guiDynamicTrusted and getAuctionGuiPriceText(main) or nil
+            stockText = guiDynamicTrusted and getAuctionGuiStockText(main) or ""
+            timerText = guiDynamicTrusted and getAuctionGuiTimerText(main) or ""
             local nameText = getFirstAttributeByNames(main, { "ItemToolTip", "DisplayName", "ItemName", "Name" })
                 or getFirstTextByNames(main, { "ItemName", "Item_Name", "Name", "Title" })
                 or card:GetAttribute("ItemToolTip")
@@ -2774,16 +2810,28 @@ function getAuctionDataFromGui()
                 local isAuctionLotCard = string.sub(cardKey, 1, 10) == "lotauction" or string.sub(cardKey, 1, 7) == "auction"
                 local looksLikeTemplateAuctionRow = not isAuctionLotCard
                     and currentPrice == 1000 and stock == 16 and duration <= 0 and headerDuration <= 0
+                local looksLikeDefaultDynamic = currentPrice == 100000
+                    and stock == 16
+                    and duration >= 1700
+                    and duration <= 1900
+                local rowDynamicTrusted = guiDynamicTrusted and not looksLikeDefaultDynamic
 
                 local expired = false
-                local expiredObj = main:FindFirstChild("EXPIRED", true)
-                if expiredObj and expiredObj:IsA("GuiObject") and expiredObj.Visible then
-                    expired = true
-                end
-                local outObj = main:FindFirstChild("OUT_OF_STOCK", true)
-                if outObj and outObj:IsA("GuiObject") and outObj.Visible then
-                    soldOut = true
-                    stock = 0
+                if rowDynamicTrusted then
+                    local expiredObj = main:FindFirstChild("EXPIRED", true)
+                    if expiredObj and expiredObj:IsA("GuiObject") and expiredObj.Visible then
+                        expired = true
+                    end
+                    local outObj = main:FindFirstChild("OUT_OF_STOCK", true)
+                    if outObj and outObj:IsA("GuiObject") and outObj.Visible then
+                        soldOut = true
+                        stock = 0
+                    end
+                else
+                    stock = nil
+                    currentPrice = 0
+                    expiresAt = 0
+                    soldOut = false
                 end
 
                 if not looksLikeTemplateAuctionRow then
@@ -2818,10 +2866,15 @@ function getAuctionDataFromGui()
                         image = getAuctionGuiImage(main, lot),
                         stock = stock,
                         stockQuantity = stock,
+                        stockUnknown = not rowDynamicTrusted or (stock == nil and not soldOut),
+                        stockUnlimited = false,
                         currentPrice = currentPrice > 0 and currentPrice or nil,
+                        priceUnknown = not rowDynamicTrusted or currentPrice <= 0,
                         expiresAt = expiresAt,
                         soldOut = soldOut,
-                        expired = expired
+                        expired = expired,
+                        dynamicTrusted = rowDynamicTrusted,
+                        looksLikeDefaultDynamic = looksLikeDefaultDynamic
                     })
                 end
             end
@@ -2836,7 +2889,8 @@ function getAuctionDataFromGui()
         lots = lots,
         refreshAt = refreshAt,
         serverNow = serverNow,
-        source = "gui"
+        source = "gui",
+        dynamicTrusted = guiDynamicTrusted
     }
 end
 
@@ -2895,16 +2949,37 @@ function getAuctionData()
                 or (lotIndex ~= nil and guiLotsByIndex[lotIndex] or nil)
                 or guiLotsByPosition[position]
             local stock = latestAuctionStock and latestAuctionStock[lotId]
+            local hasLiveStock = stock ~= nil
             if stock == nil and type(snapshot.stock) == "table" then
                 stock = snapshot.stock[lotId]
+                hasLiveStock = stock ~= nil
             end
             stock = normalizeAuctionStockValue(stock)
-            if guiLot and guiLot.stock ~= nil then
+            if stock == nil then
+                hasLiveStock = false
+            end
+            local useGuiDynamic = guiLot and guiLot.dynamicTrusted == true
+            if useGuiDynamic and guiLot.stock ~= nil then
                 stock = guiLot.stock
+                hasLiveStock = true
             end
             local currentPrice = getLotCurrentPrice(lot)
-            if guiLot and tonumber(guiLot.currentPrice) and tonumber(guiLot.currentPrice) > 0 then
+            local priceKnown = hasReliableAuctionPrice(lot)
+            if useGuiDynamic and tonumber(guiLot.currentPrice) and tonumber(guiLot.currentPrice) > 0 then
                 currentPrice = tonumber(guiLot.currentPrice)
+                priceKnown = true
+            end
+            local stockUnknown = not hasLiveStock and lot.stockQuantity ~= nil
+            local stockUnlimited = not stockUnknown and stock == nil and lot.stockQuantity == nil
+            if stockUnknown then
+                stock = nil
+            end
+            if not priceKnown then
+                currentPrice = nil
+            end
+            local stockQuantity = nil
+            if not stockUnknown then
+                stockQuantity = useGuiDynamic and guiLot.stock ~= nil and guiLot.stock or lot.stockQuantity
             end
             table.insert(lots, {
                 lotId = lotId,
@@ -2918,13 +2993,17 @@ function getAuctionData()
                 rarity = guiLot and guiLot.rarity or getLotRarity(lot),
                 image = guiLot and guiLot.image or getLotImage(lot),
                 stock = stock,
-                stockQuantity = guiLot and guiLot.stock ~= nil and guiLot.stock or lot.stockQuantity,
+                stockQuantity = stockQuantity,
+                stockUnknown = stockUnknown,
+                stockUnlimited = stockUnlimited,
                 currentPrice = currentPrice,
+                priceUnknown = not priceKnown,
                 robuxPrice = lot.robuxPrice,
                 rolledAt = lot.rolledAt,
-                expiresAt = guiLot and guiLot.expiresAt and guiLot.expiresAt > 0 and guiLot.expiresAt or lot.expiresAt,
-                soldOut = guiLot and guiLot.soldOut or nil,
-                expired = guiLot and guiLot.expired or nil
+                expiresAt = useGuiDynamic and guiLot.expiresAt and guiLot.expiresAt > 0 and guiLot.expiresAt or lot.expiresAt,
+                soldOut = useGuiDynamic and guiLot.soldOut or nil,
+                expired = useGuiDynamic and guiLot.expired or nil,
+                dynamicSource = useGuiDynamic and "gui" or "snapshot"
             })
         end
     end
@@ -3232,6 +3311,44 @@ function getDefaultPlantAverageSize()
     return plantAverageSizeCache
 end
 
+function getNumberMapValue(map, name, fallback)
+    if type(map) ~= "table" then return fallback end
+    if map[name] ~= nil then
+        local n = tonumber(map[name])
+        if n then return n end
+    end
+    local target = string.lower(tostring(name or ""))
+    for key, value in pairs(map) do
+        if string.lower(tostring(key or "")) == target then
+            local n = tonumber(value)
+            if n then return n end
+        end
+    end
+    return fallback
+end
+
+function calculateCalculatorSizePower(fruitName, weight, config)
+    local safeWeight = tonumber(weight) or 1
+    if safeWeight < 0.01 then safeWeight = 0.01 end
+    config = type(config) == "table" and config or {}
+    local dr = type(config.diminishingReturns) == "table" and config.diminishingReturns or {}
+    local exponent = getNumberMapValue(config.sizeExponentOverrides, fruitName, tonumber(config.sizeExponent) or 2.65)
+    local sizePower = safeWeight ^ exponent
+
+    if dr.enabled ~= false then
+        local knee = (tonumber(dr.knee) or 5) * getNumberMapValue(dr.kneeMultipliers, fruitName, 1)
+        if knee > 0 and safeWeight > knee then
+            local tailBase = tonumber(dr.tailExponent) or 1.5
+            local tailMultiplier = getNumberMapValue(dr.tailExponentMultipliers, fruitName, 1)
+            local tailExponent = math.min(tailBase * tailMultiplier, exponent)
+            sizePower = (knee ^ exponent) * ((safeWeight / knee) ^ tailExponent)
+        end
+    end
+
+    if sizePower <= 0 then return 1 end
+    return sizePower
+end
+
 function buildSeedMeta(seedData)
     local meta = {}
     if type(seedData) ~= "table" then return meta end
@@ -3429,34 +3546,12 @@ function getCalculatorData()
     end
 
     local seedMeta = buildSeedMeta(seedData)
-    local fruits = {}
-    for fruitName, baseValue in pairs(sellValueData) do
-        local value = tonumber(baseValue)
-        if type(fruitName) == "string" and value and value >= 0 then
-            local cleanName = cleanScrapedName(fruitName)
-            local meta = seedMeta[fruitName] or seedMeta[normalizeName(fruitName)] or {}
-            table.insert(fruits, {
-                name = cleanName,
-                baseValue = value,
-                image = getFruitImage(fruitName) or meta.image,
-                rarity = meta.rarity,
-                isSingleHarvest = meta.isSingleHarvest == true,
-                averageWeight = meta.averageWeight
-            })
-        end
-    end
-
-    table.sort(fruits, function(a, b)
-        if a.baseValue == b.baseValue then
-            return tostring(a.name) < tostring(b.name)
-        end
-        return a.baseValue > b.baseValue
-    end)
-
     local defaultExponentOverrides = { Mushroom = 1.9, Bamboo = 1.75 }
     local emptyFruitMap = {}
-    for _, fruit in ipairs(fruits) do
-        emptyFruitMap[fruit.name] = 1
+    for fruitName, _ in pairs(sellValueData) do
+        if type(fruitName) == "string" then
+            emptyFruitMap[cleanScrapedName(fruitName) or fruitName] = 1
+        end
     end
 
     local sizeExponentOverrides = getFastFlagValue(
@@ -3474,27 +3569,57 @@ function getCalculatorData()
         emptyFruitMap,
         function(asserts) return asserts.Map(asserts.String, asserts.FinitePositive) end
     )
+    local calculatorConfig = {
+        sizeMultiplier = getFastFlagValue("Game.Selling.SizeMultiplier", 1, function(asserts) return asserts.FinitePositive end),
+        mutationMultiplier = getFastFlagValue("Game.Selling.MutationMultiplier", 1, function(asserts) return asserts.FinitePositive end),
+        sizeExponent = getFastFlagValue("Game.Selling.SizeExponent", 2.65, function(asserts) return asserts.FinitePositive end),
+        sizeExponentOverrides = cleanNumberMap(sizeExponentOverrides, defaultExponentOverrides),
+        singleHarvestMutationBonusScale = getFastFlagValue("Game.Selling.SingleHarvestMutationBonusScale", 0.15, function(asserts) return asserts.FiniteNonNegative end),
+        minimumValues = { Carrot = 4 },
+        diminishingReturns = {
+            enabled = getFastFlagValue("Game.Selling.SizeDiminishingReturns.Enabled", true, function(asserts) return asserts.Boolean end) ~= false,
+            knee = getFastFlagValue("Game.Selling.SizeDiminishingReturns.Knee", 5, function(asserts) return asserts.FinitePositive end),
+            tailExponent = getFastFlagValue("Game.Selling.SizeDiminishingReturns.TailExponent", 1.5, function(asserts) return asserts.FinitePositive end),
+            kneeMultipliers = cleanNumberMap(kneeMultipliers, {}),
+            tailExponentMultipliers = cleanNumberMap(tailExponentMultipliers, {})
+        }
+    }
+
+    local fruits = {}
+    for fruitName, baseValue in pairs(sellValueData) do
+        local value = tonumber(baseValue)
+        if type(fruitName) == "string" and value and value >= 0 then
+            local cleanName = cleanScrapedName(fruitName)
+            local meta = seedMeta[fruitName] or seedMeta[normalizeName(fruitName)] or {}
+            local averageWeight = tonumber(meta.averageWeight) or getDefaultPlantAverageSize()
+            local averageSizePower = calculateCalculatorSizePower(cleanName, averageWeight, calculatorConfig)
+            local baseValuePerKg = averageSizePower > 0 and (value / averageSizePower) or value
+            table.insert(fruits, {
+                name = cleanName,
+                baseValue = value,
+                baseValuePerKg = baseValuePerKg,
+                averageSizePower = averageSizePower,
+                image = getFruitImage(fruitName) or meta.image,
+                rarity = meta.rarity,
+                isSingleHarvest = meta.isSingleHarvest == true,
+                averageWeight = averageWeight
+            })
+        end
+    end
+
+    table.sort(fruits, function(a, b)
+        if a.baseValue == b.baseValue then
+            return tostring(a.name) < tostring(b.name)
+        end
+        return a.baseValue > b.baseValue
+    end)
 
     calculatorDataCache = {
         source = "live-data",
         scrapedAt = os.time(),
         fruits = fruits,
         mutations = getMutationDataList(mutationData),
-        config = {
-            sizeMultiplier = getFastFlagValue("Game.Selling.SizeMultiplier", 1, function(asserts) return asserts.FinitePositive end),
-            mutationMultiplier = getFastFlagValue("Game.Selling.MutationMultiplier", 1, function(asserts) return asserts.FinitePositive end),
-            sizeExponent = getFastFlagValue("Game.Selling.SizeExponent", 2.65, function(asserts) return asserts.FinitePositive end),
-            sizeExponentOverrides = cleanNumberMap(sizeExponentOverrides, defaultExponentOverrides),
-            singleHarvestMutationBonusScale = getFastFlagValue("Game.Selling.SingleHarvestMutationBonusScale", 0.15, function(asserts) return asserts.FiniteNonNegative end),
-            minimumValues = { Carrot = 4 },
-            diminishingReturns = {
-                enabled = getFastFlagValue("Game.Selling.SizeDiminishingReturns.Enabled", true, function(asserts) return asserts.Boolean end) ~= false,
-                knee = getFastFlagValue("Game.Selling.SizeDiminishingReturns.Knee", 5, function(asserts) return asserts.FinitePositive end),
-                tailExponent = getFastFlagValue("Game.Selling.SizeDiminishingReturns.TailExponent", 1.5, function(asserts) return asserts.FinitePositive end),
-                kneeMultipliers = cleanNumberMap(kneeMultipliers, {}),
-                tailExponentMultipliers = cleanNumberMap(tailExponentMultipliers, {})
-            }
-        }
+        config = calculatorConfig
     }
     calculatorDataCacheAt = now
     return calculatorDataCache
