@@ -3234,7 +3234,7 @@ end
 function isDefaultAuctionPlaceholderLot(lot)
     if type(lot) ~= "table" then return false end
     local startPrice = tonumber(lot.startPrice or lot.currentPrice or lot.price or lot.cost)
-    local stockQuantity = tonumber(lot.stockQuantity)
+    local stockQuantity = tonumber(lot.stockQuantity or lot.stock or lot.quantity or lot.count)
     local expiresAt = tonumber(lot.expiresAt) or 0
     local rolledAt = tonumber(lot.rolledAt) or 0
     local duration = expiresAt - rolledAt
@@ -3359,10 +3359,7 @@ function getAuctionDataFromGui()
                 local isAuctionLotCard = string.sub(cardKey, 1, 10) == "lotauction" or string.sub(cardKey, 1, 7) == "auction"
                 local looksLikeTemplateAuctionRow = not isAuctionLotCard
                     and currentPrice == 1000 and stock == 16 and duration <= 0 and headerDuration <= 0
-                local looksLikeDefaultDynamic = currentPrice == 100000
-                    and stock == 16
-                    and duration >= 1700
-                    and duration <= 1900
+                local looksLikeDefaultDynamic = currentPrice == 100000 and stock == 16
                 local rowDynamicTrusted = guiDynamicTrusted and not looksLikeDefaultDynamic
 
                 local expired = false
