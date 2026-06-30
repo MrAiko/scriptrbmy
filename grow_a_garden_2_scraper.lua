@@ -21,7 +21,7 @@ local API_PASSWORD = "mySuperSecretToken123"
 local UPDATE_INTERVAL = 30       -- Fallback interval in seconds to update API
 local POLL_INTERVAL = 2.0        -- Fast state poll interval; fruit data comes from FruitStock snapshot
 local FRUIT_REQUEST_INTERVAL = 10 -- Fallback remote refresh interval if Snapshot event is missed
-local DEBUG = true              -- Set to true only to diagnose scraper issues
+local DEBUG = false             -- Set to true only to diagnose scraper issues
 local MOBILE_SAFE_MODE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 local DESTROY_WORLD_ASSETS = false -- Never destroy Workspace parts; game controllers need plant.Base etc.
 -- =================================================
@@ -4132,6 +4132,52 @@ function updateAPI(fruitData)
         warn("[Grow a Garden 2 Stocker] Error during updateAPI: " .. tostring(err))
     end
 end
+
+local function keepGuiActiveAndHidden()
+    safeTaskSpawn(function()
+        local auctionGui = PlayerGui:WaitForChild("Auction", 30)
+        if auctionGui and auctionGui:IsA("ScreenGui") then
+            pcall(function()
+                auctionGui.Enabled = true
+            end)
+            auctionGui:GetPropertyChangedSignal("Enabled"):Connect(function()
+                pcall(function()
+                    if not auctionGui.Enabled then
+                        auctionGui.Enabled = true
+                    end
+                end)
+            end)
+
+            local frame = auctionGui:WaitForChild("Frame", 10)
+            if frame then
+                pcall(function()
+                    frame.Visible = false
+                end)
+                frame:GetPropertyChangedSignal("Visible"):Connect(function()
+                    pcall(function()
+                        if frame.Visible then
+                            frame.Visible = false
+                        end
+                    end)
+                end)
+
+                pcall(function()
+                    frame.Position = UDim2.new(5, 0, 5, 0)
+                end)
+                frame:GetPropertyChangedSignal("Position"):Connect(function()
+                    pcall(function()
+                        local targetPos = UDim2.new(5, 0, 5, 0)
+                        if frame.Position ~= targetPos then
+                            frame.Position = targetPos
+                        end
+                    end)
+                end)
+            end
+        end
+    end)
+end
+
+pcall(keepGuiActiveAndHidden)
 
 -- ================== EVENT HOOKS ==================
 -- FruitStock.Snapshot is the same source FruitStockPriceController uses for x4/x5 values.
