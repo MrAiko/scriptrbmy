@@ -2153,6 +2153,8 @@ local auctionSnapshotConnected = false
 local auctionStockConnected = false
 local auctionRequestPending = false
 local lastAuctionRequestAt = -10
+local auctionGuiPrimedAt = 0
+local auctionGuiAutoHidden = false
 local AUCTION_REQUEST_INTERVAL = 3
 local AUCTION_STARTUP_RETRY_INTERVAL = 0.75
 local AUCTION_STARTUP_RETRY_COUNT = 24
@@ -3192,6 +3194,46 @@ function getAuctionGuiTimerText(root)
     return getAuctionTextByNames(root, { "Timer", "Time", "RefreshIn" }) or ""
 end
 
+function primeAuctionGuiForLiveValues()
+    local auctionGui = PlayerGui and PlayerGui:FindFirstChild("Auction")
+    if not auctionGui then return false end
+    local frame = auctionGui:FindFirstChild("Frame", true)
+
+    if auctionGui:IsA("ScreenGui") then
+        if auctionGui.Enabled == false then
+            auctionGui.Enabled = true
+            auctionGuiPrimedAt = os.clock()
+            auctionGuiAutoHidden = true
+            if frame and frame:IsA("GuiObject") then
+                frame.Visible = false
+            end
+        elseif auctionGuiPrimedAt <= 0 then
+            auctionGuiPrimedAt = os.clock() - 1
+        end
+    end
+
+    if auctionGuiAutoHidden and frame and frame:IsA("GuiObject") then
+        frame.Visible = false
+    end
+
+    return auctionGuiPrimedAt > 0 and (os.clock() - auctionGuiPrimedAt) > 0.25
+end
+
+function isDefaultAuctionPlaceholderLot(lot)
+    if type(lot) ~= "table" then return false end
+    local startPrice = tonumber(lot.startPrice or lot.currentPrice or lot.price or lot.cost)
+    local stockQuantity = tonumber(lot.stockQuantity)
+    local expiresAt = tonumber(lot.expiresAt) or 0
+    local rolledAt = tonumber(lot.rolledAt) or 0
+    local duration = expiresAt - rolledAt
+    local remaining = expiresAt - getServerNow()
+    local looksLikeThirtyMinuteTimer = (duration >= 1700 and duration <= 1900)
+        or (remaining >= 1700 and remaining <= 1900)
+    return startPrice == 100000
+        and stockQuantity == 16
+        and looksLikeThirtyMinuteTimer
+end
+
 function parseCompactMoney(text)
     local raw = tostring(text or ""):gsub("%s+", "")
     raw = raw:gsub("\194\162", "")
@@ -3261,7 +3303,7 @@ end
 function getAuctionDataFromGui()
     local auctionGui = PlayerGui and PlayerGui:FindFirstChild("Auction")
     if not auctionGui then return nil end
-    local guiDynamicTrusted = true
+    local guiDynamicTrusted = primeAuctionGuiForLiveValues()
     local frame = auctionGui:FindFirstChild("Frame", true)
     local scrollingFrame = frame and frame:FindFirstChild("ScrollingFrame", true)
     if not scrollingFrame then return nil end
@@ -3443,6 +3485,7 @@ function getAuctionData()
             local guiLot = guiLotsById[lotId]
                 or (lotIndex ~= nil and guiLotsByIndex[lotIndex] or nil)
                 or guiLotsByPosition[position]
+            local placeholderLot = isDefaultAuctionPlaceholderLot(lot)
             local stock = getAuctionStockMapValue(latestAuctionStock, lot, lotId, lotIndex, position, rawIndex)
             local hasLiveStock = stock ~= nil
             if stock == nil and type(snapshot.stock) == "table" then
@@ -3458,7 +3501,7 @@ function getAuctionData()
                 stock = guiLot.stock
                 hasLiveStock = true
             end
-            if stock == nil then
+            if stock == nil and not placeholderLot then
                 stock = getAuctionLotFallbackStock(lot)
             end
             local currentPrice = getLotCurrentPrice(lot)
@@ -3467,7 +3510,11 @@ function getAuctionData()
                 currentPrice = tonumber(guiLot.currentPrice)
                 priceKnown = true
             end
-            local stockUnknown = stock == nil and lot.stockQuantity ~= nil
+            if placeholderLot and not useGuiDynamic then
+                priceKnown = false
+                currentPrice = nil
+            end
+            local stockUnknown = stock == nil and (lot.stockQuantity ~= nil or placeholderLot)
             local stockUnlimited = not stockUnknown and stock == nil and lot.stockQuantity == nil
             if stockUnknown then
                 stock = nil
@@ -3476,7 +3523,7 @@ function getAuctionData()
                 currentPrice = nil
             end
             local soldOut = (stock ~= nil and stock <= 0) or (useGuiDynamic and guiLot.soldOut == true)
-            local lotExpiresAt = getAuctionLotExpiry(lot)
+            local lotExpiresAt = placeholderLot and not useGuiDynamic and 0 or getAuctionLotExpiry(lot)
             local expired = lotExpiresAt > 0 and lotExpiresAt <= getServerNow()
             if useGuiDynamic and guiLot.expired ~= nil then
                 expired = guiLot.expired == true
