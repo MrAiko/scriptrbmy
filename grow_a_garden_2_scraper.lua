@@ -4075,31 +4075,21 @@ function fruitHash(list)
 end
 
 local lastUpdateTime = 0
-local updatePending = false
-local pendingFruitData = nil
 
 -- updateAPI(fruitData): fruitData is an optional pre-scraped fruit list. If nil,
 -- fruits are scraped fresh inside. We ALWAYS send live fruit data (never a stale
 -- cache) so the website/bot reflects in-game multiplier changes immediately.
 function updateAPI(fruitData)
-    pendingFruitData = fruitData or pendingFruitData
-    if updatePending then return end
+    writeDebugLog("updateAPI called")
     local now = os.clock()
-    local elapsed = now - lastUpdateTime
-    if elapsed < 1.0 then
-        updatePending = true
-        local waitLeft = 1.0 - elapsed
-        safeTaskDelay(waitLeft, function()
-            updatePending = false
-            local dataToSend = pendingFruitData
-            pendingFruitData = nil
-            updateAPI(dataToSend)
-        end)
+    if now - lastUpdateTime < 1.0 then
+        writeDebugLog("updateAPI rate-limited, ignoring")
         return
     end
     lastUpdateTime = now
-    local dataToSend = pendingFruitData
-    pendingFruitData = nil
+
+    -- Scrape auction data outside the pcall block because it may yield (task.wait)
+    local auctionData = getAuctionData()
 
     local success, err = pcall(function()
         local function resolveShopPath(shopName, innerName)
@@ -4145,13 +4135,11 @@ function updateAPI(fruitData)
                 GearShop = scrapeShopSafe(resolveShopPath("GearShop", "ScrollingFrame")),
                 SeedShop_Normal = scrapeShopSafe(resolveShopPath("SeedShop", "NormalShop"))
             },
-            -- ALWAYS send live fruit data (never a stale cache) so the website reflects
-            -- in-game multiplier changes immediately.
-            fruitMultipliers = dataToSend or fruitData or getFruitMultipliers(),
+            fruitMultipliers = fruitData or getFruitMultipliers(),
             -- Seconds until the next in-game multiplier refresh (dynamic countdown).
             fruitRefreshTimer = getFruitRefreshTimer(),
             calculatorData = getCalculatorData(),
-            auction = getAuctionData(),
+            auction = auctionData,
             debugSnapshot = (latestAuctionSnapshot ~= nil),
             debugNetworking = (getAuctionNetworking() ~= nil),
             debugRemotes = getDebugRemotesInfo()
