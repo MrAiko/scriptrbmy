@@ -2064,17 +2064,10 @@ function cleanScrapedName(name)
 end
 
 local function writeDebugLog(msg)
-    pcall(function()
-        local formatted = "[" .. os.date("%H:%M:%S") .. "] " .. tostring(msg)
-        print(formatted)
-        if writefile then
-            local existing = ""
-            pcall(function() existing = readfile("scraper_debug.log") or "" end)
-            writefile("scraper_debug.log", existing .. "\n" .. formatted)
-        end
-    end)
+    if DEBUG then
+        print("[" .. os.date("%H:%M:%S") .. "] [Grow a Garden 2 Stocker] " .. tostring(msg))
+    end
 end
-pcall(function() if writefile then writefile("scraper_debug.log", "--- Scraper Started ---") end end)
 
 function safeRequireModule(moduleScript)
     if not moduleScript then return nil end
@@ -2205,20 +2198,6 @@ local function getFallbackNetworking(serviceName)
     return nil
 end
 
-local function getDebugRemotesInfo()
-    local list = {}
-    pcall(function()
-        for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
-            if desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") then
-                local name = string.lower(desc.Name)
-                if string.find(name, "auction") or string.find(name, "fruit") or string.find(name, "stock") then
-                    table.insert(list, desc:GetFullName())
-                end
-            end
-        end
-    end)
-    return list
-end
 
 function getAuctionNetworking()
     local networking = getNetworkingModule()
@@ -2569,14 +2548,10 @@ function requestAuctionSnapshot(force)
 
     local auction = getAuctionNetworking()
     local requestRemote = auction and auction.RequestSnapshot
-    if not requestRemote then 
-        writeDebugLog("requestAuctionSnapshot failed: RequestSnapshot remote not found")
-        return false 
-    end
+    if not requestRemote then return false end
 
     auctionRequestPending = true
     lastAuctionRequestAt = now
-    writeDebugLog("Firing RequestSnapshot to server...")
     local ok, result = pcall(function()
         if requestRemote.Fire then
             return requestRemote:Fire()
@@ -2594,15 +2569,11 @@ function requestAuctionSnapshot(force)
     end)
     auctionRequestPending = false
 
-    if ok then
-        writeDebugLog("RequestSnapshot fired successfully. Result type: " .. type(result))
-        if type(result) == "table" then
-            writeDebugLog("Received inline snapshot from RequestSnapshot invoke!")
-            return applyAuctionSnapshot(result)
-        end
-        return true
-    else
-        writeDebugLog("RequestSnapshot fire failed: " .. tostring(result))
+    if ok and type(result) == "table" then
+        return applyAuctionSnapshot(result)
+    end
+    if DEBUG and not ok then
+        warn("[Grow a Garden 2 Stocker] Auctioneer.RequestSnapshot failed: " .. tostring(result))
     end
     return false
 end
@@ -2610,60 +2581,44 @@ end
 function connectAuctionSnapshot(onSnapshot)
     if auctionSnapshotConnected then return end
     local auction = getAuctionNetworking()
-    if not auction then 
-        writeDebugLog("connectAuctionSnapshot failed: auction networking not found")
-        return 
-    end
+    if not auction then return end
 
     local connected = false
     local ok, err = pcall(function()
         local snapshotEvent = auction.Snapshot
         if snapshotEvent then
-            writeDebugLog("Connecting to Snapshot event...")
             if snapshotEvent.OnClientEvent then
                 snapshotEvent.OnClientEvent:Connect(function(snapshot)
-                    writeDebugLog("Snapshot OnClientEvent received!")
                     if applyAuctionSnapshot(snapshot) and onSnapshot then onSnapshot() end
                 end)
                 connected = true
             elseif snapshotEvent.Connect then
                 snapshotEvent:Connect(function(snapshot)
-                    writeDebugLog("Snapshot Connect received!")
                     if applyAuctionSnapshot(snapshot) and onSnapshot then onSnapshot() end
                 end)
                 connected = true
             end
-        else
-            writeDebugLog("SnapshotEvent not found in auction networking")
         end
 
         local stockEvent = auction.StockUpdate
         if stockEvent then
-            writeDebugLog("Connecting to StockUpdate event...")
             if stockEvent.OnClientEvent then
-                snapshotEvent = stockEvent
-                snapshotEvent.OnClientEvent:Connect(function(update)
-                    writeDebugLog("StockUpdate OnClientEvent received!")
+                stockEvent.OnClientEvent:Connect(function(update)
                     if applyAuctionStockUpdate(update) and onSnapshot then onSnapshot() end
                 end)
                 connected = true
             elseif stockEvent.Connect then
-                snapshotEvent = stockEvent
-                snapshotEvent:Connect(function(update)
-                    writeDebugLog("StockUpdate Connect received!")
+                stockEvent:Connect(function(update)
                     if applyAuctionStockUpdate(update) and onSnapshot then onSnapshot() end
                 end)
                 connected = true
             end
-        else
-            writeDebugLog("StockUpdate event not found in auction networking")
         end
     end)
-    if ok and connected then
-        writeDebugLog("connectAuctionSnapshot connected successfully")
-        auctionSnapshotConnected = true
-    else
-        writeDebugLog("connectAuctionSnapshot failed: " .. tostring(err or "unknown error"))
+
+    auctionSnapshotConnected = ok and connected
+    if DEBUG and not ok then
+        warn("[Grow a Garden 2 Stocker] Failed to connect Auctioneer events: " .. tostring(err))
     end
 end
 
@@ -3057,47 +3012,21 @@ function getAuctionDataFromGui()
 end
 
 function getAuctionData()
-    writeDebugLog("getAuctionData called")
-    local auctionGui = PlayerGui and PlayerGui:FindFirstChild("Auction")
-    local wasEnabled = false
-    if auctionGui and auctionGui:IsA("ScreenGui") then
-        wasEnabled = auctionGui.Enabled
-        if not wasEnabled then
-            writeDebugLog("Temporarily enabling Auction GUI to force refresh...")
-            auctionGui.Enabled = true
-            -- Wait a few frames for the client controller to update labels
-            safeTaskWait(0.05)
-        end
+    if not latestAuctionSnapshot or (os.clock() - latestAuctionAt) > AUCTION_REQUEST_INTERVAL then
+        requestAuctionSnapshot(false)
     end
-
-    local success, result = pcall(getAuctionDataFromGui)
-    
-    if auctionGui and auctionGui:IsA("ScreenGui") and not wasEnabled then
-        writeDebugLog("Disabling Auction GUI")
-        auctionGui.Enabled = false
-    end
-
-    if success and result and result.lots and #result.lots > 0 then
-        writeDebugLog("Successfully scraped " .. tostring(#result.lots) .. " lots from GUI!")
-        return result
-    end
-
-    writeDebugLog("GUI scrape returned no lots. Falling back to snapshot/original logic...")
     local snapshot = latestAuctionSnapshot
-    if type(snapshot) ~= "table" then 
-        return success and result or nil 
-    end
+    if type(snapshot) ~= "table" then return getAuctionDataFromGui() end
 
     local rawLots = snapshot.manifest and snapshot.manifest.lots
-    if type(rawLots) ~= "table" then 
-        return success and result or nil 
-    end
+    if type(rawLots) ~= "table" then return getAuctionDataFromGui() end
 
+    local guiData = getAuctionDataFromGui()
     local guiLotsById = {}
     local guiLotsByIndex = {}
     local guiLotsByPosition = {}
-    if result and type(result.lots) == "table" then
-        for position, guiLot in ipairs(result.lots) do
+    if guiData and type(guiData.lots) == "table" then
+        for position, guiLot in ipairs(guiData.lots) do
             if guiLot and guiLot.lotId then
                 local normalizedLotId = normalizeAuctionLotId(guiLot.lotId)
                 guiLotsById[normalizedLotId] = guiLot
@@ -3203,6 +3132,10 @@ function getAuctionData()
         return tostring(a.lotId or "") < tostring(b.lotId or "")
     end)
 
+    if #lots == 0 then
+        return getAuctionDataFromGui()
+    end
+
     local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds) or 0
     local rollWindowUnix = tonumber(snapshot.rollWindowUnix) or 0
     local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
@@ -3223,9 +3156,8 @@ function getAuctionData()
             refreshAt = nextLotExpiry
         end
     end
-    local guiRefreshAt = result and tonumber(result.refreshAt) or 0
-    if guiRefreshAt > serverNow then
-        refreshAt = guiRefreshAt
+    if guiData and tonumber(guiData.refreshAt) and tonumber(guiData.refreshAt) > serverNow then
+        refreshAt = tonumber(guiData.refreshAt)
     end
     if refreshAt > serverNow then
         for _, lot in ipairs(lots) do
@@ -4075,21 +4007,31 @@ function fruitHash(list)
 end
 
 local lastUpdateTime = 0
+local updatePending = false
+local pendingFruitData = nil
 
 -- updateAPI(fruitData): fruitData is an optional pre-scraped fruit list. If nil,
 -- fruits are scraped fresh inside. We ALWAYS send live fruit data (never a stale
 -- cache) so the website/bot reflects in-game multiplier changes immediately.
 function updateAPI(fruitData)
-    writeDebugLog("updateAPI called")
+    pendingFruitData = fruitData or pendingFruitData
+    if updatePending then return end
     local now = os.clock()
-    if now - lastUpdateTime < 1.0 then
-        writeDebugLog("updateAPI rate-limited, ignoring")
+    local elapsed = now - lastUpdateTime
+    if elapsed < 1.0 then
+        updatePending = true
+        local waitLeft = 1.0 - elapsed
+        safeTaskDelay(waitLeft, function()
+            updatePending = false
+            local dataToSend = pendingFruitData
+            pendingFruitData = nil
+            updateAPI(dataToSend)
+        end)
         return
     end
     lastUpdateTime = now
-
-    -- Scrape auction data outside the pcall block because it may yield (task.wait)
-    local auctionData = getAuctionData()
+    local dataToSend = pendingFruitData
+    pendingFruitData = nil
 
     local success, err = pcall(function()
         local function resolveShopPath(shopName, innerName)
@@ -4135,14 +4077,13 @@ function updateAPI(fruitData)
                 GearShop = scrapeShopSafe(resolveShopPath("GearShop", "ScrollingFrame")),
                 SeedShop_Normal = scrapeShopSafe(resolveShopPath("SeedShop", "NormalShop"))
             },
-            fruitMultipliers = fruitData or getFruitMultipliers(),
+            -- ALWAYS send live fruit data (never a stale cache) so the website reflects
+            -- in-game multiplier changes immediately.
+            fruitMultipliers = dataToSend or fruitData or getFruitMultipliers(),
             -- Seconds until the next in-game multiplier refresh (dynamic countdown).
             fruitRefreshTimer = getFruitRefreshTimer(),
             calculatorData = getCalculatorData(),
-            auction = auctionData,
-            debugSnapshot = (latestAuctionSnapshot ~= nil),
-            debugNetworking = (getAuctionNetworking() ~= nil),
-            debugRemotes = getDebugRemotesInfo()
+            auction = getAuctionData()
         }
 
         safeTaskSpawn(function()
