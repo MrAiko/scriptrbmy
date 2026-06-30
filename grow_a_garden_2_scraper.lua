@@ -21,10 +21,55 @@ local DESTROY_WORLD_ASSETS = false -- Never destroy Workspace parts; game contro
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local SharedModules = ReplicatedStorage:WaitForChild("SharedModules", 10)
 
+function safeTaskSpawn(fn)
+    if type(task) == "table" and type(task.spawn) == "function" then
+        return task.spawn(fn)
+    end
+    if type(spawn) == "function" then
+        return spawn(fn)
+    end
+    local thread = coroutine.create(fn)
+    return coroutine.resume(thread)
+end
+
+function safeTaskDelay(seconds, fn)
+    if type(task) == "table" and type(task.delay) == "function" then
+        return task.delay(seconds, fn)
+    end
+    if type(delay) == "function" then
+        return delay(seconds, fn)
+    end
+    return safeTaskSpawn(function()
+        if type(task) == "table" and type(task.wait) == "function" then
+            task.wait(seconds)
+        elseif type(wait) == "function" then
+            wait(seconds)
+        end
+        fn()
+    end)
+end
+
+function safeTaskDefer(fn)
+    if type(task) == "table" and type(task.defer) == "function" then
+        return task.defer(fn)
+    end
+    return safeTaskDelay(0, fn)
+end
+
+function safeTaskWait(seconds)
+    if type(task) == "table" and type(task.wait) == "function" then
+        return task.wait(seconds)
+    end
+    if type(wait) == "function" then
+        return wait(seconds)
+    end
+    return nil
+end
+
 -- ================== CLIENT OPTIMIZATION ==================
 -- Aggressively reduce client CPU/GPU/RAM usage so the scraper runs with near-zero
 -- overhead. All steps are wrapped in pcall so a failure never breaks scraping.
-local function optimizeClient()
+function optimizeClient()
     local RunService = game:GetService("RunService")
 
     -- 1. Stop 3D world rendering entirely.
@@ -92,7 +137,7 @@ local function optimizeClient()
         -- Destroy other players' characters locally.
         local player = Players:GetPlayerFromCharacter(instance)
         if player and player ~= LocalPlayer then
-            task.defer(function() pcall(function() instance:Destroy() end) end)
+            safeTaskDefer(function() pcall(function() instance:Destroy() end) end)
             return
         end
         -- Walk up the parent chain; if any ancestor is a moon/eclipse asset, keep it.
@@ -108,7 +153,7 @@ local function optimizeClient()
         if instance:IsA("BasePart") or instance:IsA("Decal") or instance:IsA("Texture")
            or instance:IsA("SpecialMesh") or instance:IsA("ParticleEmitter")
            or instance:IsA("Beam") or instance:IsA("Trail") or instance:IsA("PostEffect") then
-            task.defer(function() pcall(function() instance:Destroy() end) end)
+            safeTaskDefer(function() pcall(function() instance:Destroy() end) end)
         end
     end
 
@@ -121,7 +166,7 @@ local function optimizeClient()
     end
 
     -- 8. Black overlay indicating optimization mode (no brand text).
-    task.spawn(function()
+    safeTaskSpawn(function()
         pcall(function()
             local pGui = LocalPlayer:WaitForChild("PlayerGui", 15)
             if not pGui then return end
@@ -165,7 +210,7 @@ local function optimizeClient()
             status.TextSize = 16
             status.TextWrapped = true
             status.TextYAlignment = Enum.TextYAlignment.Top
-            status.Text = "⚙️ Optimization: EXTREME (Void Mode)\n\n" ..
+            status.Text = "РІС™в„ўРїС‘РЏ Optimization: EXTREME (Void Mode)\n\n" ..
                           "Monitoring stock, weather, moon phases and fruit multipliers in the background...\n\n" ..
                           "Active & Connected"
             status.Parent = content
@@ -176,12 +221,12 @@ local function optimizeClient()
 end
 
 -- ================== NAME HELPERS ==================
-local function formatCamelCase(str)
+function formatCamelCase(str)
     if not str then return nil end
     return (str:gsub("(%l)(%u)", "%1 %2"))
 end
 
-local function cleanPhaseName(name)
+function cleanPhaseName(name)
     local formatted = formatCamelCase(name)
     local key = string.lower(tostring(formatted or name or "")):gsub("[^%w]", "")
     if key == "night" then return "Moon" end
@@ -195,11 +240,11 @@ local function cleanPhaseName(name)
     return formatted
 end
 
-local function normalizeName(name)
+function normalizeName(name)
     return string.lower(tostring(name or "")):gsub("[^%w]", "")
 end
 
-local function isTechnicalPhaseName(name)
+function isTechnicalPhaseName(name)
     local key = normalizeName(name)
     return key == "" or string.find(key, "websocket") or string.find(key, "remote")
         or string.find(key, "controller") or string.find(key, "module")
@@ -217,7 +262,7 @@ local PHASE_FALLBACK_IMAGES = {
     megamoon = "107925838920918",
 }
 
-local function getPhaseKey(name)
+function getPhaseKey(name)
     if not name or name == "" or isTechnicalPhaseName(name) then return nil end
     local key = normalizeName(name)
     if key == "night" then return "moon" end
@@ -233,7 +278,7 @@ local function getPhaseKey(name)
     return nil
 end
 
-local function getPhaseFallbackImage(name)
+function getPhaseFallbackImage(name)
     local phaseKey = getPhaseKey(name)
     return phaseKey and PHASE_FALLBACK_IMAGES[phaseKey] or nil
 end
@@ -245,11 +290,11 @@ local weatherDataByKeyCache = nil
 local weatherDataCacheAt = -999
 local WEATHER_DATA_REFRESH_INTERVAL = 5
 
-local function getWeatherValues()
+function getWeatherValues()
     return ReplicatedStorage:FindFirstChild("WeatherValues")
 end
 
-local function normalizeWeatherImageRef(value)
+function normalizeWeatherImageRef(value)
     if value == nil then return nil end
     local str = tostring(value)
     if str == "" or str == "0" or str == "112886786873408" then return nil end
@@ -263,12 +308,12 @@ local RAINBOW_MOON_IMAGE_IDS = {
     ["93602895495056"] = true
 }
 
-local function weatherImageRefContainsId(image, assetId)
+function weatherImageRefContainsId(image, assetId)
     if not image or not assetId then return false end
     return string.find(tostring(image), tostring(assetId), 1, true) ~= nil
 end
 
-local function isWeatherImageValidForName(name, image)
+function isWeatherImageValidForName(name, image)
     if not image then return false end
     local key = normalizeName(name)
     if key == "rainbow" then
@@ -285,7 +330,7 @@ local function isWeatherImageValidForName(name, image)
     return true
 end
 
-local function stripWeatherWrapperTokens(key)
+function stripWeatherWrapperTokens(key)
     local stripped = key
     for _, token in ipairs({ "weather", "event", "active", "state", "card", "frame", "ui", "button", "container", "holder" }) do
         stripped = string.gsub(stripped, token, "")
@@ -297,12 +342,12 @@ local WEATHER_CANONICAL_NAME_OVERRIDES = {
     lightning = "Thunderstorm"
 }
 
-local function canonicalWeatherDisplayName(rawName)
+function canonicalWeatherDisplayName(rawName)
     local key = normalizeName(rawName)
     return WEATHER_CANONICAL_NAME_OVERRIDES[key] or formatCamelCase(rawName) or rawName
 end
 
-local function addWeatherDataEntry(entries, byKey, rawName, image)
+function addWeatherDataEntry(entries, byKey, rawName, image)
     if type(rawName) ~= "string" or rawName == "" then return end
     if isTechnicalPhaseName(rawName) or isDecorativeWeatherCatalogName(rawName) then return end
 
@@ -323,7 +368,7 @@ local function addWeatherDataEntry(entries, byKey, rawName, image)
     byKey[stripWeatherWrapperTokens(key)] = entry
 end
 
-local function getWeatherDataEntries()
+function getWeatherDataEntries()
     local now = os.clock()
     if weatherDataCache and (now - weatherDataCacheAt) < WEATHER_DATA_REFRESH_INTERVAL then
         return weatherDataCache, weatherDataByKeyCache
@@ -373,7 +418,7 @@ local function getWeatherDataEntries()
     return entries, byKey
 end
 
-local function findWeatherDataEntryByName(name)
+function findWeatherDataEntryByName(name)
     local key = normalizeName(name)
     if key == "" then return nil end
     local _, byKey = getWeatherDataEntries()
@@ -394,12 +439,12 @@ local function findWeatherDataEntryByName(name)
     return nil
 end
 
-local function cleanWeatherStateName(name)
+function cleanWeatherStateName(name)
     local entry = findWeatherDataEntryByName(name)
     return entry and entry.name or nil
 end
 
-local function isKnownWeatherStateName(name)
+function isKnownWeatherStateName(name)
     return cleanWeatherStateName(name) ~= nil
 end
 
@@ -421,7 +466,7 @@ isDecorativeWeatherCatalogName = function(name)
         or string.find(key, "bevel") or string.find(key, "overlay")
 end
 
-local function findChildByNormalizedName(parent, names)
+function findChildByNormalizedName(parent, names)
     if not parent then return nil end
     for _, targetName in ipairs(names) do
         local exact = parent:FindFirstChild(targetName)
@@ -446,7 +491,7 @@ local FALLBACK_PHASE_NAMES = {
 
 local cachedTimeCycle = nil
 
-local function findTimeCycleController()
+function findTimeCycleController()
     if cachedTimeCycle and cachedTimeCycle.Parent and findChildByNormalizedName(cachedTimeCycle, { "Phases", "phases" }) then
         return cachedTimeCycle
     end
@@ -464,12 +509,12 @@ local function findTimeCycleController()
     return nil
 end
 
-local function getPhasesFolder()
+function getPhasesFolder()
     local tc = findTimeCycleController()
     return tc and findChildByNormalizedName(tc, { "Phases", "phases" }) or nil
 end
 
-local function getKnownPhaseNames()
+function getKnownPhaseNames()
     local names, seen = {}, {}
     local function add(name)
         if not name or name == "" then return end
@@ -492,7 +537,7 @@ local function getKnownPhaseNames()
     return names
 end
 
-local function isDefaultPhaseName(name)
+function isDefaultPhaseName(name)
     local key = normalizeName(name)
     return key == "day" or key == "sunset" or key == "moon" or key == "night"
 end
@@ -506,7 +551,7 @@ local DECORATION_SUFFIXES = {
     "attachment", "attachments", "decal", "decals", "billboard", "billboardgui",
 }
 
-local function isDecorationAsset(instanceKey, phaseKey)
+function isDecorationAsset(instanceKey, phaseKey)
     if #instanceKey <= #phaseKey then return false end
     if string.sub(instanceKey, 1, #phaseKey) ~= phaseKey then return false end
     local rest = string.sub(instanceKey, #phaseKey + 1)
@@ -516,7 +561,7 @@ local function isDecorationAsset(instanceKey, phaseKey)
     return false
 end
 
-local function findActivePhaseAsset(container, specialOnly)
+function findActivePhaseAsset(container, specialOnly)
     if not container then return nil end
     local instances = {}
     for _, child in ipairs(container:GetChildren()) do
@@ -549,7 +594,7 @@ local function findActivePhaseAsset(container, specialOnly)
 end
 
 -- ================== HTTP ==================
-local function addHttpCandidate(list, fn)
+function addHttpCandidate(list, fn)
     if type(fn) == "function" then
         for _, existing in ipairs(list) do
             if existing == fn then return end
@@ -558,7 +603,7 @@ local function addHttpCandidate(list, fn)
     end
 end
 
-local function getExecutorHttpCandidates()
+function getExecutorHttpCandidates()
     local list = {}
     addHttpCandidate(list, request)
     addHttpCandidate(list, http_request)
@@ -586,7 +631,7 @@ local function getExecutorHttpCandidates()
     return list
 end
 
-local function normalizeHttpResult(response)
+function normalizeHttpResult(response)
     if type(response) == "table" then
         local status = response.StatusCode or response.Status or response.status or response.status_code or response.code
         local body = response.Body or response.body or response.Response or response.response or response.Data or response.data or ""
@@ -605,7 +650,7 @@ local function normalizeHttpResult(response)
     return false, "no response"
 end
 
-local function makeHttpRequest(url, method, headers, body)
+function makeHttpRequest(url, method, headers, body)
     local lastErr = nil
     for _, requestFunc in ipairs(getExecutorHttpCandidates()) do
         local payloads = {
@@ -669,7 +714,7 @@ end
 local wsConnection = nil
 local isWsConnecting = false
 
-local function getWebSocketClient()
+function getWebSocketClient()
     if wsConnection then return wsConnection end
     if isWsConnecting then return nil end
     
@@ -679,7 +724,7 @@ local function getWebSocketClient()
     end
     
     isWsConnecting = true
-    task.spawn(function()
+    safeTaskSpawn(function()
         local wsUrl = API_URL:gsub("https://", "wss://"):gsub("http://", "ws://")
         if wsUrl:sub(-10) == "/api/stock" then
             wsUrl = wsUrl:sub(1, -11)
@@ -731,7 +776,7 @@ end
 
 
 -- ================== RESTOCK TIMES ==================
-local function getRestockTimes()
+function getRestockTimes()
     local times = {
         CrateShop = { last = 0, next = 0 },
         GearShop = { last = 0, next = 0 },
@@ -781,7 +826,7 @@ local GENERIC_ITEM_NAMES = {
     backpack = true, character = true
 }
 
-local function isTechnicalItem(name)
+function isTechnicalItem(name)
     local ln = string.lower(name)
     return ln == "itemtemplate" or ln == "template" or ln == "padding" or ln == "uipadting"
         or ln == "uipadding" or ln == "robux_shelf" or ln == "sheckles_shelf" or ln == "shackles_shelf"
@@ -789,7 +834,7 @@ local function isTechnicalItem(name)
         or string.find(ln, "shelf") or string.find(ln, "layout")
 end
 
-local function isGenericItemName(name)
+function isGenericItemName(name)
     if not name or name == "" then return true end
     local ln = string.lower(name)
     if GENERIC_ITEM_NAMES[ln] then return true end
@@ -797,7 +842,7 @@ local function isGenericItemName(name)
     return isTechnicalItem(name)
 end
 
-local function detectRarity(itemRoot)
+function detectRarity(itemRoot)
     local rarityFrame = itemRoot:FindFirstChild("Rarity", true)
     if rarityFrame then
         for _, c in ipairs(rarityFrame:GetChildren()) do
@@ -827,7 +872,7 @@ local DECORATIVE_IMAGE_NAMES = {
     shine = true, overlay = true, rarity = true, main_frame = true,
 }
 
-local function detectImage(itemRoot)
+function detectImage(itemRoot)
     -- Pass 1: prefer ImageLabels/ImageButtons whose Name marks them as the item icon.
     -- This is the correct icon (ImageDisplay / Vector in the new card layout).
     for _, desc in ipairs(itemRoot:GetDescendants()) do
@@ -864,7 +909,7 @@ local function detectImage(itemRoot)
     return nil
 end
 
-local function getNestedText(itemRoot, containerName)
+function getNestedText(itemRoot, containerName)
     local container = itemRoot:FindFirstChild(containerName, true)
     if not container then return nil end
     if container:IsA("TextLabel") and container.Text and container.Text ~= "" then
@@ -878,7 +923,7 @@ local function getNestedText(itemRoot, containerName)
     return nil
 end
 
-local function scrapeShop(container)
+function scrapeShop(container)
     local items = {}
     if not container then return items end
     for _, desc in ipairs(container:GetDescendants()) do
@@ -919,25 +964,25 @@ local function scrapeShop(container)
     return items
 end
 
-local function scrapeShopSafe(container)
+function scrapeShopSafe(container)
     local success, items = pcall(function() return scrapeShop(container) end)
     return success and items or {}
 end
 
 -- ================== WEATHER / PHASE ==================
-local function getDefaultPhase()
+function getDefaultPhase()
     local clock = game.Lighting.ClockTime
     if clock >= 17 and clock < 19.5 then return "Sunset"
     elseif clock >= 6 and clock < 17 then return "Day"
     else return "Moon" end
 end
 
-local function isNightPhase(phaseName)
+function isNightPhase(phaseName)
     local lower = string.lower(phaseName)
     return lower ~= "day" and lower ~= "sunset"
 end
 
-local function isInstanceVisible(instance)
+function isInstanceVisible(instance)
     local p = instance
     while p and p ~= PlayerGui do
         if p:IsA("GuiObject") and p.Visible == false then return false end
@@ -946,7 +991,7 @@ local function isInstanceVisible(instance)
     return true
 end
 
-local function hasTruthyAttribute(instance, names)
+function hasTruthyAttribute(instance, names)
     if not instance then return false end
     for _, attrName in ipairs(names) do
         local ok, value = pcall(function() return instance:GetAttribute(attrName) end)
@@ -959,7 +1004,7 @@ local function hasTruthyAttribute(instance, names)
     return false
 end
 
-local function valueLooksTruthy(value)
+function valueLooksTruthy(value)
     if value == true then return true end
     if type(value) == "number" then return value > 0 end
     if type(value) == "string" then
@@ -973,7 +1018,7 @@ local function valueLooksTruthy(value)
     return false
 end
 
-local function hasTruthyStateSignal(instance, names)
+function hasTruthyStateSignal(instance, names)
     if not instance then return false end
     if hasTruthyAttribute(instance, names) then return true end
 
@@ -996,11 +1041,11 @@ local function hasTruthyStateSignal(instance, names)
     return false
 end
 
-local function textLooksActive(text)
+function textLooksActive(text)
     local lower = string.lower(tostring(text or ""))
     if lower == "" then return false end
     if string.find(lower, "starts") or string.find(lower, "start in")
-       or string.find(lower, "начн") or string.find(lower, "скоро") then
+       or string.find(lower, "Р Р…Р В°РЎвЂЎР Р…") or string.find(lower, "РЎРѓР С”Р С•РЎР‚Р С•") then
         return false
     end
     return string.find(lower, "%d+:%d+") ~= nil
@@ -1011,11 +1056,11 @@ local function textLooksActive(text)
         or string.find(lower, "ends") ~= nil
         or string.find(lower, "remaining") ~= nil
         or string.find(lower, "left") ~= nil
-        or string.find(lower, "актив") ~= nil
-        or string.find(lower, "ид") ~= nil
+        or string.find(lower, "Р В°Р С”РЎвЂљР С‘Р Р†") ~= nil
+        or string.find(lower, "Р С‘Р Т‘") ~= nil
 end
 
-local function isWeatherCardActive(card)
+function isWeatherCardActive(card)
     if not card or not card:IsA("GuiObject") then return false end
     if not isInstanceVisible(card) then return false end
     local stateNames = { "Playing", "Active", "IsActive", "Enabled", "Running", "Started", "playing", "active", "enabled", "running" }
@@ -1036,7 +1081,7 @@ local function isWeatherCardActive(card)
     return false
 end
 
-local function parseTimeToSeconds(timeStr)
+function parseTimeToSeconds(timeStr)
     if not timeStr or timeStr == "" then return 0 end
     local cleanStr = string.match(timeStr, "(%d+:%d+)") or timeStr
     local m, s = string.match(cleanStr, "(%d+):(%d+)")
@@ -1050,7 +1095,7 @@ local function parseTimeToSeconds(timeStr)
     return total
 end
 
-local function findWeatherUI()
+function findWeatherUI()
     local exact = PlayerGui:FindFirstChild("WeatherUI")
     if exact then return exact end
     exact = PlayerGui:FindFirstChild("Weather")
@@ -1067,7 +1112,7 @@ local function findWeatherUI()
     return nil
 end
 
-local function getActiveTimerText()
+function getActiveTimerText()
     local weatherUI = findWeatherUI()
     if not weatherUI then return nil end
     local frame = weatherUI:FindFirstChild("Frame") or weatherUI
@@ -1106,7 +1151,7 @@ local function getActiveTimerText()
     return nil
 end
 
-local function findImageId(instance, expectedName)
+function findImageId(instance, expectedName)
     if not instance then return nil end
     local expectedKey = normalizeName(expectedName or instance.Name or "")
     local expectedPhaseKey = getPhaseKey(expectedName or instance.Name or "")
@@ -1277,12 +1322,12 @@ local function findImageId(instance, expectedName)
     return nil
 end
 
-local function isWeatherPhaseName(name)
+function isWeatherPhaseName(name)
     if isTechnicalPhaseName(name) then return false end
     return getPhaseKey(name) ~= nil
 end
 
-local function resolveWeatherCardName(instance)
+function resolveWeatherCardName(instance)
     if not instance then return nil, false end
     local rawName = instance.Name
     if isTechnicalPhaseName(rawName) or isDecorativeWeatherCatalogName(rawName) then
@@ -1338,7 +1383,7 @@ local function resolveWeatherCardName(instance)
     return nil, false
 end
 
-local function getWeatherFrameCards(frame)
+function getWeatherFrameCards(frame)
     local cards, seen = {}, {}
     local function add(inst)
         if not inst or seen[inst] or not inst:IsA("GuiObject") then return end
@@ -1358,7 +1403,7 @@ local function getWeatherFrameCards(frame)
     return cards
 end
 
-local function findWeatherFrameCard(frame, name)
+function findWeatherFrameCard(frame, name)
     if not frame or not name then return nil end
     local wantedEntry = findWeatherDataEntryByName(name)
     local wantedKey = wantedEntry and wantedEntry.key or normalizeName(name)
@@ -1375,7 +1420,7 @@ local function findWeatherFrameCard(frame, name)
     return nil
 end
 
-local function getWeatherStateScanRoots()
+function getWeatherStateScanRoots()
     local roots, seen = {}, {}
     local function add(root)
         if root and not seen[root] then
@@ -1400,7 +1445,7 @@ local function getWeatherStateScanRoots()
     return roots
 end
 
-local function readWeatherNameFromValue(value)
+function readWeatherNameFromValue(value)
     if type(value) ~= "string" then return nil, false end
     if isWeatherPhaseName(value) then
         return cleanPhaseName(value), true
@@ -1412,7 +1457,7 @@ local function readWeatherNameFromValue(value)
     return nil, false
 end
 
-local function getActiveWeatherFromWeatherValues(endTime, frame)
+function getActiveWeatherFromWeatherValues(endTime, frame)
     local weathers = {}
     local weatherValues = getWeatherValues()
     if not weatherValues then
@@ -1460,7 +1505,7 @@ local function getActiveWeatherFromWeatherValues(endTime, frame)
     return weathers, maxEndTime
 end
 
-local function getActiveWeatherFromStateRoots(endTime)
+function getActiveWeatherFromStateRoots(endTime)
     local weathers = {}
     local phase = nil
     local visited = 0
@@ -1542,7 +1587,7 @@ local WEATHER_CATALOG_RESCAN_INTERVAL = 120
 local WEATHER_CATALOG_SCAN_LIMIT = 5000
 local weatherCatalogCacheAt = -WEATHER_CATALOG_RESCAN_INTERVAL
 
-local function getWeatherCatalogScanRoots()
+function getWeatherCatalogScanRoots()
     local roots, seen = {}, {}
     local function add(root)
         if root and not seen[root] then
@@ -1589,7 +1634,7 @@ local function getWeatherCatalogScanRoots()
     return roots
 end
 
-local function rebuildWeatherCatalogCache()
+function rebuildWeatherCatalogCache()
     local catalog, visited = {}, 0
 
     local function add(rawName, root, allowUnknown)
@@ -1658,7 +1703,7 @@ local function rebuildWeatherCatalogCache()
     weatherCatalogCacheAt = os.clock()
 end
 
-local function getWeatherCatalog()
+function getWeatherCatalog()
     local catalog = {}
     local function add(rawName, root, allowUnknown)
         if not rawName or rawName == "" or not root then return end
@@ -1710,7 +1755,7 @@ local function getWeatherCatalog()
     return catalog
 end
 
-local function getActiveWeatherAndPhase()
+function getActiveWeatherAndPhase()
     local activePhase = getDefaultPhase()
     local workspacePhase = findActivePhaseAsset(workspace, true)
     if workspacePhase and not isTechnicalPhaseName(workspacePhase) then activePhase = workspacePhase end
@@ -1770,7 +1815,7 @@ local function getActiveWeatherAndPhase()
     return activePhase, activePhaseImage, activeWeathers, endTime
 end
 
-local function getWeathersHash(weathers)
+function getWeathersHash(weathers)
     local parts = {}
     for name, info in pairs(weathers) do
         if info.playing then table.insert(parts, name .. ":true") end
@@ -1779,7 +1824,7 @@ local function getWeathersHash(weathers)
     return table.concat(parts, "|")
 end
 
-local function getWeatherCatalogHash(catalog)
+function getWeatherCatalogHash(catalog)
     local parts = {}
     for name, info in pairs(catalog or {}) do
         table.insert(parts, tostring(name) .. ":" .. tostring(info and info.image or ""))
@@ -1788,7 +1833,7 @@ local function getWeatherCatalogHash(catalog)
     return table.concat(parts, "|")
 end
 
-local function getCatalogImageByName(catalog, name)
+function getCatalogImageByName(catalog, name)
     if not catalog or not name then return nil end
     local wantedKey = getPhaseKey(name) or normalizeName(name)
     if wantedKey == "" then return nil end
@@ -1809,11 +1854,11 @@ end
 
 -- Legacy GUI parser retained only as dead fallback/reference; active code below uses
 -- FruitImages + FruitStock snapshots and never calls these legacy* functions.
-local function legacyGetFruitRefreshTimer()
+function legacyGetFruitRefreshTimer()
     return nil
 end
 
-local function legacyGetFruitMultipliers()
+function legacyGetFruitMultipliers()
     if true then return {} end
     local multipliers = {}
     local success, err = pcall(function()
@@ -1874,7 +1919,7 @@ local function legacyGetFruitMultipliers()
                                 local num = string.match(cleanText, "([%d%.]+)")
                                 if num then
                                     local lowerText = string.lower(desc.Text)
-                                    if string.find(lowerText, "x") or string.find(lowerText, "х") or string.find(lowerText, "%*") 
+                                    if string.find(lowerText, "x") or string.find(lowerText, "РЎвЂ¦") or string.find(lowerText, "%*") 
                                        or string.match(cleanText, "^%s*[%d%.]+%s*$") then
                                         multText = num
                                         multiplierLabel = desc
@@ -2002,14 +2047,14 @@ end
 
 -- Active fruit multiplier source:
 -- FruitImages gives fruit name -> image id, FruitStock snapshot gives fruit name -> multiplier/tier.
-local function cleanScrapedName(name)
+function cleanScrapedName(name)
     if not name then return nil end
     local str = tostring(name)
     if string.find(string.lower(str), "^photo_") then return string.sub(str, 7) end
     return str
 end
 
-local function safeRequireModule(moduleScript)
+function safeRequireModule(moduleScript)
     if not moduleScript then return nil end
     local ok, result = pcall(function()
         return require(moduleScript)
@@ -2021,21 +2066,21 @@ local function safeRequireModule(moduleScript)
     return nil
 end
 
-local function getSharedModule(moduleName)
+function getSharedModule(moduleName)
     local root = SharedModules or ReplicatedStorage:FindFirstChild("SharedModules")
     return root and root:FindFirstChild(moduleName) or nil
 end
 
 local cachedNetworking = nil
 
-local function getNetworkingModule()
+function getNetworkingModule()
     if not cachedNetworking then
         cachedNetworking = safeRequireModule(getSharedModule("Networking"))
     end
     return cachedNetworking
 end
 
-local function normalizeAssetRef(value)
+function normalizeAssetRef(value)
     if value == nil then return nil end
     local str = tostring(value)
     if str == "" then return nil end
@@ -2057,14 +2102,14 @@ local auctionRequestPending = false
 local lastAuctionRequestAt = -10
 local AUCTION_REQUEST_INTERVAL = 10
 
-local function getAuctioneerModule()
+function getAuctioneerModule()
     if not cachedAuctioneer then
         cachedAuctioneer = safeRequireModule(getSharedModule("Auctioneer"))
     end
     return cachedAuctioneer
 end
 
-local function getMailboxItemCatalog()
+function getMailboxItemCatalog()
     if cachedMailboxItemCatalog ~= false then
         return cachedMailboxItemCatalog
     end
@@ -2078,12 +2123,12 @@ local function getMailboxItemCatalog()
     return cachedMailboxItemCatalog
 end
 
-local function getAuctionNetworking()
+function getAuctionNetworking()
     local networking = getNetworkingModule()
     return networking and networking.Auctioneer or nil
 end
 
-local function getServerNow()
+function getServerNow()
     local ok, result = pcall(function()
         return workspace:GetServerTimeNow()
     end)
@@ -2093,7 +2138,7 @@ local function getServerNow()
     return os.time()
 end
 
-local function getLotDisplayName(lot)
+function getLotDisplayName(lot)
     if type(lot) ~= "table" then return "" end
     local auctioneer = getAuctioneerModule()
     if auctioneer and auctioneer.DisplayName then
@@ -2107,7 +2152,7 @@ local function getLotDisplayName(lot)
     return tostring(lot.displayName or lot.name or lot.item or lot.FruitName or lot.lotId or "")
 end
 
-local function getLotCurrentPrice(lot)
+function getLotCurrentPrice(lot)
     if type(lot) ~= "table" then return tonumber(lot) or 0 end
     local auctioneer = getAuctioneerModule()
     if auctioneer and auctioneer.CurrentPrice then
@@ -2121,7 +2166,7 @@ local function getLotCurrentPrice(lot)
     return math.max(0, math.floor(tonumber(lot.currentPrice or lot.price or lot.startPrice or lot.cost) or 0))
 end
 
-local function normalizeAuctionStockValue(stock)
+function normalizeAuctionStockValue(stock)
     if type(stock) == "table" then
         stock = stock.stock
             or stock.Stock
@@ -2145,18 +2190,18 @@ local function normalizeAuctionStockValue(stock)
     return math.max(0, math.floor(value))
 end
 
-local function normalizeAuctionLotId(lotId)
+function normalizeAuctionLotId(lotId)
     local text = tostring(lotId or "")
     if text == "" then return "" end
     return (text:gsub("^Lot_", ""))
 end
 
-local function getAuctionLotIndex(lotId)
+function getAuctionLotIndex(lotId)
     local indexText = tostring(lotId or ""):match(":(%d+)$")
     return indexText and tonumber(indexText) or nil
 end
 
-local function normalizeAuctionStockMap(stock)
+function normalizeAuctionStockMap(stock)
     local out = {}
     if type(stock) ~= "table" then return out end
     for key, value in pairs(stock) do
@@ -2200,7 +2245,7 @@ local AUCTION_CATEGORY_CANDIDATES = {
     HarvestedFruits = { "HarvestedFruits", "Harvested Fruits", "Fruits", "Fruit" }
 }
 
-local function normalizeAuctionCategory(category)
+function normalizeAuctionCategory(category)
     if category == nil then return nil end
     local text = tostring(category)
     if text == "" then return nil end
@@ -2208,12 +2253,12 @@ local function normalizeAuctionCategory(category)
     return AUCTION_CATEGORY_ALIASES[key] or text
 end
 
-local function isDefaultAuctionIcon(ref)
+function isDefaultAuctionIcon(ref)
     local normalized = normalizeAssetRef(ref)
     return normalized == AUCTION_DEFAULT_ICON_ID
 end
 
-local function addUnique(list, seen, value)
+function addUnique(list, seen, value)
     if value == nil then return end
     local text = tostring(value)
     if text == "" then return end
@@ -2223,7 +2268,7 @@ local function addUnique(list, seen, value)
     table.insert(list, text)
 end
 
-local function getAuctionCategoryCandidates(category)
+function getAuctionCategoryCandidates(category)
     local normalized = normalizeAuctionCategory(category)
     local result = {}
     local seen = {}
@@ -2244,7 +2289,7 @@ local function getAuctionCategoryCandidates(category)
     return result
 end
 
-local function getAuctionItemCandidates(lot)
+function getAuctionItemCandidates(lot)
     local result = {}
     local seen = {}
     if type(lot) == "table" then
@@ -2256,7 +2301,7 @@ local function getAuctionItemCandidates(lot)
     return result
 end
 
-local function resolveAuctionCatalogImage(lot)
+function resolveAuctionCatalogImage(lot)
     if type(lot) ~= "table" then return nil end
     local catalog = getMailboxItemCatalog()
     if not (catalog and catalog.Resolve) then return nil end
@@ -2289,7 +2334,7 @@ local function resolveAuctionCatalogImage(lot)
     return defaultResult
 end
 
-local function getLotImage(lot)
+function getLotImage(lot)
     if type(lot) ~= "table" then return nil end
     local direct = normalizeAssetRef(lot.image or lot.icon or lot.displayImage or lot.thumbnail or lot.assetId)
     if direct and not isDefaultAuctionIcon(direct) then return direct end
@@ -2300,7 +2345,7 @@ local function getLotImage(lot)
     return direct
 end
 
-local function getLotRarity(lot)
+function getLotRarity(lot)
     if type(lot) ~= "table" then return "" end
     if type(lot.rarity) == "string" and lot.rarity ~= "" then
         return lot.rarity
@@ -2317,7 +2362,7 @@ local function getLotRarity(lot)
     return ""
 end
 
-local function applyAuctionSnapshot(snapshot)
+function applyAuctionSnapshot(snapshot)
     if type(snapshot) ~= "table" then return false end
     latestAuctionSnapshot = snapshot
     if type(snapshot.stock) == "table" then
@@ -2328,7 +2373,7 @@ local function applyAuctionSnapshot(snapshot)
     return true
 end
 
-local function applyAuctionStockUpdate(update)
+function applyAuctionStockUpdate(update)
     if type(update) ~= "table" or type(update.stock) ~= "table" then return false end
     latestAuctionStock = normalizeAuctionStockMap(update.stock)
     if latestAuctionSnapshot then
@@ -2338,7 +2383,7 @@ local function applyAuctionStockUpdate(update)
     return true
 end
 
-local function requestAuctionSnapshot(force)
+function requestAuctionSnapshot(force)
     local now = os.clock()
     if auctionRequestPending then return false end
     if not force and (now - lastAuctionRequestAt) < AUCTION_REQUEST_INTERVAL then
@@ -2374,7 +2419,7 @@ local function requestAuctionSnapshot(force)
     return false
 end
 
-local function connectAuctionSnapshot(onSnapshot)
+function connectAuctionSnapshot(onSnapshot)
     if auctionSnapshotConnected then return end
     local auction = getAuctionNetworking()
     if not auction then return end
@@ -2418,7 +2463,7 @@ local function connectAuctionSnapshot(onSnapshot)
     end
 end
 
-local function getFirstTextByNames(root, names)
+function getFirstTextByNames(root, names)
     if not root then return nil end
     local targets = {}
     for _, name in ipairs(names) do
@@ -2433,7 +2478,7 @@ local function getFirstTextByNames(root, names)
     return nil
 end
 
-local function getFirstTextMatching(root, matcher)
+function getFirstTextMatching(root, matcher)
     if not root then return nil end
     for _, desc in ipairs(root:GetDescendants()) do
         if desc:IsA("TextLabel") or desc:IsA("TextButton") then
@@ -2446,7 +2491,7 @@ local function getFirstTextMatching(root, matcher)
     return nil
 end
 
-local function getVisibleTextFrom(root)
+function getVisibleTextFrom(root)
     if not root then return nil end
     if (root:IsA("TextLabel") or root:IsA("TextButton")) and isInstanceVisible(root) then
         local text = root.Text or ""
@@ -2461,7 +2506,7 @@ local function getVisibleTextFrom(root)
     return nil
 end
 
-local function getVisibleTextAtPath(root, path)
+function getVisibleTextAtPath(root, path)
     local node = root
     for _, name in ipairs(path) do
         node = node and node:FindFirstChild(name)
@@ -2470,7 +2515,7 @@ local function getVisibleTextAtPath(root, path)
     return getVisibleTextFrom(node)
 end
 
-local function getVisibleTextByNames(root, names)
+function getVisibleTextByNames(root, names)
     if not root then return nil end
     local targets = {}
     for _, name in ipairs(names) do
@@ -2489,7 +2534,7 @@ local function getVisibleTextByNames(root, names)
     return nil
 end
 
-local function hasAncestorNamed(instance, names, stopAt)
+function hasAncestorNamed(instance, names, stopAt)
     if not instance then return false end
     local targets = {}
     for _, name in ipairs(names) do
@@ -2503,7 +2548,7 @@ local function hasAncestorNamed(instance, names, stopAt)
     return false
 end
 
-local function getFirstAttributeByNames(root, names)
+function getFirstAttributeByNames(root, names)
     if not root then return nil end
     local targets = {}
     for _, name in ipairs(names) do
@@ -2532,7 +2577,7 @@ local function getFirstAttributeByNames(root, names)
     return nil
 end
 
-local function getAuctionGuiCategory(root)
+function getAuctionGuiCategory(root)
     local attr = getFirstAttributeByNames(root, { "Category", "ItemCategory", "ItemToolTipCategory", "Type" })
     local normalizedAttr = normalizeAuctionCategory(attr)
     if normalizedAttr then return normalizedAttr end
@@ -2544,7 +2589,7 @@ local function getAuctionGuiCategory(root)
     return normalizeAuctionCategory(text)
 end
 
-local function getAuctionGuiImage(root, lot)
+function getAuctionGuiImage(root, lot)
     local imageDisplay = root and root:FindFirstChild("ImageDisplay", true)
     local vector = imageDisplay and imageDisplay:FindFirstChild("Vector")
     if vector and vector:IsA("ImageLabel") then
@@ -2579,14 +2624,14 @@ local function getAuctionGuiImage(root, lot)
     return attrImage or detectedImage or catalogImage
 end
 
-local function textLooksLikeAuctionMoney(text)
+function textLooksLikeAuctionMoney(text)
     local raw = tostring(text or "")
     return string.find(raw, "\194\162") ~= nil
-        or string.find(raw, "Вў") ~= nil
-        or string.find(raw, "¢") ~= nil
+        or string.find(raw, "Р вЂ™РЎС›") ~= nil
+        or string.find(raw, "Р’Сћ") ~= nil
 end
 
-local function getAuctionGuiPriceText(root)
+function getAuctionGuiPriceText(root)
     if not root then return nil end
 
     local buyButton = root:FindFirstChild("BuyButton", true)
@@ -2607,13 +2652,13 @@ local function getAuctionGuiPriceText(root)
     end)
 end
 
-local function getAuctionGuiStockText(root)
+function getAuctionGuiStockText(root)
     local stockText = getVisibleTextByNames(root, { "Stock_Text" })
     if stockText and stockText ~= "" then return stockText end
     return getVisibleTextByNames(root, { "StockText", "Stock" }) or ""
 end
 
-local function getAuctionGuiTimerText(root)
+function getAuctionGuiTimerText(root)
     if not root then return "" end
     local refreshIn = root:FindFirstChild("RefreshIn", true)
     if refreshIn and isInstanceVisible(refreshIn) then
@@ -2625,7 +2670,7 @@ local function getAuctionGuiTimerText(root)
     return getVisibleTextByNames(root, { "Timer", "Time", "RefreshIn" }) or ""
 end
 
-local function parseCompactMoney(text)
+function parseCompactMoney(text)
     local raw = tostring(text or ""):gsub("%s+", "")
     local numberText, suffix = raw:match("([%d%.,]+)([%a]*)")
     if not numberText then return 0 end
@@ -2651,12 +2696,12 @@ local function parseCompactMoney(text)
     return math.max(0, math.floor(value))
 end
 
-local function parseDurationSeconds(text)
+function parseDurationSeconds(text)
     local raw = string.lower(tostring(text or ""))
     local total = 0
-    local hours = tonumber(raw:match("(%d+)%s*h")) or tonumber(raw:match("(%d+)%s*ч")) or 0
-    local minutes = tonumber(raw:match("(%d+)%s*m")) or tonumber(raw:match("(%d+)%s*м")) or 0
-    local seconds = tonumber(raw:match("(%d+)%s*s")) or tonumber(raw:match("(%d+)%s*с")) or 0
+    local hours = tonumber(raw:match("(%d+)%s*h")) or tonumber(raw:match("(%d+)%s*РЎвЂЎ")) or 0
+    local minutes = tonumber(raw:match("(%d+)%s*m")) or tonumber(raw:match("(%d+)%s*Р С")) or 0
+    local seconds = tonumber(raw:match("(%d+)%s*s")) or tonumber(raw:match("(%d+)%s*РЎРѓ")) or 0
     total = hours * 3600 + minutes * 60 + seconds
     if total <= 0 then
         local a, b = raw:match("(%d+)%s*:%s*(%d+)")
@@ -2667,7 +2712,7 @@ local function parseDurationSeconds(text)
     return total
 end
 
-local function getAuctionDataFromGui()
+function getAuctionDataFromGui()
     local auctionGui = PlayerGui and PlayerGui:FindFirstChild("Auction")
     if not auctionGui then return nil end
     local frame = auctionGui:FindFirstChild("Frame", true)
@@ -2685,7 +2730,7 @@ local function getAuctionDataFromGui()
         if card:IsA("GuiObject") then
             local main = card:FindFirstChild("Main_Frame", true) or card:FindFirstChild("Frame", true) or card
             local priceText = getFirstTextMatching(main, function(text)
-                return string.find(text, "¢") or string.find(text, "\194\162")
+                return string.find(text, "Р’Сћ") or string.find(text, "\194\162")
             end)
             local stockText = getFirstTextByNames(main, { "Stock_Text", "StockText", "Stock" }) or ""
             local timerText = getFirstTextByNames(main, { "RefreshIn", "Timer", "Time" }) or ""
@@ -2786,7 +2831,7 @@ local function getAuctionDataFromGui()
     }
 end
 
-local function getAuctionData()
+function getAuctionData()
     if not latestAuctionSnapshot or (os.clock() - latestAuctionAt) > AUCTION_REQUEST_INTERVAL then
         requestAuctionSnapshot(false)
     end
@@ -2925,13 +2970,13 @@ local fruitImagesFolderConnected = false
 local fruitImageCacheBuilt = false
 local fruitListCache = nil
 
-local function getFruitImagesFolder()
+function getFruitImagesFolder()
     local root = SharedModules or ReplicatedStorage:FindFirstChild("SharedModules")
     local seedData = root and root:FindFirstChild("SeedData")
     return seedData and seedData:FindFirstChild("FruitImages") or nil
 end
 
-local function readFruitImageEntry(entry)
+function readFruitImageEntry(entry)
     if not entry then return nil end
     if entry:IsA("StringValue") or entry:IsA("IntValue") or entry:IsA("NumberValue") then
         return normalizeAssetRef(entry.Value)
@@ -2943,7 +2988,7 @@ local function readFruitImageEntry(entry)
     return normalizeAssetRef(attr)
 end
 
-local function setFruitImageCacheValue(entry)
+function setFruitImageCacheValue(entry)
     local name = cleanScrapedName(entry and entry.Name)
     if not name or name == "" then return end
 
@@ -2956,7 +3001,7 @@ local function setFruitImageCacheValue(entry)
     end
 end
 
-local function removeFruitImageCacheValue(entry)
+function removeFruitImageCacheValue(entry)
     local name = cleanScrapedName(entry and entry.Name)
     if not name or name == "" then return end
     fruitImageCache[name] = nil
@@ -2964,14 +3009,14 @@ local function removeFruitImageCacheValue(entry)
     fruitListCache = nil
 end
 
-local function watchFruitImageEntry(entry)
+function watchFruitImageEntry(entry)
     if not entry or fruitImagesWatched[entry] then return end
     fruitImagesWatched[entry] = entry.Changed:Connect(function()
         setFruitImageCacheValue(entry)
     end)
 end
 
-local function ensureFruitImageCache()
+function ensureFruitImageCache()
     local folder = getFruitImagesFolder()
     if not folder then return end
 
@@ -2999,7 +3044,7 @@ local function ensureFruitImageCache()
     end
 end
 
-local function getFruitImage(fruitName)
+function getFruitImage(fruitName)
     ensureFruitImageCache()
     local name = cleanScrapedName(fruitName)
     if not name then return nil end
@@ -3016,7 +3061,7 @@ local CALCULATOR_DATA_REFRESH_INTERVAL = 60
 local cachedFastFlags = false
 local cachedAsserts = false
 
-local function getUserGeneratedChild(...)
+function getUserGeneratedChild(...)
     local node = ReplicatedStorage:FindFirstChild("UserGenerated")
     if not node then return nil end
     local names = { ... }
@@ -3027,7 +3072,7 @@ local function getUserGeneratedChild(...)
     return node
 end
 
-local function getFastFlagsModule()
+function getFastFlagsModule()
     if cachedFastFlags ~= false then return cachedFastFlags end
     local module = safeRequireModule(getUserGeneratedChild("FastFlags"))
     if module then
@@ -3036,7 +3081,7 @@ local function getFastFlagsModule()
     return module
 end
 
-local function getAssertsModule()
+function getAssertsModule()
     if cachedAsserts ~= false then return cachedAsserts end
     local module = safeRequireModule(getUserGeneratedChild("Lang", "Asserts"))
     if module then
@@ -3045,7 +3090,7 @@ local function getAssertsModule()
     return module
 end
 
-local function getFastFlagValue(flagName, defaultValue, assertFactory)
+function getFastFlagValue(flagName, defaultValue, assertFactory)
     local fastFlags = getFastFlagsModule()
     local asserts = getAssertsModule()
     if not (fastFlags and fastFlags.Replicated and asserts and assertFactory) then
@@ -3075,7 +3120,7 @@ local function getFastFlagValue(flagName, defaultValue, assertFactory)
     return defaultValue
 end
 
-local function cleanNumberMap(input, fallback)
+function cleanNumberMap(input, fallback)
     local out = {}
     if type(fallback) == "table" then
         for key, value in pairs(fallback) do
@@ -3092,7 +3137,7 @@ local function cleanNumberMap(input, fallback)
     return out
 end
 
-local function readNumberField(source, names)
+function readNumberField(source, names)
     if type(source) ~= "table" then return nil end
     for _, fieldName in ipairs(names) do
         local value = source[fieldName]
@@ -3106,7 +3151,7 @@ local function readNumberField(source, names)
     return nil
 end
 
-local function readAverageWeight(entry)
+function readAverageWeight(entry)
     local fields = {
         "AverageWeight", "AvgWeight", "MeanWeight", "DefaultWeight", "BaseWeight",
         "FruitWeight", "AverageFruitWeight", "AvgFruitWeight", "DefaultFruitWeight", "BaseFruitWeight",
@@ -3139,7 +3184,7 @@ local FALLBACK_AVERAGE_WEIGHTS = {
     Mushroom = 13
 }
 
-local function buildSeedMeta(seedData)
+function buildSeedMeta(seedData)
     local meta = {}
     if type(seedData) ~= "table" then return meta end
     for _, entry in pairs(seedData) do
@@ -3160,7 +3205,7 @@ local function buildSeedMeta(seedData)
     return meta
 end
 
-local function getMutationMultiplier(mutationData, mutationName, rawEntry)
+function getMutationMultiplier(mutationData, mutationName, rawEntry)
     if type(mutationName) ~= "string" or mutationName == "" then return nil end
 
     if type(mutationData) == "table" and mutationData.ReturnPriceMultiplier then
@@ -3182,7 +3227,7 @@ local function getMutationMultiplier(mutationData, mutationName, rawEntry)
     return nil
 end
 
-local function collectMutationEntriesFromInstance(moduleScript)
+function collectMutationEntriesFromInstance(moduleScript)
     local entries = {}
     if not moduleScript then return entries end
 
@@ -3281,7 +3326,7 @@ local function collectMutationEntriesFromInstance(moduleScript)
     return entries
 end
 
-local function getMutationDataList(mutationData)
+function getMutationDataList(mutationData)
     local byKey = {}
     local mutations = {}
 
@@ -3322,7 +3367,7 @@ local function getMutationDataList(mutationData)
     return mutations
 end
 
-local function getCalculatorData()
+function getCalculatorData()
     local now = os.clock()
     if calculatorDataCache and (now - calculatorDataCacheAt) < CALCULATOR_DATA_REFRESH_INTERVAL then
         return calculatorDataCache
@@ -3416,7 +3461,7 @@ local fruitRequestPending = false
 local lastFruitRequestAt = -FRUIT_REQUEST_INTERVAL
 local fruitSnapshotConnected = false
 
-local function applyFruitSnapshot(snapshot)
+function applyFruitSnapshot(snapshot)
     if type(snapshot) ~= "table" then return false end
 
     if type(snapshot.server_now_unix) == "number" then
@@ -3492,12 +3537,12 @@ local function applyFruitSnapshot(snapshot)
     return true
 end
 
-local function getFruitStockNetworking()
+function getFruitStockNetworking()
     local networking = getNetworkingModule()
     return networking and networking.FruitStock or nil
 end
 
-local function requestFruitSnapshot(force)
+function requestFruitSnapshot(force)
     local now = os.clock()
     if fruitRequestPending then return false end
     if not force and (now - lastFruitRequestAt) < FRUIT_REQUEST_INTERVAL then
@@ -3534,7 +3579,7 @@ local function requestFruitSnapshot(force)
     return false
 end
 
-local function connectFruitStockSnapshot(onSnapshot)
+function connectFruitStockSnapshot(onSnapshot)
     if fruitSnapshotConnected then return end
     local fruitStock = getFruitStockNetworking()
     local snapshotEvent = fruitStock and fruitStock.Snapshot
@@ -3565,7 +3610,7 @@ local function connectFruitStockSnapshot(onSnapshot)
     end
 end
 
-local function getFruitRefreshTimer()
+function getFruitRefreshTimer()
     if fruitNextRefreshUnix <= 0 then
         requestFruitSnapshot(false)
     end
@@ -3573,7 +3618,7 @@ local function getFruitRefreshTimer()
     return math.max(0, math.floor(fruitNextRefreshUnix - (os.time() + fruitServerOffset)))
 end
 
-local function addFruitName(list, seen, name)
+function addFruitName(list, seen, name)
     local cleanName = cleanScrapedName(name)
     if not cleanName or cleanName == "" then return end
     local key = normalizeName(cleanName)
@@ -3582,7 +3627,7 @@ local function addFruitName(list, seen, name)
     table.insert(list, cleanName)
 end
 
-local function getKnownFruitNames()
+function getKnownFruitNames()
     ensureFruitImageCache()
 
     local names = {}
@@ -3602,12 +3647,12 @@ local function getKnownFruitNames()
     return names
 end
 
-local function getFruitEntry(fruitName)
+function getFruitEntry(fruitName)
     if not fruitName then return nil end
     return latestFruitEntries[fruitName] or latestFruitEntriesByKey[normalizeName(fruitName)]
 end
 
-local function getFruitMultipliers()
+function getFruitMultipliers()
     ensureFruitImageCache()
     if latestFruitSnapshotAt == 0 or (os.clock() - latestFruitSnapshotAt) > FRUIT_REQUEST_INTERVAL then
         requestFruitSnapshot(false)
@@ -3643,7 +3688,7 @@ end
 
 -- ================== STATE POLLING + UPDATE ==================
 -- Compact hash of a fruit list, used by the fast poll to detect value changes.
-local function fruitHash(list)
+function fruitHash(list)
     local h = ""
     for _, m in ipairs(list) do
         h = h .. (m.key or "?") .. ":" .. tostring(m.multiplier) .. ":" .. tostring(m.tier) .. ":" .. tostring(m.image) .. "|"
@@ -3658,7 +3703,7 @@ local pendingFruitData = nil
 -- updateAPI(fruitData): fruitData is an optional pre-scraped fruit list. If nil,
 -- fruits are scraped fresh inside. We ALWAYS send live fruit data (never a stale
 -- cache) so the website/bot reflects in-game multiplier changes immediately.
-local function updateAPI(fruitData)
+function updateAPI(fruitData)
     pendingFruitData = fruitData or pendingFruitData
     if updatePending then return end
     local now = os.clock()
@@ -3666,7 +3711,7 @@ local function updateAPI(fruitData)
     if elapsed < 1.0 then
         updatePending = true
         local waitLeft = 1.0 - elapsed
-        task.delay(waitLeft, function()
+        safeTaskDelay(waitLeft, function()
             updatePending = false
             local dataToSend = pendingFruitData
             pendingFruitData = nil
@@ -3731,7 +3776,7 @@ local function updateAPI(fruitData)
             auction = getAuctionData()
         }
 
-        task.spawn(function()
+        safeTaskSpawn(function()
             local encodeOk, encoded = pcall(function() return HttpService:JSONEncode(data) end)
             if not encodeOk then
                 warn("[Grow a Garden 2 Stocker] JSON encoding failed: " .. tostring(encoded))
@@ -3800,18 +3845,18 @@ pcall(function()
     requestAuctionSnapshot(true)
 end)
 
-task.spawn(function()
+safeTaskSpawn(function()
     while not fruitSnapshotConnected do
-        task.wait(5)
+        safeTaskWait(5)
         connectFruitStockSnapshot(function()
             updateAPI(getFruitMultipliers())
         end)
     end
 end)
 
-task.spawn(function()
+safeTaskSpawn(function()
     while not auctionSnapshotConnected do
-        task.wait(5)
+        safeTaskWait(5)
         connectAuctionSnapshot(function()
             updateAPI(nil)
         end)
@@ -3825,7 +3870,7 @@ if StockValues then
         local nextRestock = shopFolder:FindFirstChild("UnixNextRestock")
         if nextRestock then
             nextRestock.Changed:Connect(function()
-                task.wait(1.5)
+                safeTaskWait(1.5)
                 updateAPI(nil)
             end)
         end
@@ -3845,9 +3890,9 @@ local lastWeathersHash = ""
 local lastWeatherCatalogHash = ""
 local lastFruitHash = ""
 
-task.spawn(function()
+safeTaskSpawn(function()
     while true do
-        task.wait(POLL_INTERVAL)
+        safeTaskWait(POLL_INTERVAL)
         local phase, _, weathers = getActiveWeatherAndPhase()
         local weathersHash = getWeathersHash(weathers)
         local weatherCatalogHash = getWeatherCatalogHash(getWeatherCatalog())
@@ -3871,10 +3916,10 @@ end)
 -- Fallback periodic update: scrape everything fresh inside updateAPI (fruitData=nil
 -- means "scrape fresh"), guaranteeing the site gets current data even if the fast
 -- poll detected no change (e.g. UI re-opened, values rotated server-side).
-task.spawn(function()
+safeTaskSpawn(function()
     while true do
         updateAPI(nil)
-        task.wait(UPDATE_INTERVAL)
+        safeTaskWait(UPDATE_INTERVAL)
     end
 end)
 
