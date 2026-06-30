@@ -4133,25 +4133,57 @@ function updateAPI(fruitData)
     end
 end
 
-local function keepGuiActiveAndHidden()
+local function getAuctionPrompt()
+    local stand = workspace:FindFirstChild("AuctionStand")
+    if not stand then return nil end
+    for _, desc in ipairs(stand:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") and desc:GetAttribute("DontShow") == nil then
+            return desc
+        end
+    end
+    return nil
+end
+
+local function automateAuctionInteraction()
     safeTaskSpawn(function()
-        local auctionGui = PlayerGui:WaitForChild("Auction", 30)
-        if auctionGui and auctionGui:IsA("ScreenGui") then
-            pcall(function()
-                auctionGui.Enabled = true
-            end)
-            auctionGui:GetPropertyChangedSignal("Enabled"):Connect(function()
-                pcall(function()
-                    if not auctionGui.Enabled then
-                        auctionGui.Enabled = true
+        while true do
+            local gui = PlayerGui:FindFirstChild("Auction")
+            local isOpen = gui and gui:IsA("ScreenGui") and gui.Enabled
+            if not isOpen then
+                local prompt = getAuctionPrompt()
+                if prompt then
+                    pcall(function()
+                        local character = LocalPlayer.Character
+                        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+                        if hrp then
+                            local part = prompt.Parent:IsA("BasePart") and prompt.Parent or prompt:FindFirstAncestorWhichIsA("BasePart")
+                            if not part then
+                                local stand = workspace:FindFirstChild("AuctionStand")
+                                part = stand and stand:FindFirstChildWhichIsA("BasePart", true)
+                            end
+                            if part then
+                                hrp.CFrame = part.CFrame + Vector3.new(0, 3, 0)
+                            end
+                        end
+                    end)
+                    safeTaskWait(0.5)
+                    if fireproximityprompt then
+                        pcall(function() fireproximityprompt(prompt) end)
+                    else
+                        pcall(function()
+                            prompt:InputHoldBegin()
+                            safeTaskWait(prompt.HoldDuration + 0.1)
+                            prompt:InputHoldEnd()
+                        end)
                     end
-                end)
-            end)
+                end
+            end
+            safeTaskWait(10)
         end
     end)
 end
 
-pcall(keepGuiActiveAndHidden)
+pcall(automateAuctionInteraction)
 
 -- ================== EVENT HOOKS ==================
 -- FruitStock.Snapshot is the same source FruitStockPriceController uses for x4/x5 values.
