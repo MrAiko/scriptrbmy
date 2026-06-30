@@ -2569,10 +2569,14 @@ function requestAuctionSnapshot(force)
 
     local auction = getAuctionNetworking()
     local requestRemote = auction and auction.RequestSnapshot
-    if not requestRemote then return false end
+    if not requestRemote then 
+        writeDebugLog("requestAuctionSnapshot failed: RequestSnapshot remote not found")
+        return false 
+    end
 
     auctionRequestPending = true
     lastAuctionRequestAt = now
+    writeDebugLog("Firing RequestSnapshot to server...")
     local ok, result = pcall(function()
         if requestRemote.Fire then
             return requestRemote:Fire()
@@ -2590,11 +2594,15 @@ function requestAuctionSnapshot(force)
     end)
     auctionRequestPending = false
 
-    if ok and type(result) == "table" then
-        return applyAuctionSnapshot(result)
-    end
-    if DEBUG and not ok then
-        warn("[Grow a Garden 2 Stocker] Auctioneer.RequestSnapshot failed: " .. tostring(result))
+    if ok then
+        writeDebugLog("RequestSnapshot fired successfully. Result type: " .. type(result))
+        if type(result) == "table" then
+            writeDebugLog("Received inline snapshot from RequestSnapshot invoke!")
+            return applyAuctionSnapshot(result)
+        end
+        return true
+    else
+        writeDebugLog("RequestSnapshot fire failed: " .. tostring(result))
     end
     return false
 end
@@ -2602,44 +2610,60 @@ end
 function connectAuctionSnapshot(onSnapshot)
     if auctionSnapshotConnected then return end
     local auction = getAuctionNetworking()
-    if not auction then return end
+    if not auction then 
+        writeDebugLog("connectAuctionSnapshot failed: auction networking not found")
+        return 
+    end
 
     local connected = false
     local ok, err = pcall(function()
         local snapshotEvent = auction.Snapshot
         if snapshotEvent then
+            writeDebugLog("Connecting to Snapshot event...")
             if snapshotEvent.OnClientEvent then
                 snapshotEvent.OnClientEvent:Connect(function(snapshot)
+                    writeDebugLog("Snapshot OnClientEvent received!")
                     if applyAuctionSnapshot(snapshot) and onSnapshot then onSnapshot() end
                 end)
                 connected = true
             elseif snapshotEvent.Connect then
                 snapshotEvent:Connect(function(snapshot)
+                    writeDebugLog("Snapshot Connect received!")
                     if applyAuctionSnapshot(snapshot) and onSnapshot then onSnapshot() end
                 end)
                 connected = true
             end
+        else
+            writeDebugLog("SnapshotEvent not found in auction networking")
         end
 
         local stockEvent = auction.StockUpdate
         if stockEvent then
+            writeDebugLog("Connecting to StockUpdate event...")
             if stockEvent.OnClientEvent then
-                stockEvent.OnClientEvent:Connect(function(update)
+                snapshotEvent = stockEvent
+                snapshotEvent.OnClientEvent:Connect(function(update)
+                    writeDebugLog("StockUpdate OnClientEvent received!")
                     if applyAuctionStockUpdate(update) and onSnapshot then onSnapshot() end
                 end)
                 connected = true
             elseif stockEvent.Connect then
-                stockEvent:Connect(function(update)
+                snapshotEvent = stockEvent
+                snapshotEvent:Connect(function(update)
+                    writeDebugLog("StockUpdate Connect received!")
                     if applyAuctionStockUpdate(update) and onSnapshot then onSnapshot() end
                 end)
                 connected = true
             end
+        else
+            writeDebugLog("StockUpdate event not found in auction networking")
         end
     end)
-
-    auctionSnapshotConnected = ok and connected
-    if DEBUG and not ok then
-        warn("[Grow a Garden 2 Stocker] Failed to connect Auctioneer events: " .. tostring(err))
+    if ok and connected then
+        writeDebugLog("connectAuctionSnapshot connected successfully")
+        auctionSnapshotConnected = true
+    else
+        writeDebugLog("connectAuctionSnapshot failed: " .. tostring(err or "unknown error"))
     end
 end
 
