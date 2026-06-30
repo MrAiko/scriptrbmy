@@ -2200,13 +2200,13 @@ end
 
 
 function getAuctionNetworking()
-    local networking = getNetworkingModule()
-    local auction = networking and networking.Auctioneer or nil
+    local auction = getFallbackNetworking("Auction")
     if auction then
-        writeDebugLog("Auction networking obtained via Sharing Module")
+        writeDebugLog("Auction networking obtained via Fallback Module")
     else
-        writeDebugLog("Auction networking sharing module failed, trying fallback")
-        auction = getFallbackNetworking("Auction")
+        writeDebugLog("Auction networking fallback module failed, trying Sharing Module")
+        local networking = getNetworkingModule()
+        auction = networking and networking.Auctioneer or nil
     end
     return auction
 end
@@ -3159,13 +3159,7 @@ function getAuctionData()
     if guiData and tonumber(guiData.refreshAt) and tonumber(guiData.refreshAt) > serverNow then
         refreshAt = tonumber(guiData.refreshAt)
     end
-    if refreshAt > serverNow then
-        for _, lot in ipairs(lots) do
-            if (tonumber(lot.expiresAt) or 0) <= serverNow then
-                lot.expiresAt = refreshAt
-            end
-        end
-    end
+
 
     return {
         lots = lots,
@@ -3838,13 +3832,13 @@ function applyFruitSnapshot(snapshot)
 end
 
 function getFruitStockNetworking()
-    local networking = getNetworkingModule()
-    local fruitStock = networking and networking.FruitStock or nil
+    local fruitStock = getFallbackNetworking("FruitStock")
     if fruitStock then
-        writeDebugLog("FruitStock networking obtained via Sharing Module")
+        writeDebugLog("FruitStock networking obtained via Fallback Module")
     else
-        writeDebugLog("FruitStock networking sharing module failed, trying fallback")
-        fruitStock = getFallbackNetworking("FruitStock")
+        writeDebugLog("FruitStock networking fallback module failed, trying Sharing Module")
+        local networking = getNetworkingModule()
+        fruitStock = networking and networking.FruitStock or nil
     end
     return fruitStock
 end
