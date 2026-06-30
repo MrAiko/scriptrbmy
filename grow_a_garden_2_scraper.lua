@@ -2249,6 +2249,52 @@ local function callNetworkEndpoint(endpoint, ...)
     return false, lastError
 end
 
+local function connectNetworkSignal(signal, callback)
+    if not signal or type(callback) ~= "function" then return false end
+
+    local okEvent, event = pcall(function()
+        return signal.OnClientEvent
+    end)
+    if okEvent and event and event.Connect then
+        local ok = pcall(function()
+            event:Connect(callback)
+        end)
+        if ok then return true end
+    end
+
+    local okBindable, bindableEvent = pcall(function()
+        return signal.Event
+    end)
+    if okBindable and bindableEvent and bindableEvent.Connect then
+        local ok = pcall(function()
+            bindableEvent:Connect(callback)
+        end)
+        if ok then return true end
+    end
+
+    local okConnect, connectFn = pcall(function()
+        return signal.Connect
+    end)
+    if okConnect and type(connectFn) == "function" then
+        local ok = pcall(function()
+            connectFn(signal, callback)
+        end)
+        if ok then return true end
+    end
+
+    local okOn, onFn = pcall(function()
+        return signal.On
+    end)
+    if okOn and type(onFn) == "function" then
+        local ok = pcall(function()
+            onFn(signal, callback)
+        end)
+        if ok then return true end
+    end
+
+    return false
+end
+
 function getServerNow()
     local ok, result = pcall(function()
         return workspace:GetServerTimeNow()
@@ -2745,6 +2791,9 @@ function requestAuctionSnapshot(force)
         writeDebugLog("Auction snapshot received from RequestSnapshot")
         return applyAuctionSnapshot(result)
     end
+    if ok then
+        writeDebugLog("Auction RequestSnapshot fired; waiting for Snapshot event")
+    end
     if DEBUG and not ok then
         warn("[Grow a Garden 2 Stocker] Auctioneer.RequestSnapshot failed: " .. tostring(result))
     end
@@ -2760,36 +2809,27 @@ function connectAuctionSnapshot(onSnapshot)
     local ok, err = pcall(function()
         local snapshotEvent = auction.Snapshot
         if snapshotEvent then
-            if snapshotEvent.OnClientEvent then
-                snapshotEvent.OnClientEvent:Connect(function(snapshot)
-                    if applyAuctionSnapshot(snapshot) and onSnapshot then onSnapshot() end
-                end)
-                connected = true
-            elseif snapshotEvent.Connect then
-                snapshotEvent:Connect(function(snapshot)
-                    if applyAuctionSnapshot(snapshot) and onSnapshot then onSnapshot() end
-                end)
+            if connectNetworkSignal(snapshotEvent, function(snapshot)
+                if applyAuctionSnapshot(snapshot) and onSnapshot then onSnapshot() end
+            end) then
                 connected = true
             end
         end
 
         local stockEvent = auction.StockUpdate
         if stockEvent then
-            if stockEvent.OnClientEvent then
-                stockEvent.OnClientEvent:Connect(function(...)
-                    if applyAuctionStockUpdate(...) and onSnapshot then onSnapshot() end
-                end)
-                connected = true
-            elseif stockEvent.Connect then
-                stockEvent:Connect(function(...)
-                    if applyAuctionStockUpdate(...) and onSnapshot then onSnapshot() end
-                end)
+            if connectNetworkSignal(stockEvent, function(...)
+                if applyAuctionStockUpdate(...) and onSnapshot then onSnapshot() end
+            end) then
                 connected = true
             end
         end
     end)
 
     auctionSnapshotConnected = ok and connected
+    if auctionSnapshotConnected then
+        writeDebugLog("Auction Snapshot/StockUpdate events connected")
+    end
     if DEBUG and not ok then
         warn("[Grow a Garden 2 Stocker] Failed to connect Auctioneer events: " .. tostring(err))
     end
@@ -3189,10 +3229,10 @@ function getAuctionData()
         requestAuctionSnapshot(false)
     end
     local snapshot = latestAuctionSnapshot
-    if type(snapshot) ~= "table" then return nil end
+    if type(snapshot) ~= "table" then return getAuctionDataFromGui() end
 
     local rawLots = getAuctionRawLots(snapshot)
-    if type(rawLots) ~= "table" then return nil end
+    if type(rawLots) ~= "table" then return getAuctionDataFromGui() end
 
     local guiData = getAuctionDataFromGui()
     local guiLotsById = {}
@@ -3323,7 +3363,7 @@ function getAuctionData()
     end)
 
     if #lots == 0 then
-        return nil
+        return getAuctionDataFromGui()
     end
 
     local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds) or 0
