@@ -4721,15 +4721,34 @@ local lastWeatherCatalogHash = ""
 local lastFruitHash = ""
 local lastAuctionHash = ""
 
+local function destroyAllLoadingGuis()
+    if not PlayerGui then return end
+    local targets = {
+        { PlayerGui, "LoadingGui" },
+        { game:GetService("ReplicatedStorage"), "Assets", "Cutscenes", "GAGTrailer", "Screen", "LoadingGui" },
+        { game:GetService("ReplicatedFirst"), "LoadingScreenMenu", "LoadingGui" },
+        { game:GetService("ReplicatedStorage"), "Assets", "Cutscenes", "GAGTrailerNoWalls", "Screen", "LoadingGui" },
+        { game:GetService("ReplicatedStorage"), "Assets", "Cutscenes", "GAGTrailerShortVers", "Screen", "LoadingGui" },
+        { game:GetService("StarterGui"), "LoadingGui" }
+    }
+    for _, path in ipairs(targets) do
+        pcall(function()
+            local current = path[1]
+            for i = 2, #path do
+                current = current:FindFirstChild(path[i])
+                if not current then break end
+            end
+            if current then
+                current:Destroy()
+            end
+        end)
+    end
+end
+
 safeTaskSpawn(function()
     while true do
         safeTaskWait(POLL_INTERVAL)
-        pcall(function()
-            local loading = PlayerGui and PlayerGui:FindFirstChild("LoadingGui")
-            if loading then
-                loading:Destroy()
-            end
-        end)
+        destroyAllLoadingGuis()
         local phase, _, weathers = getActiveWeatherAndPhase()
         local weathersHash = getWeathersHash(weathers)
         local weatherCatalogHash = getWeatherCatalogHash(getWeatherCatalog())
@@ -4768,5 +4787,19 @@ end)
 
 -- Apply client optimizations LAST, so all monitoring hooks are already connected.
 optimizeClient()
+
+safeTaskSpawn(function()
+    while true do
+        safeTaskWait(4)
+        pcall(function()
+            local player = game:GetService("Players").LocalPlayer
+            local character = player and player.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            if humanoid then
+                humanoid.Jump = true
+            end
+        end)
+    end
+end)
 
 print("[Grow a Garden 2 Stocker] Scraper loaded (" .. (MOBILE_SAFE_MODE and "Mobile Safe Mode" or "Extreme Optimization") .. ")!")
