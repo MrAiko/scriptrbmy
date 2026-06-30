@@ -4144,6 +4144,13 @@ local function getAuctionPrompt()
     return nil
 end
 
+local function getGuiController()
+    local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
+    local controllers = playerScripts and playerScripts:FindFirstChild("Controllers")
+    local module = controllers and controllers:FindFirstChild("GuiController")
+    return safeRequireModule(module)
+end
+
 local function automateAuctionInteraction()
     safeTaskSpawn(function()
         while true do
@@ -4162,20 +4169,30 @@ local function automateAuctionInteraction()
                                 part = stand and stand:FindFirstChildWhichIsA("BasePart", true)
                             end
                             if part then
-                                hrp.CFrame = part.CFrame + Vector3.new(0, 3, 0)
+                                -- Teleport 4 studs away in local space to avoid collision conflicts
+                                hrp.CFrame = part.CFrame * CFrame.new(0, 0, 4)
                             end
                         end
                     end)
                     safeTaskWait(0.5)
+                    -- Trigger the prompt
                     if fireproximityprompt then
                         pcall(function() fireproximityprompt(prompt) end)
-                    else
-                        pcall(function()
-                            prompt:InputHoldBegin()
-                            safeTaskWait(prompt.HoldDuration + 0.1)
-                            prompt:InputHoldEnd()
-                        end)
                     end
+                    pcall(function()
+                        prompt:InputHoldBegin()
+                        safeTaskWait(prompt.HoldDuration + 0.05)
+                        prompt:InputHoldEnd()
+                    end)
+                    safeTaskWait(0.5)
+                end
+                
+                -- Force GUI open via game UI framework to establish session
+                local GuiController = getGuiController()
+                if GuiController and GuiController.Open then
+                    pcall(function()
+                        GuiController:Open("Auction", nil, { "HUD" })
+                    end)
                 end
             end
             safeTaskWait(10)
