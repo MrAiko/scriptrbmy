@@ -3468,6 +3468,9 @@ local function isGameLoading()
             end
         end
     end
+    if workspace:FindFirstChild("LoadingScreenMenu") then
+        return true
+    end
     return false
 end
 
@@ -4721,27 +4724,60 @@ local lastWeatherCatalogHash = ""
 local lastFruitHash = ""
 local lastAuctionHash = ""
 
-local function destroyAllLoadingGuis()
-    if not PlayerGui then return end
-    local targets = {
-        { PlayerGui, "LoadingGui" },
-        { workspace, "LoadingScreenMenu" },
-        { game:GetService("ReplicatedStorage"), "Assets", "Cutscenes", "GAGTrailer", "Screen", "LoadingGui" },
-        { game:GetService("ReplicatedFirst"), "LoadingScreenMenu", "LoadingGui" },
-        { game:GetService("ReplicatedStorage"), "Assets", "Cutscenes", "GAGTrailerNoWalls", "Screen", "LoadingGui" },
-        { game:GetService("ReplicatedStorage"), "Assets", "Cutscenes", "GAGTrailerShortVers", "Screen", "LoadingGui" },
-        { game:GetService("StarterGui"), "LoadingGui" }
-    }
-    for _, path in ipairs(targets) do
+local function handleAutoSkipLoading()
+    local player = game:GetService("Players").LocalPlayer
+    if not player then return end
+    
+    local plotId = player:GetAttribute("PlotId")
+    if not plotId then return end -- Wait until player data is loaded (plot is assigned)
+    
+    local hasLoading = workspace:FindFirstChild("LoadingScreenMenu")
+        or (PlayerGui and PlayerGui:FindFirstChild("LoadingGui"))
+        or player:GetAttribute("LoadingScreenActive") == true
+
+    if hasLoading then
         pcall(function()
-            local current = path[1]
-            for i = 2, #path do
-                current = current:FindFirstChild(path[i])
-                if not current then break end
+            -- 1. Unanchor character
+            local character = player.Character
+            local rootPart = character and (character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 5))
+            if rootPart then
+                rootPart.Anchored = false
             end
-            if current then
-                current:Destroy()
+
+            -- 2. Teleport to plot spawn
+            local gardens = workspace:FindFirstChild("Gardens")
+            local plot = gardens and gardens:FindFirstChild("Plot" .. plotId)
+            local spawnPoint = plot and plot:FindFirstChild("SpawnPoint")
+            if spawnPoint and character then
+                character:PivotTo(spawnPoint.CFrame)
             end
+
+            -- 3. Reset camera
+            workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+
+            -- 4. Enable hidden ScreenGuis
+            local PlayerGui = player:FindFirstChildOfClass("PlayerGui")
+            if PlayerGui then
+                for _, gui in ipairs(PlayerGui:GetChildren()) do
+                    if gui:IsA("ScreenGui") and gui.Name ~= "LoadingGui" then
+                        gui.Enabled = true
+                    end
+                end
+            end
+
+            -- 5. Destroy loading screen elements
+            local menu = workspace:FindFirstChild("LoadingScreenMenu")
+            if menu then
+                menu:Destroy()
+            end
+            local loadingGui = PlayerGui and PlayerGui:FindFirstChild("LoadingGui")
+            if loadingGui then
+                loadingGui:Destroy()
+            end
+
+            -- 6. Set attributes
+            player:SetAttribute("LoadingScreenActive", false)
+            player:SetAttribute("LoadingScreenDone", true)
         end)
     end
 end
@@ -4749,7 +4785,7 @@ end
 safeTaskSpawn(function()
     while true do
         safeTaskWait(POLL_INTERVAL)
-        destroyAllLoadingGuis()
+        handleAutoSkipLoading()
         local phase, _, weathers = getActiveWeatherAndPhase()
         local weathersHash = getWeathersHash(weathers)
         local weatherCatalogHash = getWeatherCatalogHash(getWeatherCatalog())
