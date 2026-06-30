@@ -3957,6 +3957,25 @@ end
 function getMutationMultiplier(mutationData, mutationName, rawEntry)
     if type(mutationName) ~= "string" or mutationName == "" then return nil end
 
+    -- Try resolving ReturnPriceMultiplier via GC dynamically to bypass require restrictions
+    local gc = getgc or (debug and debug.getregistry)
+    if gc then
+        local foundFunc = nil
+        pcall(function()
+            for _, v in ipairs(gc(true)) do
+                if type(v) == "table" and rawget(v, "ReturnPriceMultiplier") and type(v.ReturnPriceMultiplier) == "function" then
+                    foundFunc = v.ReturnPriceMultiplier
+                    break
+                end
+            end
+        end)
+        if foundFunc then
+            local ok, value = pcall(foundFunc, mutationName)
+            local n = tonumber(value)
+            if ok and n and n > 0 then return n end
+        end
+    end
+
     if type(mutationData) == "table" and mutationData.ReturnPriceMultiplier then
         local ok, value = pcall(function()
             return mutationData.ReturnPriceMultiplier(mutationName)
@@ -4153,6 +4172,12 @@ function getCalculatorData()
         emptyFruitMap,
         function(asserts) return asserts.Map(asserts.String, asserts.FinitePositive) end
     )
+    local priceMultipliers = getFastFlagValue(
+        "Game.Sell.PriceMultipliers",
+        { Mushroom = 0.5 },
+        function(asserts) return asserts.Map(asserts.String, asserts.FinitePositive) end
+    )
+
     local calculatorConfig = {
         sizeMultiplier = getFastFlagValue("Game.Selling.SizeMultiplier", 1, function(asserts) return asserts.FinitePositive end),
         mutationMultiplier = getFastFlagValue("Game.Selling.MutationMultiplier", 1, function(asserts) return asserts.FinitePositive end),
@@ -4160,6 +4185,8 @@ function getCalculatorData()
         sizeExponentOverrides = cleanNumberMap(sizeExponentOverrides, defaultExponentOverrides),
         singleHarvestMutationBonusScale = getFastFlagValue("Game.Selling.SingleHarvestMutationBonusScale", 0.15, function(asserts) return asserts.FiniteNonNegative end),
         minimumValues = { Carrot = 4 },
+        globalMultiplier = getFastFlagValue("Game.Sell.GlobalMultiplier", 1, function(asserts) return asserts.FinitePositive end),
+        priceMultipliers = cleanNumberMap(priceMultipliers, { Mushroom = 0.5 }),
         diminishingReturns = {
             enabled = getFastFlagValue("Game.Selling.SizeDiminishingReturns.Enabled", true, function(asserts) return asserts.Boolean end) ~= false,
             knee = getFastFlagValue("Game.Selling.SizeDiminishingReturns.Knee", 5, function(asserts) return asserts.FinitePositive end),
