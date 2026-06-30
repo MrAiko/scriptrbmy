@@ -210,7 +210,7 @@ function optimizeClient()
             status.TextSize = 16
             status.TextWrapped = true
             status.TextYAlignment = Enum.TextYAlignment.Top
-            status.Text = "РІС™в„ўРїС‘РЏ Optimization: EXTREME (Void Mode)\n\n" ..
+            status.Text = "Optimization: EXTREME (Void Mode)\n\n" ..
                           "Monitoring stock, weather, moon phases and fruit multipliers in the background...\n\n" ..
                           "Active & Connected"
             status.Parent = content
@@ -510,8 +510,9 @@ function findTimeCycleController()
 end
 
 function getPhasesFolder()
-    local tc = findTimeCycleController()
-    return tc and findChildByNormalizedName(tc, { "Phases", "phases" }) or nil
+    -- Do not scan/require TimeCycleController.Phases.* modules from an executor:
+    -- some phase modules are RobloxScript-context only and throw in public executors.
+    return nil
 end
 
 function getKnownPhaseNames()
@@ -1045,7 +1046,7 @@ function textLooksActive(text)
     local lower = string.lower(tostring(text or ""))
     if lower == "" then return false end
     if string.find(lower, "starts") or string.find(lower, "start in")
-       or string.find(lower, "Р Р…Р В°РЎвЂЎР Р…") or string.find(lower, "РЎРѓР С”Р С•РЎР‚Р С•") then
+       or string.find(lower, "???") or string.find(lower, "?????") then
         return false
     end
     return string.find(lower, "%d+:%d+") ~= nil
@@ -1056,8 +1057,8 @@ function textLooksActive(text)
         or string.find(lower, "ends") ~= nil
         or string.find(lower, "remaining") ~= nil
         or string.find(lower, "left") ~= nil
-        or string.find(lower, "Р В°Р С”РЎвЂљР С‘Р Р†") ~= nil
-        or string.find(lower, "Р С‘Р Т‘") ~= nil
+        or string.find(lower, "?????") ~= nil
+        or string.find(lower, "??") ~= nil
 end
 
 function isWeatherCardActive(card)
@@ -2110,17 +2111,9 @@ function getAuctioneerModule()
 end
 
 function getMailboxItemCatalog()
-    if cachedMailboxItemCatalog ~= false then
-        return cachedMailboxItemCatalog
-    end
-    cachedMailboxItemCatalog = nil
-    pcall(function()
-        local controllers = LocalPlayer:WaitForChild("PlayerScripts", 5):FindFirstChild("Controllers")
-        local mailbox = controllers and controllers:FindFirstChild("MailboxController")
-        local catalogModule = mailbox and mailbox:FindFirstChild("MailboxItemCatalog")
-        cachedMailboxItemCatalog = safeRequireModule(catalogModule)
-    end)
-    return cachedMailboxItemCatalog
+    -- Avoid requiring PlayerScripts modules from executor context. Auction cards
+    -- already expose the final image/name/rarity in PlayerGui.Auction.
+    return nil
 end
 
 function getAuctionNetworking()
@@ -2162,6 +2155,23 @@ function getLotCurrentPrice(lot)
         if ok and type(result) == "number" then
             return math.max(0, math.floor(result))
         end
+    end
+    local startPrice = tonumber(lot.startPrice)
+    local minPrice = tonumber(lot.minPrice) or 0
+    local decrementIntervalSeconds = tonumber(lot.decrementIntervalSeconds) or 0
+    local decrementPercent = tonumber(lot.decrementPercent) or 0
+    local rolledAt = tonumber(lot.rolledAt) or 0
+    if startPrice and startPrice >= 0 then
+        if decrementIntervalSeconds <= 0 then
+            return math.max(0, math.floor(startPrice))
+        end
+        local elapsed = getServerNow() - rolledAt
+        if elapsed < 0 then elapsed = 0 end
+        local ticks = math.floor(elapsed / decrementIntervalSeconds)
+        local step = math.floor(startPrice * decrementPercent / 100 + 0.5)
+        local price = startPrice - step * ticks
+        if price < minPrice then price = minPrice end
+        return math.max(0, math.floor(price))
     end
     return math.max(0, math.floor(tonumber(lot.currentPrice or lot.price or lot.startPrice or lot.cost) or 0))
 end
@@ -2627,8 +2637,7 @@ end
 function textLooksLikeAuctionMoney(text)
     local raw = tostring(text or "")
     return string.find(raw, "\194\162") ~= nil
-        or string.find(raw, "Р вЂ™РЎС›") ~= nil
-        or string.find(raw, "Р’Сћ") ~= nil
+        or string.find(raw, "?") ~= nil
 end
 
 function getAuctionGuiPriceText(root)
@@ -2699,9 +2708,9 @@ end
 function parseDurationSeconds(text)
     local raw = string.lower(tostring(text or ""))
     local total = 0
-    local hours = tonumber(raw:match("(%d+)%s*h")) or tonumber(raw:match("(%d+)%s*РЎвЂЎ")) or 0
-    local minutes = tonumber(raw:match("(%d+)%s*m")) or tonumber(raw:match("(%d+)%s*Р С")) or 0
-    local seconds = tonumber(raw:match("(%d+)%s*s")) or tonumber(raw:match("(%d+)%s*РЎРѓ")) or 0
+    local hours = tonumber(raw:match("(%d+)%s*h")) or tonumber(raw:match("(%d+)%s*?")) or 0
+    local minutes = tonumber(raw:match("(%d+)%s*m")) or tonumber(raw:match("(%d+)%s*?")) or 0
+    local seconds = tonumber(raw:match("(%d+)%s*s")) or tonumber(raw:match("(%d+)%s*?")) or 0
     total = hours * 3600 + minutes * 60 + seconds
     if total <= 0 then
         local a, b = raw:match("(%d+)%s*:%s*(%d+)")
@@ -3180,9 +3189,48 @@ function readAverageWeight(entry)
     return nil
 end
 
-local FALLBACK_AVERAGE_WEIGHTS = {
-    Mushroom = 13
-}
+local plantAverageSizeCache = nil
+
+function getDefaultPlantAverageSize()
+    if plantAverageSizeCache then return plantAverageSizeCache end
+    local sizeModule = safeRequireModule(getSharedModule("PlantSizeMultipliers"))
+    local tiers = nil
+    if sizeModule and sizeModule.GetDefaultPlantTiers then
+        local ok, result = pcall(function()
+            return sizeModule.GetDefaultPlantTiers()
+        end)
+        if ok and type(result) == "table" then
+            tiers = result
+        end
+    end
+    if type(tiers) ~= "table" then
+        tiers = {
+            { min = 0.95, max = 1.05, weight = 2000 },
+            { min = 1.45, max = 1.55, weight = 250 },
+            { min = 1.9, max = 2.1, weight = 125 },
+            { min = 2.85, max = 3.15, weight = 62.5 },
+            { min = 3.8, max = 4.2, weight = 31.25 },
+            { min = 5.8, max = 6.2, weight = 15.625 },
+            { min = 9.5, max = 12.5, weight = 3 },
+            { min = 12, max = 17, weight = 0.05 },
+            { min = 20, max = 35, weight = 0.0001 }
+        }
+    end
+    local weighted, totalWeight = 0, 0
+    for _, tier in pairs(tiers) do
+        if type(tier) == "table" then
+            local minSize = tonumber(tier.min) or tonumber(tier.Min) or tonumber(tier.minimum)
+            local maxSize = tonumber(tier.max) or tonumber(tier.Max) or tonumber(tier.maximum)
+            local weight = tonumber(tier.weight) or tonumber(tier.Weight) or 0
+            if minSize and maxSize and weight > 0 then
+                weighted = weighted + ((minSize + maxSize) / 2) * weight
+                totalWeight = totalWeight + weight
+            end
+        end
+    end
+    plantAverageSizeCache = totalWeight > 0 and (weighted / totalWeight) or 1
+    return plantAverageSizeCache
+end
 
 function buildSeedMeta(seedData)
     local meta = {}
@@ -3195,7 +3243,7 @@ function buildSeedMeta(seedData)
                     isSingleHarvest = entry.IsSingleHarvest == true,
                     rarity = entry.Rarity or entry.Tier,
                     image = normalizeAssetRef(entry.Image or entry.Icon or entry.AssetId),
-                    averageWeight = readAverageWeight(entry) or FALLBACK_AVERAGE_WEIGHTS[seedName]
+                    averageWeight = readAverageWeight(entry) or getDefaultPlantAverageSize()
                 }
                 meta[seedName] = value
                 meta[normalizeName(seedName)] = value
