@@ -4725,6 +4725,7 @@ local function destroyAllLoadingGuis()
     if not PlayerGui then return end
     local targets = {
         { PlayerGui, "LoadingGui" },
+        { workspace, "LoadingScreenMenu" },
         { game:GetService("ReplicatedStorage"), "Assets", "Cutscenes", "GAGTrailer", "Screen", "LoadingGui" },
         { game:GetService("ReplicatedFirst"), "LoadingScreenMenu", "LoadingGui" },
         { game:GetService("ReplicatedStorage"), "Assets", "Cutscenes", "GAGTrailerNoWalls", "Screen", "LoadingGui" },
@@ -4743,30 +4744,6 @@ local function destroyAllLoadingGuis()
             end
         end)
     end
-
-    -- Destroy workspace.LoadingScreenMenu
-    pcall(function()
-        local menu = workspace:FindFirstChild("LoadingScreenMenu")
-        if menu then
-            menu:Destroy()
-        end
-    end)
-
-    -- Destroy LoadingCam and LoadingScreenCam in workspace.Gardens.Plot1..Plot8
-    pcall(function()
-        local gardens = workspace:FindFirstChild("Gardens")
-        if gardens then
-            for i = 1, 8 do
-                local plot = gardens:FindFirstChild("Plot" .. i)
-                if plot then
-                    local cam1 = plot:FindFirstChild("LoadingCam")
-                    if cam1 then cam1:Destroy() end
-                    local cam2 = plot:FindFirstChild("LoadingScreenCam")
-                    if cam2 then cam2:Destroy() end
-                end
-            end
-        end
-    end)
 end
 
 safeTaskSpawn(function()
