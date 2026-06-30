@@ -3375,9 +3375,18 @@ function getAuctionDataFromGui()
                     local rarity = getAuctionTextAtPath(main, { "Rarity", "Rarity_Text" })
                         or getFirstAttributeByNames(main, { "ItemToolTipRarity", "Rarity" })
                         or ""
-                    local amountText = getAuctionTextAtPath(main, { "ImageDisplay", "Amount" })
+                    local amountNode = main:FindFirstChild("ImageDisplay")
+                    amountNode = amountNode and amountNode:FindFirstChild("Amount") or main:FindFirstChild("Amount")
+                    
+                    local amountText = nil
+                    if amountNode and isInstanceVisible(amountNode) then
+                        amountText = getAuctionTextFrom(amountNode)
+                    end
+                    
                     local countAttr = getFirstAttributeByNames(main, { "Amount", "Count" })
+                    local imageDisplay = main:FindFirstChild("ImageDisplay")
                     local subtitleAttr = getFirstAttributeByNames(main, { "ItemToolTipSubtitle", "Subtitle" })
+                        or (imageDisplay and getFirstAttributeByNames(imageDisplay, { "ItemToolTipSubtitle", "Subtitle" }) or nil)
 
                     local count = 1
                     if amountText and amountText ~= "" then
