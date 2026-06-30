@@ -2116,9 +2116,74 @@ function getMailboxItemCatalog()
     return nil
 end
 
+local function wrapRawRemote(remote)
+    if not remote then return nil end
+    local wrapper = {}
+    if remote:IsA("RemoteEvent") then
+        wrapper.Fire = function(self, ...)
+            return remote:FireServer(...)
+        end
+        wrapper.OnClientEvent = remote.OnClientEvent
+        wrapper.Connect = function(self, callback)
+            return remote.OnClientEvent:Connect(callback)
+        end
+    elseif remote:IsA("RemoteFunction") then
+        wrapper.Invoke = function(self, ...)
+            return remote:InvokeServer(...)
+        end
+        wrapper.InvokeServer = function(self, ...)
+            return remote:InvokeServer(...)
+        end
+    end
+    return wrapper
+end
+
+local function getFallbackNetworking(serviceName)
+    local remotes = {}
+    local ok, err = pcall(function()
+        for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
+            if desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") then
+                local name = desc.Name
+                local matchService = string.find(string.lower(name), string.lower(serviceName))
+                    or (desc.Parent and string.find(string.lower(desc.Parent.Name), string.lower(serviceName)))
+                if matchService then
+                    local key = nil
+                    if string.lower(serviceName) == "auction" then
+                        if string.find(name, "Request") then
+                            key = "RequestSnapshot"
+                        elseif string.find(name, "StockUpdate") or string.find(name, "Stock") then
+                            key = "StockUpdate"
+                        elseif string.find(name, "Snapshot") then
+                            key = "Snapshot"
+                        end
+                    elseif string.lower(serviceName) == "fruitstock" then
+                        if string.find(name, "Request") then
+                            key = "Request"
+                        elseif string.find(name, "Snapshot") then
+                            key = "Snapshot"
+                        end
+                    end
+                    
+                    if key then
+                        remotes[key] = wrapRawRemote(desc)
+                    end
+                end
+            end
+        end
+    end)
+    if next(remotes) ~= nil then
+        return remotes
+    end
+    return nil
+end
+
 function getAuctionNetworking()
     local networking = getNetworkingModule()
-    return networking and networking.Auctioneer or nil
+    local auction = networking and networking.Auctioneer or nil
+    if not auction then
+        auction = getFallbackNetworking("Auction")
+    end
+    return auction
 end
 
 function getServerNow()
@@ -3746,7 +3811,11 @@ end
 
 function getFruitStockNetworking()
     local networking = getNetworkingModule()
-    return networking and networking.FruitStock or nil
+    local fruitStock = networking and networking.FruitStock or nil
+    if not fruitStock then
+        fruitStock = getFallbackNetworking("FruitStock")
+    end
+    return fruitStock
 end
 
 function requestFruitSnapshot(force)
