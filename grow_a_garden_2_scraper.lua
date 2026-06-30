@@ -4789,16 +4789,48 @@ end)
 optimizeClient()
 
 safeTaskSpawn(function()
+    local vu = game:GetService("VirtualUser")
+    
+    -- Keep window active (Anti-AFK via Idled event)
+    pcall(function()
+        local player = game:GetService("Players").LocalPlayer
+        if player then
+            player.Idled:Connect(function()
+                vu:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+                task.wait(0.5)
+                vu:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+            end)
+        end
+    end)
+
+    -- Auto-jump (every 4 seconds) and auto-click (every 2 seconds while loading)
+    local lastJump = 0
     while true do
-        safeTaskWait(4)
-        pcall(function()
-            local player = game:GetService("Players").LocalPlayer
-            local character = player and player.Character
-            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-            if humanoid then
-                humanoid.Jump = true
-            end
-        end)
+        safeTaskWait(1)
+        local now = os.clock()
+        
+        -- Jump every 4 seconds
+        if now - lastJump >= 4 then
+            lastJump = now
+            pcall(function()
+                local player = game:GetService("Players").LocalPlayer
+                local character = player and player.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    humanoid.Jump = true
+                end
+            end)
+        end
+
+        -- Click in center of screen to skip intro/loading screen
+        if isGameLoading() then
+            pcall(function()
+                local camera = workspace.CurrentCamera
+                local size = camera and camera.ViewportSize or Vector2.new(800, 600)
+                vu:CaptureController()
+                vu:ClickButton1(Vector2.new(size.X / 2, size.Y / 2))
+            end)
+        end
     end
 end)
 
