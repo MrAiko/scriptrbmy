@@ -2112,10 +2112,12 @@ local cachedMailboxItemCatalog = false
 local latestAuctionSnapshot = nil
 local latestAuctionStock = {}
 local latestAuctionAt = 0
+local latestAuctionSnapshotAt = 0
+local latestAuctionStockAt = 0
 local auctionSnapshotConnected = false
 local auctionRequestPending = false
 local lastAuctionRequestAt = -10
-local AUCTION_REQUEST_INTERVAL = 10
+local AUCTION_REQUEST_INTERVAL = 3
 
 function getAuctioneerModule()
     if not cachedAuctioneer then
@@ -2209,6 +2211,41 @@ function getAuctionNetworking()
         auction = getFallbackNetworking("Auction")
     end
     return auction
+end
+
+local function callNetworkEndpoint(endpoint, ...)
+    if not endpoint then return false, nil end
+    if type(endpoint) == "function" then
+        return pcall(endpoint, ...)
+    end
+
+    local methods = { "Fire", "Invoke", "InvokeServer", "FireServer", "Call", "Request", "Send" }
+    local lastError = nil
+    for _, method in ipairs(methods) do
+        local okMethod, fn = pcall(function()
+            return endpoint[method]
+        end)
+        if okMethod and type(fn) == "function" then
+            local ok, result = pcall(function(...)
+                return fn(endpoint, ...)
+            end, ...)
+            if ok then
+                return true, result
+            end
+            lastError = result
+        end
+    end
+
+    local okInstance, isRemoteFunction = pcall(function()
+        return endpoint:IsA("RemoteFunction")
+    end)
+    if okInstance and isRemoteFunction then
+        return pcall(function(...)
+            return endpoint:InvokeServer(...)
+        end, ...)
+    end
+
+    return false, lastError
 end
 
 function getServerNow()
@@ -2345,8 +2382,34 @@ function normalizeAuctionStockMap(stock)
     return out
 end
 
+function getAuctionRawLots(snapshot)
+    if type(snapshot) ~= "table" then return nil end
+    if type(snapshot.manifest) == "table" and type(snapshot.manifest.lots) == "table" then
+        return snapshot.manifest.lots
+    end
+    if type(snapshot.lots) == "table" then
+        return snapshot.lots
+    end
+    if type(snapshot.items) == "table" then
+        return snapshot.items
+    end
+    if type(snapshot.manifest) == "table" then
+        local hasIndexedLots = false
+        for _, lot in pairs(snapshot.manifest) do
+            if type(lot) == "table" and lot.lotId then
+                hasIndexedLots = true
+                break
+            end
+        end
+        if hasIndexedLots then
+            return snapshot.manifest
+        end
+    end
+    return nil
+end
+
 function getAuctionSnapshotLotKey(snapshot)
-    local lots = snapshot and snapshot.manifest and snapshot.manifest.lots
+    local lots = getAuctionRawLots(snapshot)
     if type(lots) ~= "table" then return "" end
     local keys = {}
     for _, lot in pairs(lots) do
@@ -2512,6 +2575,20 @@ end
 
 function applyAuctionSnapshot(snapshot)
     if type(snapshot) ~= "table" then return false end
+    local incomingHasLots = type(getAuctionRawLots(snapshot)) == "table"
+    if not incomingHasLots and type(snapshot.stock) ~= "table" and not latestAuctionSnapshot then
+        return false
+    end
+    if not incomingHasLots and latestAuctionSnapshot then
+        local merged = {}
+        for key, value in pairs(latestAuctionSnapshot) do
+            merged[key] = value
+        end
+        for key, value in pairs(snapshot) do
+            merged[key] = value
+        end
+        snapshot = merged
+    end
     local previousLotKey = getAuctionSnapshotLotKey(latestAuctionSnapshot)
     local nextLotKey = getAuctionSnapshotLotKey(snapshot)
     local lotsChanged = previousLotKey ~= "" and nextLotKey ~= "" and previousLotKey ~= nextLotKey
@@ -2526,6 +2603,9 @@ function applyAuctionSnapshot(snapshot)
         latestAuctionSnapshot.stock = latestAuctionStock
     end
     latestAuctionAt = os.clock()
+    if incomingHasLots then
+        latestAuctionSnapshotAt = latestAuctionAt
+    end
     return true
 end
 
@@ -2535,7 +2615,8 @@ function applyAuctionStockUpdate(update)
     if latestAuctionSnapshot then
         latestAuctionSnapshot.stock = latestAuctionStock
     end
-    latestAuctionAt = os.clock()
+    latestAuctionStockAt = os.clock()
+    latestAuctionAt = latestAuctionStockAt
     return true
 end
 
@@ -2552,24 +2633,11 @@ function requestAuctionSnapshot(force)
 
     auctionRequestPending = true
     lastAuctionRequestAt = now
-    local ok, result = pcall(function()
-        if requestRemote.Fire then
-            return requestRemote:Fire()
-        end
-        if requestRemote.FireServer then
-            return requestRemote:FireServer()
-        end
-        if requestRemote.InvokeServer then
-            return requestRemote:InvokeServer()
-        end
-        if requestRemote.Invoke then
-            return requestRemote:Invoke()
-        end
-        return nil
-    end)
+    local ok, result = callNetworkEndpoint(requestRemote)
     auctionRequestPending = false
 
     if ok and type(result) == "table" then
+        writeDebugLog("Auction snapshot received from RequestSnapshot")
         return applyAuctionSnapshot(result)
     end
     if DEBUG and not ok then
@@ -3012,14 +3080,14 @@ function getAuctionDataFromGui()
 end
 
 function getAuctionData()
-    if not latestAuctionSnapshot or (os.clock() - latestAuctionAt) > AUCTION_REQUEST_INTERVAL then
+    if not latestAuctionSnapshot or (os.clock() - latestAuctionSnapshotAt) > AUCTION_REQUEST_INTERVAL then
         requestAuctionSnapshot(false)
     end
     local snapshot = latestAuctionSnapshot
-    if type(snapshot) ~= "table" then return getAuctionDataFromGui() end
+    if type(snapshot) ~= "table" then return nil end
 
-    local rawLots = snapshot.manifest and snapshot.manifest.lots
-    if type(rawLots) ~= "table" then return getAuctionDataFromGui() end
+    local rawLots = getAuctionRawLots(snapshot)
+    if type(rawLots) ~= "table" then return nil end
 
     local guiData = getAuctionDataFromGui()
     local guiLotsById = {}
@@ -3133,7 +3201,7 @@ function getAuctionData()
     end)
 
     if #lots == 0 then
-        return getAuctionDataFromGui()
+        return nil
     end
 
     local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds) or 0
@@ -4133,75 +4201,6 @@ function updateAPI(fruitData)
     end
 end
 
-local function getAuctionPrompt()
-    local stand = workspace:FindFirstChild("AuctionStand")
-    if not stand then return nil end
-    for _, desc in ipairs(stand:GetDescendants()) do
-        if desc:IsA("ProximityPrompt") and desc:GetAttribute("DontShow") == nil then
-            return desc
-        end
-    end
-    return nil
-end
-
-local function getGuiController()
-    local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
-    local controllers = playerScripts and playerScripts:FindFirstChild("Controllers")
-    local module = controllers and controllers:FindFirstChild("GuiController")
-    return safeRequireModule(module)
-end
-
-local function automateAuctionInteraction()
-    safeTaskSpawn(function()
-        while true do
-            local gui = PlayerGui:FindFirstChild("Auction")
-            local isOpen = gui and gui:IsA("ScreenGui") and gui.Enabled
-            if not isOpen then
-                local prompt = getAuctionPrompt()
-                if prompt then
-                    pcall(function()
-                        local character = LocalPlayer.Character
-                        local hrp = character and character:FindFirstChild("HumanoidRootPart")
-                        if hrp then
-                            local part = prompt.Parent:IsA("BasePart") and prompt.Parent or prompt:FindFirstAncestorWhichIsA("BasePart")
-                            if not part then
-                                local stand = workspace:FindFirstChild("AuctionStand")
-                                part = stand and stand:FindFirstChildWhichIsA("BasePart", true)
-                            end
-                            if part then
-                                -- Teleport 4 studs away in local space to avoid collision conflicts
-                                hrp.CFrame = part.CFrame * CFrame.new(0, 0, 4)
-                            end
-                        end
-                    end)
-                    safeTaskWait(0.5)
-                    -- Trigger the prompt
-                    if fireproximityprompt then
-                        pcall(function() fireproximityprompt(prompt) end)
-                    end
-                    pcall(function()
-                        prompt:InputHoldBegin()
-                        safeTaskWait(prompt.HoldDuration + 0.05)
-                        prompt:InputHoldEnd()
-                    end)
-                    safeTaskWait(0.5)
-                end
-                
-                -- Force GUI open via game UI framework to establish session
-                local GuiController = getGuiController()
-                if GuiController and GuiController.Open then
-                    pcall(function()
-                        GuiController:Open("Auction", nil, { "HUD" })
-                    end)
-                end
-            end
-            safeTaskWait(10)
-        end
-    end)
-end
-
-pcall(automateAuctionInteraction)
-
 -- ================== EVENT HOOKS ==================
 -- FruitStock.Snapshot is the same source FruitStockPriceController uses for x4/x5 values.
 pcall(function()
@@ -4237,9 +4236,12 @@ safeTaskSpawn(function()
 end)
 
 safeTaskSpawn(function()
-    while not latestAuctionSnapshot do
-        safeTaskWait(5)
-        requestAuctionSnapshot(true)
+    while true do
+        safeTaskWait(latestAuctionSnapshot and AUCTION_REQUEST_INTERVAL or 5)
+        local gotSnapshot = requestAuctionSnapshot(not latestAuctionSnapshot)
+        if gotSnapshot then
+            updateAPI(nil)
+        end
     end
 end)
 
