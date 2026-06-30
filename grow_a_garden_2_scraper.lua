@@ -3450,7 +3450,31 @@ function getAuctionDataFromGui()
     }
 end
 
+local function isGameLoading()
+    if not PlayerGui then return false end
+    for _, gui in ipairs(PlayerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Enabled then
+            local name = string.lower(gui.Name)
+            if string.find(name, "loading") or string.find(name, "intro") then
+                return true
+            end
+            for _, desc in ipairs(gui:GetDescendants()) do
+                if desc:IsA("TextLabel") and desc.Visible then
+                    local text = string.lower(desc.Text or "")
+                    if string.find(text, "loading") or string.find(text, "загрузка") or string.find(text, "player data") then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
 function getAuctionData()
+    if isGameLoading() then
+        return nil
+    end
     if not latestAuctionSnapshot or (os.clock() - latestAuctionSnapshotAt) > AUCTION_REQUEST_INTERVAL then
         requestAuctionSnapshot(false)
     end
@@ -4700,6 +4724,12 @@ local lastAuctionHash = ""
 safeTaskSpawn(function()
     while true do
         safeTaskWait(POLL_INTERVAL)
+        pcall(function()
+            local loading = PlayerGui and PlayerGui:FindFirstChild("LoadingGui")
+            if loading then
+                loading:Destroy()
+            end
+        end)
         local phase, _, weathers = getActiveWeatherAndPhase()
         local weathersHash = getWeathersHash(weathers)
         local weatherCatalogHash = getWeatherCatalogHash(getWeatherCatalog())
