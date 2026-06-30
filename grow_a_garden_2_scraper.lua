@@ -2179,12 +2179,36 @@ end
 function hasReliableAuctionPrice(lot)
     if type(lot) ~= "table" then return false end
     if tonumber(lot.currentPrice or lot.price or lot.cost) then return true end
+    if tonumber(lot.startPrice) then return true end
+    return false
+end
+
+function getAuctionLotFallbackStock(lot)
+    if type(lot) ~= "table" then return nil end
+    return normalizeAuctionStockValue(lot.stockQuantity or lot.stock or lot.quantity or lot.count)
+end
+
+function getAuctionLotExpiry(lot)
+    if type(lot) ~= "table" then return 0 end
+    local expiresAt = tonumber(lot.expiresAt or lot.expireAt or lot.endTime or lot.endsAt)
+    if expiresAt and expiresAt > 0 then return expiresAt end
+    local rolledAt = tonumber(lot.rolledAt or lot.startedAt)
+    local duration = tonumber(lot.durationSeconds or lot.duration or lot.lifetime or lot.last)
+    if rolledAt and rolledAt > 0 and duration and duration > 0 then
+        return rolledAt + duration
+    end
+    return 0
+end
+
+function hasAuctionPriceFormula(lot)
+    if type(lot) ~= "table" then return false end
+    if tonumber(lot.currentPrice or lot.price or lot.cost) then return true end
     if not tonumber(lot.startPrice) then return false end
     local decrementIntervalSeconds = tonumber(lot.decrementIntervalSeconds)
     if decrementIntervalSeconds and decrementIntervalSeconds > 0 then
         return tonumber(lot.rolledAt) ~= nil and tonumber(lot.decrementPercent) ~= nil
     end
-    return lot.decrementIntervalSeconds ~= nil or lot.minPrice ~= nil or lot.rolledAt ~= nil
+    return true
 end
 
 function normalizeAuctionStockValue(stock)
@@ -2963,13 +2987,16 @@ function getAuctionData()
                 stock = guiLot.stock
                 hasLiveStock = true
             end
+            if stock == nil then
+                stock = getAuctionLotFallbackStock(lot)
+            end
             local currentPrice = getLotCurrentPrice(lot)
             local priceKnown = hasReliableAuctionPrice(lot)
             if useGuiDynamic and tonumber(guiLot.currentPrice) and tonumber(guiLot.currentPrice) > 0 then
                 currentPrice = tonumber(guiLot.currentPrice)
                 priceKnown = true
             end
-            local stockUnknown = not hasLiveStock and lot.stockQuantity ~= nil
+            local stockUnknown = stock == nil and lot.stockQuantity ~= nil
             local stockUnlimited = not stockUnknown and stock == nil and lot.stockQuantity == nil
             if stockUnknown then
                 stock = nil
@@ -2979,7 +3006,7 @@ function getAuctionData()
             end
             local stockQuantity = nil
             if not stockUnknown then
-                stockQuantity = useGuiDynamic and guiLot.stock ~= nil and guiLot.stock or lot.stockQuantity
+                stockQuantity = useGuiDynamic and guiLot.stock ~= nil and guiLot.stock or (lot.stockQuantity or stock)
             end
             table.insert(lots, {
                 lotId = lotId,
@@ -3000,7 +3027,7 @@ function getAuctionData()
                 priceUnknown = not priceKnown,
                 robuxPrice = lot.robuxPrice,
                 rolledAt = lot.rolledAt,
-                expiresAt = useGuiDynamic and guiLot.expiresAt and guiLot.expiresAt > 0 and guiLot.expiresAt or lot.expiresAt,
+                expiresAt = useGuiDynamic and guiLot.expiresAt and guiLot.expiresAt > 0 and guiLot.expiresAt or getAuctionLotExpiry(lot),
                 soldOut = useGuiDynamic and guiLot.soldOut or nil,
                 expired = useGuiDynamic and guiLot.expired or nil,
                 dynamicSource = useGuiDynamic and "gui" or "snapshot"
@@ -3038,6 +3065,13 @@ function getAuctionData()
     end
     if guiData and tonumber(guiData.refreshAt) and tonumber(guiData.refreshAt) > serverNow then
         refreshAt = tonumber(guiData.refreshAt)
+    end
+    if refreshAt > serverNow then
+        for _, lot in ipairs(lots) do
+            if (tonumber(lot.expiresAt) or 0) <= serverNow then
+                lot.expiresAt = refreshAt
+            end
+        end
     end
 
     return {
