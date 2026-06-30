@@ -3450,34 +3450,7 @@ function getAuctionDataFromGui()
     }
 end
 
-local function isGameLoading()
-    if not PlayerGui then return false end
-    for _, gui in ipairs(PlayerGui:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Enabled then
-            local name = string.lower(gui.Name)
-            if string.find(name, "loading") or string.find(name, "intro") then
-                return true
-            end
-            for _, desc in ipairs(gui:GetDescendants()) do
-                if desc:IsA("TextLabel") and desc.Visible then
-                    local text = string.lower(desc.Text or "")
-                    if string.find(text, "loading") or string.find(text, "загрузка") or string.find(text, "player data") then
-                        return true
-                    end
-                end
-            end
-        end
-    end
-    if workspace:FindFirstChild("LoadingScreenMenu") then
-        return true
-    end
-    return false
-end
-
 function getAuctionData()
-    if isGameLoading() then
-        return nil
-    end
     if not latestAuctionSnapshot or (os.clock() - latestAuctionSnapshotAt) > AUCTION_REQUEST_INTERVAL then
         requestAuctionSnapshot(false)
     end
@@ -4724,68 +4697,9 @@ local lastWeatherCatalogHash = ""
 local lastFruitHash = ""
 local lastAuctionHash = ""
 
-local function handleAutoSkipLoading()
-    local player = game:GetService("Players").LocalPlayer
-    if not player then return end
-    
-    local plotId = player:GetAttribute("PlotId")
-    if not plotId then return end -- Wait until player data is loaded (plot is assigned)
-    
-    local hasLoading = workspace:FindFirstChild("LoadingScreenMenu")
-        or (PlayerGui and PlayerGui:FindFirstChild("LoadingGui"))
-        or player:GetAttribute("LoadingScreenActive") == true
-
-    if hasLoading then
-        pcall(function()
-            -- 1. Unanchor character
-            local character = player.Character
-            local rootPart = character and (character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 5))
-            if rootPart then
-                rootPart.Anchored = false
-            end
-
-            -- 2. Teleport to plot spawn
-            local gardens = workspace:FindFirstChild("Gardens")
-            local plot = gardens and gardens:FindFirstChild("Plot" .. plotId)
-            local spawnPoint = plot and plot:FindFirstChild("SpawnPoint")
-            if spawnPoint and character then
-                character:PivotTo(spawnPoint.CFrame)
-            end
-
-            -- 3. Reset camera
-            workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
-
-            -- 4. Enable hidden ScreenGuis
-            local PlayerGui = player:FindFirstChildOfClass("PlayerGui")
-            if PlayerGui then
-                for _, gui in ipairs(PlayerGui:GetChildren()) do
-                    if gui:IsA("ScreenGui") and gui.Name ~= "LoadingGui" then
-                        gui.Enabled = true
-                    end
-                end
-            end
-
-            -- 5. Destroy loading screen elements
-            local menu = workspace:FindFirstChild("LoadingScreenMenu")
-            if menu then
-                menu:Destroy()
-            end
-            local loadingGui = PlayerGui and PlayerGui:FindFirstChild("LoadingGui")
-            if loadingGui then
-                loadingGui:Destroy()
-            end
-
-            -- 6. Set attributes
-            player:SetAttribute("LoadingScreenActive", false)
-            player:SetAttribute("LoadingScreenDone", true)
-        end)
-    end
-end
-
 safeTaskSpawn(function()
     while true do
         safeTaskWait(POLL_INTERVAL)
-        handleAutoSkipLoading()
         local phase, _, weathers = getActiveWeatherAndPhase()
         local weathersHash = getWeathersHash(weathers)
         local weatherCatalogHash = getWeatherCatalogHash(getWeatherCatalog())
@@ -4812,8 +4726,60 @@ end)
 -- Fallback periodic update: scrape everything fresh inside updateAPI (fruitData=nil
 -- means "scrape fresh"), guaranteeing the site gets current data even if the fast
 -- poll detected no change (e.g. UI re-opened, values rotated server-side).
+local function bypassLoadingScreen()
+    local PlayerGui = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui", 10)
+    if not PlayerGui then return end
+    
+    pcall(function()
+        -- 1. Find and destroy LoadingScreenMenu from workspace
+        for _, child in ipairs(workspace:GetChildren()) do
+            if child.Name == "LoadingScreenMenu" then
+                child:Destroy()
+                writeDebugLog("Destroyed LoadingScreenMenu in workspace")
+            end
+        end
+
+        -- 2. Unlock all ScreenGuis by disconnecting "Enabled" change connections
+        if getconnections then
+            pcall(function()
+                for _, conn in ipairs(getconnections(PlayerGui.ChildAdded)) do
+                    pcall(function() conn:Disconnect() end)
+                end
+            end)
+            
+            for _, child in ipairs(PlayerGui:GetChildren()) do
+                if child:IsA("ScreenGui") then
+                    pcall(function()
+                        for _, conn in ipairs(getconnections(child:GetPropertyChangedSignal("Enabled"))) do
+                            pcall(function() conn:Disconnect() end)
+                        end
+                    end)
+                end
+            end
+        end
+        
+        -- 3. Reset camera and spoof loading state attributes
+        local localPlayer = game:GetService("Players").LocalPlayer
+        if localPlayer then
+            pcall(function()
+                localPlayer:SetAttribute("LoadingScreenActive", false)
+                localPlayer:SetAttribute("LoadingScreenDone", true)
+            end)
+        end
+        
+        if workspace.CurrentCamera and workspace.CurrentCamera.CameraType == Enum.CameraType.Scriptable then
+            workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+            writeDebugLog("Reset camera locked by loading screen")
+        end
+    end)
+end
+
+-- Fallback periodic update: scrape everything fresh inside updateAPI (fruitData=nil
+-- means "scrape fresh"), guaranteeing the site gets current data even if the fast
+-- poll detected no change (e.g. UI re-opened, values rotated server-side).
 safeTaskSpawn(function()
     while true do
+        pcall(bypassLoadingScreen)
         updateAPI(nil)
         safeTaskWait(UPDATE_INTERVAL)
     end
@@ -4823,52 +4789,7 @@ end)
 -- FruitStockPrice visibility; snapshots drive updates directly.
 
 -- Apply client optimizations LAST, so all monitoring hooks are already connected.
+bypassLoadingScreen()
 optimizeClient()
-
-safeTaskSpawn(function()
-    local vu = game:GetService("VirtualUser")
-    
-    -- Keep window active (Anti-AFK via Idled event)
-    pcall(function()
-        local player = game:GetService("Players").LocalPlayer
-        if player then
-            player.Idled:Connect(function()
-                vu:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-                task.wait(0.5)
-                vu:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-            end)
-        end
-    end)
-
-    -- Auto-jump (every 4 seconds) and auto-click (every 2 seconds while loading)
-    local lastJump = 0
-    while true do
-        safeTaskWait(1)
-        local now = os.clock()
-        
-        -- Jump every 4 seconds
-        if now - lastJump >= 4 then
-            lastJump = now
-            pcall(function()
-                local player = game:GetService("Players").LocalPlayer
-                local character = player and player.Character
-                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-                if humanoid then
-                    humanoid.Jump = true
-                end
-            end)
-        end
-
-        -- Click in center of screen to skip intro/loading screen
-        if isGameLoading() then
-            pcall(function()
-                local camera = workspace.CurrentCamera
-                local size = camera and camera.ViewportSize or Vector2.new(800, 600)
-                vu:CaptureController()
-                vu:ClickButton1(Vector2.new(size.X / 2, size.Y / 2))
-            end)
-        end
-    end
-end)
 
 print("[Grow a Garden 2 Stocker] Scraper loaded (" .. (MOBILE_SAFE_MODE and "Mobile Safe Mode" or "Extreme Optimization") .. ")!")
