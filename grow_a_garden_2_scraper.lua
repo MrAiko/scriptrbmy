@@ -80,12 +80,45 @@ end
 function optimizeClient()
     local RunService = game:GetService("RunService")
 
+    -- PC Roblox background FPS optimization (reduces CPU/GPU load to near-zero)
+    if not MOBILE_SAFE_MODE then
+        if type(setfpscap) == "function" then
+            pcall(function() setfpscap(5) end)
+        elseif type(getgenv) == "function" and type(getgenv().setfpscap) == "function" then
+            pcall(function() getgenv().setfpscap(5) end)
+        end
+    end
+
     -- 1. Stop 3D world rendering entirely.
     -- Some mobile executors (Delta/Android) become unstable when 3D rendering
     -- is disabled or the whole Workspace is locally destroyed, so phones use a
     -- lighter optimization profile.
     if not MOBILE_SAFE_MODE then
         pcall(function() RunService:Set3dRenderingEnabled(false) end)
+    end
+
+    -- Non-destructive graphics optimization (remove heavy textures, particles, shadows on PC)
+    if not MOBILE_SAFE_MODE then
+        local function optimizeGraphics(instance)
+            if not instance then return end
+            pcall(function()
+                if instance:IsA("Decal") or instance:IsA("Texture") or instance:IsA("SpecialMesh") or
+                   instance:IsA("ParticleEmitter") or instance:IsA("Beam") or instance:IsA("Trail") or
+                   instance:IsA("PostEffect") or instance:IsA("Highlight") or instance:IsA("Light") then
+                    instance:Destroy()
+                elseif instance:IsA("BasePart") then
+                    instance.CastShadow = false
+                    instance.Material = Enum.Material.SmoothPlastic
+                    instance.Reflectance = 0
+                end
+            end)
+        end
+        pcall(function()
+            for _, desc in ipairs(workspace:GetDescendants()) do
+                optimizeGraphics(desc)
+            end
+            workspace.DescendantAdded:Connect(optimizeGraphics)
+        end)
     end
 
     -- 2. Minimize lighting/shadow cost.
@@ -133,27 +166,6 @@ function optimizeClient()
             end
         end)
     end)
-
-    -- 6.5. FPS capping & Physics throttling (PC optimizations)
-    pcall(function()
-        if setfpscap then
-            setfpscap(5)
-        end
-    end)
-    pcall(function()
-        settings().Physics.PhysicsEnvironmentalThrottle = Enum.EnviromentalPhysicsThrottle.HeavyThrottle
-        settings().Physics.AllowSleep = true
-    end)
-    -- Periodic Garbage Collection
-    safeTaskSpawn(function()
-        while true do
-            safeTaskWait(30)
-            pcall(function()
-                collectgarbage("collect")
-            end)
-        end
-    end)
-
 
     -- 7. Optional destructive cleanup. Keep disabled by default: several game
     --    controllers still read Workspace.Gardens.*.Plants.*.Base on the client.
@@ -942,45 +954,41 @@ end
 
 function scrapeShop(container)
     local items = {}
-    if not container or not container.Parent then return items end
-    local ok, descendants = pcall(function() return container:GetDescendants() end)
-    if not ok or not descendants then return items end
-    for _, desc in ipairs(descendants) do
-        pcall(function()
-            if desc and desc.Parent and desc:IsA("GuiObject") and not isGenericItemName(desc.Name) then
-                local mainFrame = desc:FindFirstChild("Main_Frame")
-                local contentRoot = mainFrame or desc
-                local hasFields = contentRoot:FindFirstChild("Cost_Text", true)
-                    or contentRoot:FindFirstChild("Stock_Text", true)
-                    or contentRoot:FindFirstChild("Seed_Text", true)
-                    or contentRoot:FindFirstChild("Rarity", true)
-                if mainFrame or hasFields then
-                    local stockVal = 0
-                    local priceVal = getNestedText(contentRoot, "Cost_Text") or "Unknown"
-                    local stockText = getNestedText(contentRoot, "Stock_Text") or getNestedText(contentRoot, "Seed_Text")
-                    if stockText then
-                        local lt = string.lower(stockText)
-                        if string.find(lt, "no stock") or stockText == "" then
-                            stockVal = 0
-                        else
-                            local parsed = string.match(stockText, "(%d+)")
-                            if parsed then stockVal = tonumber(parsed) end
-                        end
-                    end
-                    local noStock = contentRoot:FindFirstChild("NoStock", true)
-                    if noStock and noStock:IsA("GuiObject") and noStock.Visible == true then
+    if not container then return items end
+    for _, desc in ipairs(container:GetDescendants()) do
+        if desc:IsA("GuiObject") and not isGenericItemName(desc.Name) then
+            local mainFrame = desc:FindFirstChild("Main_Frame")
+            local contentRoot = mainFrame or desc
+            local hasFields = contentRoot:FindFirstChild("Cost_Text", true)
+                or contentRoot:FindFirstChild("Stock_Text", true)
+                or contentRoot:FindFirstChild("Seed_Text", true)
+                or contentRoot:FindFirstChild("Rarity", true)
+            if mainFrame or hasFields then
+                local stockVal = 0
+                local priceVal = getNestedText(contentRoot, "Cost_Text") or "Unknown"
+                local stockText = getNestedText(contentRoot, "Stock_Text") or getNestedText(contentRoot, "Seed_Text")
+                if stockText then
+                    local lt = string.lower(stockText)
+                    if string.find(lt, "no stock") or stockText == "" then
                         stockVal = 0
+                    else
+                        local parsed = string.match(stockText, "(%d+)")
+                        if parsed then stockVal = tonumber(parsed) end
                     end
-                    table.insert(items, {
-                        name = desc.Name,
-                        stock = stockVal,
-                        price = priceVal,
-                        rarity = detectRarity(contentRoot),
-                        image = detectImage(contentRoot)
-                    })
                 end
+                local noStock = contentRoot:FindFirstChild("NoStock", true)
+                if noStock and noStock:IsA("GuiObject") and noStock.Visible == true then
+                    stockVal = 0
+                end
+                table.insert(items, {
+                    name = desc.Name,
+                    stock = stockVal,
+                    price = priceVal,
+                    rarity = detectRarity(contentRoot),
+                    image = detectImage(contentRoot)
+                })
             end
-        end)
+        end
     end
     return items
 end
@@ -1104,16 +1112,32 @@ end
 
 function parseTimeToSeconds(timeStr)
     if not timeStr or timeStr == "" then return 0 end
-    local cleanStr = string.match(timeStr, "(%d+:%d+)") or timeStr
-    local m, s = string.match(cleanStr, "(%d+):(%d+)")
-    if m and s then return tonumber(m) * 60 + tonumber(s) end
-    local minutes = string.match(cleanStr, "(%d+)m")
-    local seconds = string.match(cleanStr, "(%d+)s")
-    local total = 0
-    if minutes then total = total + tonumber(minutes) * 60 end
-    if seconds then total = total + tonumber(seconds) end
-    if total == 0 and tonumber(cleanStr) then total = tonumber(cleanStr) end
-    return total
+    local raw = string.lower(tostring(timeStr)):gsub("%s+", "")
+    
+    -- Check for h, m, s suffixes first
+    local hours = tonumber(raw:match("(%d+)h")) or 0
+    local minutes = tonumber(raw:match("(%d+)m")) or 0
+    local seconds = tonumber(raw:match("(%d+)s")) or 0
+    if hours > 0 or minutes > 0 or seconds > 0 then
+        return hours * 3600 + minutes * 60 + seconds
+    end
+    
+    -- Check for colons format (e.g. HH:MM:SS)
+    local a, b, c = raw:match("(%d+):(%d+):(%d+)")
+    if a and b and c then
+        return tonumber(a) * 3600 + tonumber(b) * 60 + tonumber(c)
+    end
+    
+    -- Check for colons format (e.g. MM:SS)
+    local d, e = raw:match("(%d+):(%d+)")
+    if d and e then
+        return tonumber(d) * 60 + tonumber(e)
+    end
+    
+    local val = tonumber(raw)
+    if val then return val end
+    
+    return 0
 end
 
 function findWeatherUI()
@@ -1535,52 +1559,50 @@ function getActiveWeatherFromStateRoots(endTime)
     end
 
     local function scanInstance(inst)
-        pcall(function()
-            if not inst or not inst.Parent or isTechnicalPhaseName(inst.Name) then return end
+        if not inst or isTechnicalPhaseName(inst.Name) then return end
 
-            local attrName = nil
-            local okAttrs, attrs = pcall(function() return inst:GetAttributes() end)
-            if okAttrs and type(attrs) == "table" then
-                for attrKey, attrValue in pairs(attrs) do
-                    local attrKeyNorm = normalizeName(attrKey)
-                    if attrKeyNorm == "weather" or attrKeyNorm == "currentweather" or attrKeyNorm == "activeweather"
-                       or attrKeyNorm == "phase" or attrKeyNorm == "currentphase" then
-                        local name, isPhase = readWeatherNameFromValue(attrValue)
-                        if name then
-                            if isPhase then phase = name else attrName = name end
-                        end
+        local attrName = nil
+        local okAttrs, attrs = pcall(function() return inst:GetAttributes() end)
+        if okAttrs and type(attrs) == "table" then
+            for attrKey, attrValue in pairs(attrs) do
+                local attrKeyNorm = normalizeName(attrKey)
+                if attrKeyNorm == "weather" or attrKeyNorm == "currentweather" or attrKeyNorm == "activeweather"
+                   or attrKeyNorm == "phase" or attrKeyNorm == "currentphase" then
+                    local name, isPhase = readWeatherNameFromValue(attrValue)
+                    if name then
+                        if isPhase then phase = name else attrName = name end
                     end
                 end
             end
+        end
 
-            local nameFromValue, valueIsPhase = nil, false
-            if inst:IsA("StringValue") then
-                nameFromValue, valueIsPhase = readWeatherNameFromValue(inst.Value)
-            end
+        local nameFromValue, valueIsPhase = nil, false
+        if inst:IsA("StringValue") then
+            nameFromValue, valueIsPhase = readWeatherNameFromValue(inst.Value)
+        end
 
-            local nameFromInstance, instanceIsPhase = nil, false
-            if isWeatherPhaseName(inst.Name) then
-                nameFromInstance, instanceIsPhase = cleanPhaseName(inst.Name), true
-            else
-                nameFromInstance = cleanWeatherStateName(inst.Name)
-            end
-            local activeByState = hasTruthyStateSignal(inst, stateNames)
+        local nameFromInstance, instanceIsPhase = nil, false
+        if isWeatherPhaseName(inst.Name) then
+            nameFromInstance, instanceIsPhase = cleanPhaseName(inst.Name), true
+        else
+            nameFromInstance = cleanWeatherStateName(inst.Name)
+        end
+        local activeByState = hasTruthyStateSignal(inst, stateNames)
 
-            if attrName then
-                addWeather(attrName, inst)
-            elseif nameFromValue then
-                if valueIsPhase then
-                    phase = nameFromValue
-                elseif activeByState or normalizeName(inst.Name) == "weather"
-                    or normalizeName(inst.Name) == "currentweather" or normalizeName(inst.Name) == "activeweather" then
-                    addWeather(nameFromValue, inst)
-                end
-            elseif nameFromInstance and not instanceIsPhase and activeByState then
-                addWeather(nameFromInstance, inst)
-            elseif nameFromInstance and instanceIsPhase and activeByState then
-                phase = nameFromInstance
+        if attrName then
+            addWeather(attrName, inst)
+        elseif nameFromValue then
+            if valueIsPhase then
+                phase = nameFromValue
+            elseif activeByState or normalizeName(inst.Name) == "weather"
+                or normalizeName(inst.Name) == "currentweather" or normalizeName(inst.Name) == "activeweather" then
+                addWeather(nameFromValue, inst)
             end
-        end)
+        elseif nameFromInstance and not instanceIsPhase and activeByState then
+            addWeather(nameFromInstance, inst)
+        elseif nameFromInstance and instanceIsPhase and activeByState then
+            phase = nameFromInstance
+        end
     end
 
     for _, root in ipairs(getWeatherStateScanRoots()) do
@@ -3266,9 +3288,9 @@ function isDefaultAuctionPlaceholderLot(lot)
 end
 
 function parseCompactMoney(text)
-    local raw = tostring(text or ""):gsub("%s+", "")
-    raw = raw:gsub("\194\162", "")
-    local numberText, suffix = raw:match("([%d%.,]+)([%a]*)")
+    if not text then return 0 end
+    local raw = string.lower(tostring(text)):gsub("%s+", ""):gsub("[%$%¢₽]", "")
+    local numberText, suffix = raw:match("([%d%.,]+)(%a*)")
     if not numberText then return 0 end
     suffix = string.lower(suffix or "")
     if suffix == "" then
@@ -3319,11 +3341,17 @@ function parseAuctionStockText(stockText)
     local soldOut = string.find(lowerStock, "sold") ~= nil
         or string.find(lowerStock, "out") ~= nil
         or string.find(lowerStock, "expired") ~= nil
+        or string.find(lowerStock, "нет") ~= nil
+        or string.find(lowerStock, "закончился") ~= nil
     if soldOut then return 0, true end
 
     local parsedStock = raw:match("[xX]%s*([%d,%s%.]+)")
         or raw:match("([%d][%d,%s%.]*)")
-    if not parsedStock then return nil, false end
+    if not parsedStock then
+        -- Fallback: strip all non-digits to get pure stock count
+        parsedStock = raw:gsub("%D", "")
+    end
+    if parsedStock == "" then return nil, false end
 
     local cleaned = parsedStock:gsub("[%s,%.]", "")
     local value = tonumber(cleaned)
@@ -3348,122 +3376,120 @@ function getAuctionDataFromGui()
     local refreshAt = headerDuration > 0 and (serverNow + headerDuration) or 0
 
     for _, card in ipairs(scrollingFrame:GetChildren()) do
-        pcall(function()
-            if card and card.Parent and card:IsA("GuiObject") then
-                local main = card:FindFirstChild("Main_Frame", true) or card:FindFirstChild("Frame", true) or card
-                local priceText = getFirstTextMatching(main, function(text)
-                    return string.find(text, "Р’Сћ") or string.find(text, "\194\162")
-                end)
-                local stockText = getFirstTextByNames(main, { "Stock_Text", "StockText", "Stock" }) or ""
-                local timerText = getFirstTextByNames(main, { "RefreshIn", "Timer", "Time" }) or ""
-                priceText = guiDynamicTrusted and getAuctionGuiPriceText(main) or nil
-                stockText = guiDynamicTrusted and getAuctionGuiStockText(main) or ""
-                timerText = guiDynamicTrusted and getAuctionGuiTimerText(main) or ""
-                local nameText = getFirstAttributeByNames(main, { "ItemToolTip", "DisplayName", "ItemName", "Name" })
-                    or getAuctionTextByNames(main, { "ItemName", "Item_Name", "Name", "Title" })
-                    or card:GetAttribute("ItemToolTip")
-                    or card:GetAttribute("DisplayName")
+        if card:IsA("GuiObject") then
+            local main = card:FindFirstChild("Main_Frame", true) or card:FindFirstChild("Frame", true) or card
+            local priceText = getFirstTextMatching(main, function(text)
+                return string.find(text, "Р’Сћ") or string.find(text, "\194\162")
+            end)
+            local stockText = getFirstTextByNames(main, { "Stock_Text", "StockText", "Stock" }) or ""
+            local timerText = getFirstTextByNames(main, { "RefreshIn", "Timer", "Time" }) or ""
+            priceText = guiDynamicTrusted and getAuctionGuiPriceText(main) or nil
+            stockText = guiDynamicTrusted and getAuctionGuiStockText(main) or ""
+            timerText = guiDynamicTrusted and getAuctionGuiTimerText(main) or ""
+            local nameText = getFirstAttributeByNames(main, { "ItemToolTip", "DisplayName", "ItemName", "Name" })
+                or getAuctionTextByNames(main, { "ItemName", "Item_Name", "Name", "Title" })
+                or card:GetAttribute("ItemToolTip")
+                or card:GetAttribute("DisplayName")
 
-                if (priceText or stockText ~= "" or nameText) and normalizeName(card.Name) ~= "uilistlayout" then
-                    local duration = parseDurationSeconds(timerText)
-                    local expiresAt = duration > 0 and (serverNow + duration) or 0
-                    if headerDuration <= 0 and expiresAt > 0 and (refreshAt == 0 or expiresAt < refreshAt) then
-                        refreshAt = expiresAt
+            if (priceText or stockText ~= "" or nameText) and normalizeName(card.Name) ~= "uilistlayout" then
+                local duration = parseDurationSeconds(timerText)
+                local expiresAt = duration > 0 and (serverNow + duration) or 0
+                if headerDuration <= 0 and expiresAt > 0 and (refreshAt == 0 or expiresAt < refreshAt) then
+                    refreshAt = expiresAt
+                end
+
+                local stock, soldOut = parseAuctionStockText(stockText)
+
+                local currentPrice = parseCompactMoney(priceText)
+                local cardLotId = normalizeAuctionLotId(card.Name)
+                local cardKey = normalizeName(card.Name)
+                local isAuctionLotCard = string.sub(cardKey, 1, 10) == "lotauction" or string.sub(cardKey, 1, 7) == "auction"
+                local looksLikeTemplateAuctionRow = not isAuctionLotCard
+                    and currentPrice == 1000 and stock == 16 and duration <= 0 and headerDuration <= 0
+                local looksLikeDefaultDynamic = currentPrice == 100000 and stock == 16
+                local rowDynamicTrusted = guiDynamicTrusted and not looksLikeDefaultDynamic
+
+                local expired = false
+                if rowDynamicTrusted then
+                    local expiredObj = main:FindFirstChild("EXPIRED", true)
+                    if expiredObj and expiredObj:IsA("GuiObject") and expiredObj.Visible then
+                        expired = true
                     end
-
-                    local stock, soldOut = parseAuctionStockText(stockText)
-
-                    local currentPrice = parseCompactMoney(priceText)
-                    local cardLotId = normalizeAuctionLotId(card.Name)
-                    local cardKey = normalizeName(card.Name)
-                    local isAuctionLotCard = string.sub(cardKey, 1, 10) == "lotauction" or string.sub(cardKey, 1, 7) == "auction"
-                    local looksLikeTemplateAuctionRow = not isAuctionLotCard
-                        and currentPrice == 1000 and stock == 16 and duration <= 0 and headerDuration <= 0
-                    local looksLikeDefaultDynamic = currentPrice == 100000 and stock == 16
-                    local rowDynamicTrusted = guiDynamicTrusted and not looksLikeDefaultDynamic
-
-                    local expired = false
-                    if rowDynamicTrusted then
-                        local expiredObj = main:FindFirstChild("EXPIRED", true)
-                        if expiredObj and expiredObj:IsA("GuiObject") and expiredObj.Visible then
-                            expired = true
-                        end
-                        local outObj = main:FindFirstChild("OUT_OF_STOCK", true)
-                        if outObj and outObj:IsA("GuiObject") and outObj.Visible then
-                            soldOut = true
-                            stock = 0
-                        end
-                    else
-                        stock = nil
-                        currentPrice = 0
-                        expiresAt = 0
-                        soldOut = false
+                    local outObj = main:FindFirstChild("OUT_OF_STOCK", true)
+                    if outObj and outObj:IsA("GuiObject") and outObj.Visible then
+                        soldOut = true
+                        stock = 0
                     end
+                else
+                    stock = nil
+                    currentPrice = 0
+                    expiresAt = 0
+                    soldOut = false
+                end
 
-                    if not looksLikeTemplateAuctionRow then
-                        local category = getAuctionGuiCategory(main) or "Auction"
-                        local rarity = getAuctionTextAtPath(main, { "Rarity", "Rarity_Text" })
-                            or getFirstAttributeByNames(main, { "ItemToolTipRarity", "Rarity" })
-                            or ""
-                        local amountNode = main:FindFirstChild("ImageDisplay")
-                        amountNode = amountNode and amountNode:FindFirstChild("Amount") or main:FindFirstChild("Amount")
-                        
-                        local amountText = nil
-                        if amountNode and isInstanceVisible(amountNode) then
-                            amountText = getAuctionTextFrom(amountNode)
-                        end
-                        
-                        local countAttr = getFirstAttributeByNames(main, { "Amount", "Count" })
-                        local imageDisplay = main:FindFirstChild("ImageDisplay")
-                        local subtitleAttr = getFirstAttributeByNames(main, { "ItemToolTipSubtitle", "Subtitle" })
-                            or (imageDisplay and getFirstAttributeByNames(imageDisplay, { "ItemToolTipSubtitle", "Subtitle" }) or nil)
-
-                        local count = 1
-                        if amountText and amountText ~= "" then
-                            local countText = tostring(amountText):match("[xX]%s*([%d,%s%.]+)") or tostring(amountText):match("([%d][%d,%s%.]*)")
-                            count = countText and tonumber((countText:gsub("[%s,%.]", ""))) or 1
-                        elseif countAttr and tostring(countAttr) ~= "" then
-                            local countText = tostring(countAttr):match("[xX]%s*([%d,%s%.]+)") or tostring(countAttr):match("([%d][%d,%s%.]*)")
-                            count = countText and tonumber((countText:gsub("[%s,%.]", ""))) or 1
-                        elseif subtitleAttr and tostring(subtitleAttr) ~= "" then
-                            local countText = tostring(subtitleAttr):match("[xX]%s*([%d,%s%.]+)")
-                            count = countText and tonumber((countText:gsub("[%s,%.]", ""))) or 1
-                        end
-                        local lotName = nameText or tostring(card.Name)
-                        local lot = {
-                            category = category,
-                            item = lotName,
-                            name = lotName,
-                            displayName = lotName,
-                            count = count
-                        }
-
-                        table.insert(lots, {
-                            lotId = cardLotId,
-                            uiLotId = tostring(card.Name),
-                            orderIndex = getAuctionLotIndex(cardLotId),
-                            item = lotName,
-                            name = lotName,
-                            category = category,
-                            count = count,
-                            rarity = rarity,
-                            image = getAuctionGuiImage(main, lot),
-                            stock = stock,
-                            stockQuantity = stock,
-                            stockUnknown = not rowDynamicTrusted or (stock == nil and not soldOut),
-                            stockUnlimited = false,
-                            currentPrice = currentPrice > 0 and currentPrice or nil,
-                            priceUnknown = not rowDynamicTrusted or currentPrice <= 0,
-                            expiresAt = expiresAt,
-                            soldOut = soldOut,
-                            expired = expired,
-                            dynamicTrusted = rowDynamicTrusted,
-                            looksLikeDefaultDynamic = looksLikeDefaultDynamic
-                        })
+                if not looksLikeTemplateAuctionRow then
+                    local category = getAuctionGuiCategory(main) or "Auction"
+                    local rarity = getAuctionTextAtPath(main, { "Rarity", "Rarity_Text" })
+                        or getFirstAttributeByNames(main, { "ItemToolTipRarity", "Rarity" })
+                        or ""
+                    local amountNode = main:FindFirstChild("ImageDisplay")
+                    amountNode = amountNode and amountNode:FindFirstChild("Amount") or main:FindFirstChild("Amount")
+                    
+                    local amountText = nil
+                    if amountNode and isInstanceVisible(amountNode) then
+                        amountText = getAuctionTextFrom(amountNode)
                     end
+                    
+                    local countAttr = getFirstAttributeByNames(main, { "Amount", "Count" })
+                    local imageDisplay = main:FindFirstChild("ImageDisplay")
+                    local subtitleAttr = getFirstAttributeByNames(main, { "ItemToolTipSubtitle", "Subtitle" })
+                        or (imageDisplay and getFirstAttributeByNames(imageDisplay, { "ItemToolTipSubtitle", "Subtitle" }) or nil)
+
+                    local count = 1
+                    if amountText and amountText ~= "" then
+                        local countText = tostring(amountText):match("[xX]%s*([%d,%s%.]+)") or tostring(amountText):match("([%d][%d,%s%.]*)")
+                        count = countText and tonumber((countText:gsub("[%s,%.]", ""))) or 1
+                    elseif countAttr and tostring(countAttr) ~= "" then
+                        local countText = tostring(countAttr):match("[xX]%s*([%d,%s%.]+)") or tostring(countAttr):match("([%d][%d,%s%.]*)")
+                        count = countText and tonumber((countText:gsub("[%s,%.]", ""))) or 1
+                    elseif subtitleAttr and tostring(subtitleAttr) ~= "" then
+                        local countText = tostring(subtitleAttr):match("[xX]%s*([%d,%s%.]+)")
+                        count = countText and tonumber((countText:gsub("[%s,%.]", ""))) or 1
+                    end
+                    local lotName = nameText or tostring(card.Name)
+                    local lot = {
+                        category = category,
+                        item = lotName,
+                        name = lotName,
+                        displayName = lotName,
+                        count = count
+                    }
+
+                    table.insert(lots, {
+                        lotId = cardLotId,
+                        uiLotId = tostring(card.Name),
+                        orderIndex = getAuctionLotIndex(cardLotId),
+                        item = lotName,
+                        name = lotName,
+                        category = category,
+                        count = count,
+                        rarity = rarity,
+                        image = getAuctionGuiImage(main, lot),
+                        stock = stock,
+                        stockQuantity = stock,
+                        stockUnknown = not rowDynamicTrusted or (stock == nil and not soldOut),
+                        stockUnlimited = false,
+                        currentPrice = currentPrice > 0 and currentPrice or nil,
+                        priceUnknown = not rowDynamicTrusted or currentPrice <= 0,
+                        expiresAt = expiresAt,
+                        soldOut = soldOut,
+                        expired = expired,
+                        dynamicTrusted = rowDynamicTrusted,
+                        looksLikeDefaultDynamic = looksLikeDefaultDynamic
+                    })
                 end
             end
-        end)
+        end
     end
 
     if #lots == 0 then return nil end
@@ -3526,100 +3552,98 @@ function getAuctionData()
     end)
 
     for position, raw in ipairs(orderedRawLots) do
-        pcall(function()
             local lot = raw.lot
             if type(lot) == "table" and lot.lotId then
-                local lotId = normalizeAuctionLotId(lot.lotId)
-                local lotIndex = getAuctionLotIndex(lotId)
-                local rawIndex = raw.rawIndex
-                local guiLot = guiLotsById[lotId]
-                    or (lotIndex ~= nil and guiLotsByIndex[lotIndex] or nil)
-                    or guiLotsByPosition[position]
-                local placeholderLot = isDefaultAuctionPlaceholderLot(lot)
-                local stock = getAuctionStockMapValue(latestAuctionStock, lot, lotId, lotIndex, position, rawIndex)
-                local hasLiveStock = stock ~= nil
-                if stock == nil and type(snapshot.stock) == "table" then
-                    stock = getAuctionStockMapValue(snapshot.stock, lot, lotId, lotIndex, position, rawIndex)
-                    hasLiveStock = stock ~= nil
-                end
-                stock = normalizeAuctionStockValue(stock)
-                if stock == nil then
-                    hasLiveStock = false
-                end
-                local useGuiDynamic = guiLot and guiLot.dynamicTrusted == true
-                if useGuiDynamic and guiLot.stock ~= nil then
-                    stock = guiLot.stock
-                    hasLiveStock = true
-                end
-                if stock == nil and not placeholderLot then
-                    stock = getAuctionLotFallbackStock(lot)
-                end
-                local currentPrice = getLotCurrentPrice(lot)
-                local priceKnown = hasReliableAuctionPrice(lot)
-                if useGuiDynamic and tonumber(guiLot.currentPrice) and tonumber(guiLot.currentPrice) > 0 then
-                    currentPrice = tonumber(guiLot.currentPrice)
-                    priceKnown = true
-                end
-                if placeholderLot and not useGuiDynamic then
-                    priceKnown = false
-                    currentPrice = nil
-                    stock = nil
-                    hasLiveStock = false
-                end
-                local stockUnknown = stock == nil and (lot.stockQuantity ~= nil or placeholderLot)
-                local stockUnlimited = not stockUnknown and stock == nil and lot.stockQuantity == nil
-                if stockUnknown then
-                    stock = nil
-                end
-                if not priceKnown then
-                    currentPrice = nil
-                end
-                local soldOut = (stock ~= nil and stock <= 0) or (useGuiDynamic and guiLot.soldOut == true)
-                local lotExpiresAt = placeholderLot and not useGuiDynamic and 0 or getAuctionLotExpiry(lot)
-                local expired = lotExpiresAt > 0 and lotExpiresAt <= getServerNow()
-                if useGuiDynamic and guiLot.expired ~= nil then
-                    expired = guiLot.expired == true
-                end
-                if soldOut and currentPrice ~= nil then
-                    local frozenPrice = latestAuctionSoldOutPrices[lotId]
-                    if frozenPrice == nil then
-                        latestAuctionSoldOutPrices[lotId] = currentPrice
-                        frozenPrice = currentPrice
-                    end
-                    currentPrice = frozenPrice
-                elseif not soldOut then
-                    latestAuctionSoldOutPrices[lotId] = nil
-                end
-                local stockQuantity = nil
-                if not stockUnknown then
-                    stockQuantity = hasLiveStock and stock or (useGuiDynamic and guiLot.stock ~= nil and guiLot.stock or (lot.stockQuantity or stock))
-                end
-                table.insert(lots, {
-                    lotId = lotId,
-                    item = guiLot and guiLot.item or lot.item,
-                    name = guiLot and guiLot.name or getLotDisplayName(lot),
-                    category = guiLot and guiLot.category or lot.category,
-                    type = lot.type,
-                    mutation = lot.mutation,
-                    size = lot.size,
-                    count = guiLot and guiLot.count or lot.count or 1,
-                    rarity = guiLot and guiLot.rarity or getLotRarity(lot),
-                    image = guiLot and guiLot.image or getLotImage(lot),
-                    stock = stock,
-                    stockQuantity = stockQuantity,
-                    stockUnknown = stockUnknown,
-                    stockUnlimited = stockUnlimited,
-                    currentPrice = currentPrice,
-                    priceUnknown = not priceKnown,
-                    robuxPrice = lot.robuxPrice,
-                    rolledAt = lot.rolledAt,
-                    expiresAt = useGuiDynamic and guiLot.expiresAt and guiLot.expiresAt > 0 and guiLot.expiresAt or lotExpiresAt,
-                    soldOut = soldOut,
-                    expired = expired,
-                    dynamicSource = useGuiDynamic and "gui" or "snapshot"
-                })
+            local lotId = normalizeAuctionLotId(lot.lotId)
+            local lotIndex = getAuctionLotIndex(lotId)
+            local rawIndex = raw.rawIndex
+            local guiLot = guiLotsById[lotId]
+                or (lotIndex ~= nil and guiLotsByIndex[lotIndex] or nil)
+                or guiLotsByPosition[position]
+            local placeholderLot = isDefaultAuctionPlaceholderLot(lot)
+            local stock = getAuctionStockMapValue(latestAuctionStock, lot, lotId, lotIndex, position, rawIndex)
+            local hasLiveStock = stock ~= nil
+            if stock == nil and type(snapshot.stock) == "table" then
+                stock = getAuctionStockMapValue(snapshot.stock, lot, lotId, lotIndex, position, rawIndex)
+                hasLiveStock = stock ~= nil
             end
-        end)
+            stock = normalizeAuctionStockValue(stock)
+            if stock == nil then
+                hasLiveStock = false
+            end
+            local useGuiDynamic = guiLot and guiLot.dynamicTrusted == true
+            if useGuiDynamic and guiLot.stock ~= nil then
+                stock = guiLot.stock
+                hasLiveStock = true
+            end
+            if stock == nil and not placeholderLot then
+                stock = getAuctionLotFallbackStock(lot)
+            end
+            local currentPrice = getLotCurrentPrice(lot)
+            local priceKnown = hasReliableAuctionPrice(lot)
+            if useGuiDynamic and tonumber(guiLot.currentPrice) and tonumber(guiLot.currentPrice) > 0 then
+                currentPrice = tonumber(guiLot.currentPrice)
+                priceKnown = true
+            end
+            if placeholderLot and not useGuiDynamic then
+                priceKnown = false
+                currentPrice = nil
+                stock = nil
+                hasLiveStock = false
+            end
+            local stockUnknown = stock == nil and (lot.stockQuantity ~= nil or placeholderLot)
+            local stockUnlimited = not stockUnknown and stock == nil and lot.stockQuantity == nil
+            if stockUnknown then
+                stock = nil
+            end
+            if not priceKnown then
+                currentPrice = nil
+            end
+            local soldOut = (stock ~= nil and stock <= 0) or (useGuiDynamic and guiLot.soldOut == true)
+            local lotExpiresAt = placeholderLot and not useGuiDynamic and 0 or getAuctionLotExpiry(lot)
+            local expired = lotExpiresAt > 0 and lotExpiresAt <= getServerNow()
+            if useGuiDynamic and guiLot.expired ~= nil then
+                expired = guiLot.expired == true
+            end
+            if soldOut and currentPrice ~= nil then
+                local frozenPrice = latestAuctionSoldOutPrices[lotId]
+                if frozenPrice == nil then
+                    latestAuctionSoldOutPrices[lotId] = currentPrice
+                    frozenPrice = currentPrice
+                end
+                currentPrice = frozenPrice
+            elseif not soldOut then
+                latestAuctionSoldOutPrices[lotId] = nil
+            end
+            local stockQuantity = nil
+            if not stockUnknown then
+                stockQuantity = hasLiveStock and stock or (useGuiDynamic and guiLot.stock ~= nil and guiLot.stock or (lot.stockQuantity or stock))
+            end
+            table.insert(lots, {
+                lotId = lotId,
+                item = guiLot and guiLot.item or lot.item,
+                name = guiLot and guiLot.name or getLotDisplayName(lot),
+                category = guiLot and guiLot.category or lot.category,
+                type = lot.type,
+                mutation = lot.mutation,
+                size = lot.size,
+                count = guiLot and guiLot.count or lot.count or 1,
+                rarity = guiLot and guiLot.rarity or getLotRarity(lot),
+                image = guiLot and guiLot.image or getLotImage(lot),
+                stock = stock,
+                stockQuantity = stockQuantity,
+                stockUnknown = stockUnknown,
+                stockUnlimited = stockUnlimited,
+                currentPrice = currentPrice,
+                priceUnknown = not priceKnown,
+                robuxPrice = lot.robuxPrice,
+                rolledAt = lot.rolledAt,
+                expiresAt = useGuiDynamic and guiLot.expiresAt and guiLot.expiresAt > 0 and guiLot.expiresAt or lotExpiresAt,
+                soldOut = soldOut,
+                expired = expired,
+                dynamicSource = useGuiDynamic and "gui" or "snapshot"
+            })
+        end
     end
 
     table.sort(lots, function(a, b)
