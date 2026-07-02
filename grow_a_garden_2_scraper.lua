@@ -1800,8 +1800,26 @@ end
 
 function getActiveWeatherAndPhase()
     local activePhase = getDefaultPhase()
-    local workspacePhase = findActivePhaseAsset(workspace, true)
-    if workspacePhase and not isTechnicalPhaseName(workspacePhase) then activePhase = workspacePhase end
+    
+    -- Check for custom Mega Moon event (has ActiveNight with Model Moon/Stars/Debris, or ActiveNightAtmosphere)
+    local activeNight = workspace:FindFirstChild("ActiveNight")
+    local isMegaMoon = false
+    if activeNight then
+        if activeNight:FindFirstChild("Stars") or activeNight:FindFirstChild("Debris") then
+            isMegaMoon = true
+        else
+            local moonObj = activeNight:FindFirstChild("Moon")
+            if moonObj and moonObj:IsA("Model") then
+                isMegaMoon = true
+            end
+        end
+    end
+    if isMegaMoon or game.Lighting:FindFirstChild("ActiveNightAtmosphere") then
+        activePhase = "Mega Moon"
+    else
+        local workspacePhase = findActivePhaseAsset(workspace, true)
+        if workspacePhase and not isTechnicalPhaseName(workspacePhase) then activePhase = workspacePhase end
+    end
 
     local activeWeathers = {}
     local weatherUI = findWeatherUI()
