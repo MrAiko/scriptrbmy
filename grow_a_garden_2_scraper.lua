@@ -324,6 +324,16 @@ function getPhaseFallbackImage(name)
     return phaseKey and PHASE_FALLBACK_IMAGES[phaseKey] or nil
 end
 
+function getPhaseNameFromImageId(imageId)
+    if not imageId then return nil end
+    local strId = tostring(imageId)
+    if string.find(strId, "140465339393451") then return "Blood Moon" end
+    if string.find(strId, "84902063004871") then return "Gold Moon" end
+    if string.find(strId, "93602895495056") then return "Rainbow Moon" end
+    if string.find(strId, "107925838920918") then return "Mega Moon" end
+    return nil
+end
+
 local isDecorativeWeatherCatalogName
 
 local weatherDataCache = nil
@@ -527,7 +537,8 @@ end
 
 local FALLBACK_PHASE_NAMES = {
     "Bloodmoon", "Goldmoon", "Chainedmoon", "Chained Moon", "Pizza Moon",
-    "Rainbow Moon", "Solar Eclipse", "Mega Moon", "MegaMoon", "Megamoon", "Moon", "Night", "Sunset", "Day"
+    "Rainbow Moon", "Solar Eclipse", "Mega Moon", "MegaMoon", "Megamoon", "Moon", "Night", "Sunset", "Day",
+    "Mega", "Blood", "Gold", "Chained", "Pizza", "Solar"
 }
 
 function findTimeCycleController()
@@ -1843,6 +1854,13 @@ function getActiveWeatherAndPhase()
         uiPhase = uiPhase or statePhase
     end
     if uiPhase and not isTechnicalPhaseName(uiPhase) then activePhase = uiPhase end
+    
+    -- Check if the actual phase image matches a known special moon (e.g. Mega Moon)
+    local resolvedPhase = getPhaseNameFromImageId(activePhaseImage)
+    if resolvedPhase then
+        activePhase = resolvedPhase
+    end
+    
     activePhaseImage = getPhaseFallbackImage(activePhase) or activePhaseImage
     return activePhase, activePhaseImage, activeWeathers, endTime
 end
