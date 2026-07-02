@@ -16,7 +16,7 @@ local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
 -- ================= CONFIGURATION =================
-local API_URL = "https://grow-a-garden-2-tracker.onrender.com/api/update-stock"
+local API_URL = "http://87.58.213.194:3000/api/update-stock"
 local API_PASSWORD = "mySuperSecretToken123"
 local UPDATE_INTERVAL = 30       -- Fallback interval in seconds to update API
 local POLL_INTERVAL = 0.5        -- Fast state poll interval; fruit data comes from FruitStock snapshot
