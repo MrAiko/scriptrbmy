@@ -2235,6 +2235,7 @@ local auctionRequestPending = false
 local lastAuctionRequestAt = -10
 local auctionGuiPrimedAt = 0
 local auctionGuiAutoHidden = false
+local originalAuctionFramePosition = nil
 local AUCTION_REQUEST_INTERVAL = 3
 local AUCTION_STARTUP_RETRY_INTERVAL = 0.75
 local AUCTION_STARTUP_RETRY_COUNT = 24
@@ -3653,7 +3654,7 @@ function getAuctionData()
                 hasLiveStock = false
             end
             local useGuiDynamic = guiLot and guiLot.dynamicTrusted == true
-            if useGuiDynamic and guiLot.stock ~= nil then
+            if stock == nil and useGuiDynamic and guiLot.stock ~= nil then
                 stock = guiLot.stock
                 hasLiveStock = true
             end
@@ -3662,7 +3663,7 @@ function getAuctionData()
             end
             local currentPrice = getLotCurrentPrice(lot)
             local priceKnown = hasReliableAuctionPrice(lot)
-            if useGuiDynamic and tonumber(guiLot.currentPrice) and tonumber(guiLot.currentPrice) > 0 then
+            if (currentPrice == nil or not priceKnown) and useGuiDynamic and tonumber(guiLot.currentPrice) and tonumber(guiLot.currentPrice) > 0 then
                 currentPrice = tonumber(guiLot.currentPrice)
                 priceKnown = true
             end
