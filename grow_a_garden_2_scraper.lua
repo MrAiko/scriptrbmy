@@ -3609,6 +3609,13 @@ function getAuctionData()
             local guiLot = guiLotsById[lotId]
                 or (lotIndex ~= nil and guiLotsByIndex[lotIndex] or nil)
                 or guiLotsByPosition[position]
+            -- If the GUI is loaded and shows real lots but this snapshot lot has
+            -- no matching GUI card, it is a phantom entry from the Auctioneer
+            -- module's internal data — skip it entirely.
+            local guiHasLots = guiData and type(guiData.lots) == "table" and #guiData.lots > 0
+            if guiHasLots and not guiLot then
+                -- phantom lot: exists in network snapshot but not in the player's GUI
+            else
             local placeholderLot = isDefaultAuctionPlaceholderLot(lot)
             local stock = getAuctionStockMapValue(latestAuctionStock, lot, lotId, lotIndex, position, rawIndex)
             local hasLiveStock = stock ~= nil
@@ -3692,6 +3699,7 @@ function getAuctionData()
                 expired = expired,
                 dynamicSource = useGuiDynamic and "gui" or "snapshot"
             })
+            end -- if guiHasLots and not guiLot (phantom check)
         end
     end
 
