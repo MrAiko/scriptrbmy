@@ -2663,14 +2663,18 @@ function getAuctionStockMapValue(stockMap, lot, lotId, lotIndex, position, rawIn
     if lotId and lotId ~= "" then
         addCandidate("Lot_" .. tostring(lotId))
     end
-    addCandidate(lotIndex)
-    addCandidate(lotIndex and tostring(lotIndex) or nil)
-    addCandidate(position)
-    addCandidate(position and tostring(position) or nil)
-    addCandidate(position and position - 1 or nil)
-    addCandidate(position and tostring(position - 1) or nil)
-    addCandidate(rawIndex)
-    addCandidate(rawIndex and tostring(rawIndex) or nil)
+    local serverNow = getServerNow()
+    local rollAge = serverNow - latestAuctionRollTime
+    if rollAge >= 30 then
+        addCandidate(lotIndex)
+        addCandidate(lotIndex and tostring(lotIndex) or nil)
+        addCandidate(position)
+        addCandidate(position and tostring(position) or nil)
+        addCandidate(position and position - 1 or nil)
+        addCandidate(position and tostring(position - 1) or nil)
+        addCandidate(rawIndex)
+        addCandidate(rawIndex and tostring(rawIndex) or nil)
+    end
 
     for _, key in ipairs(candidates) do
         if stockMap[key] ~= nil then
@@ -3761,19 +3765,21 @@ function getAuctionData()
     end
 
     local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds) or 0
+    if rollIntervalSeconds <= 0 then
+        rollIntervalSeconds = 1800
+    end
     local rollWindowUnix = tonumber(snapshot.rollWindowUnix) or 0
     local serverNow = getServerNow()
     if rollWindowUnix == 0 then
-        if latestAuctionRollTime == 0 then
-            latestAuctionRollTime = serverNow
+        local epochAligned = math.floor(serverNow / rollIntervalSeconds) * rollIntervalSeconds
+        if latestAuctionRollTime > 0 and math.abs(serverNow - epochAligned) > 300 then
+            rollWindowUnix = latestAuctionRollTime
+        else
+            rollWindowUnix = epochAligned
         end
-        rollWindowUnix = latestAuctionRollTime
     end
     local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
-    local refreshAt = 0
-    if rollIntervalSeconds > 0 and rollWindowUnix > 0 then
-        refreshAt = rollWindowUnix + rollIntervalSeconds + timerShiftSeconds
-    end
+    local refreshAt = rollWindowUnix + rollIntervalSeconds + timerShiftSeconds
     if refreshAt <= serverNow then
         local nextLotExpiry = 0
         for _, lot in ipairs(lots) do
