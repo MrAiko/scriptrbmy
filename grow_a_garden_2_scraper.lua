@@ -2922,6 +2922,7 @@ function applyAuctionSnapshot(snapshot)
     latestAuctionSnapshot = snapshot
     if lotsChanged then
         latestAuctionSoldOutPrices = {}
+        latestAuctionStock = {}
     end
     if type(snapshot.stock) == "table" then
         latestAuctionStock = normalizeAuctionStockMap(snapshot.stock)
