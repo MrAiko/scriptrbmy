@@ -2226,6 +2226,7 @@ local cachedMailboxItemCatalog = false
 local latestAuctionSnapshot = nil
 local latestAuctionStock = {}
 local latestAuctionSoldOutPrices = {}
+local latestAuctionRollTime = 0
 local latestAuctionAt = 0
 local latestAuctionSnapshotAt = 0
 local latestAuctionStockAt = 0
@@ -2923,6 +2924,10 @@ function applyAuctionSnapshot(snapshot)
     if lotsChanged then
         latestAuctionSoldOutPrices = {}
         latestAuctionStock = {}
+        latestAuctionRollTime = getServerNow()
+    end
+    if latestAuctionRollTime == 0 then
+        latestAuctionRollTime = getServerNow()
     end
     if type(snapshot.stock) == "table" then
         latestAuctionStock = normalizeAuctionStockMap(snapshot.stock)
@@ -3757,9 +3762,15 @@ function getAuctionData()
 
     local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds) or 0
     local rollWindowUnix = tonumber(snapshot.rollWindowUnix) or 0
+    local serverNow = getServerNow()
+    if rollWindowUnix == 0 then
+        if latestAuctionRollTime == 0 then
+            latestAuctionRollTime = serverNow
+        end
+        rollWindowUnix = latestAuctionRollTime
+    end
     local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
     local refreshAt = 0
-    local serverNow = getServerNow()
     if rollIntervalSeconds > 0 and rollWindowUnix > 0 then
         refreshAt = rollWindowUnix + rollIntervalSeconds + timerShiftSeconds
     end
