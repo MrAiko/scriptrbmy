@@ -2586,6 +2586,13 @@ function getAuctionLotIndex(lotId)
     return indexText and tonumber(indexText) or nil
 end
 
+function getAuctionLotTimestamp(lotId)
+    local text = tostring(lotId or "")
+    local ts = text:match(":(%d+):")
+    if ts then return ts end
+    return text:match(":(%d+)")
+end
+
 function normalizeAuctionStockMap(stock)
     local out = {}
     if type(stock) ~= "table" then return out end
@@ -3607,8 +3614,26 @@ function getAuctionData()
             local lotIndex = getAuctionLotIndex(lotId)
             local rawIndex = raw.rawIndex
             local guiLot = guiLotsById[lotId]
-                or (lotIndex ~= nil and guiLotsByIndex[lotIndex] or nil)
-                or guiLotsByPosition[position]
+            if not guiLot and lotIndex ~= nil then
+                local fallbackLot = guiLotsByIndex[lotIndex]
+                if fallbackLot then
+                    local snapTs = getAuctionLotTimestamp(lotId)
+                    local guiTs = getAuctionLotTimestamp(fallbackLot.lotId)
+                    if snapTs == nil or guiTs == nil or snapTs == guiTs then
+                        guiLot = fallbackLot
+                    end
+                end
+            end
+            if not guiLot then
+                local fallbackLot = guiLotsByPosition[position]
+                if fallbackLot then
+                    local snapTs = getAuctionLotTimestamp(lotId)
+                    local guiTs = getAuctionLotTimestamp(fallbackLot.lotId)
+                    if snapTs == nil or guiTs == nil or snapTs == guiTs then
+                        guiLot = fallbackLot
+                    end
+                end
+            end
             -- If the GUI is loaded and shows real lots but this snapshot lot has
             -- no matching GUI card, it is a phantom entry from the Auctioneer
             -- module's internal data — skip it entirely.
