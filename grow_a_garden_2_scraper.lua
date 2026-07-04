@@ -3308,14 +3308,14 @@ function primeAuctionGuiForLiveValues()
         frame.Visible = false
     end
 
-    return auctionGuiPrimedAt > 0 and (os.clock() - auctionGuiPrimedAt) > 0.25
+    return auctionGuiPrimedAt > 0 and (os.clock() - auctionGuiPrimedAt) > 2.0
 end
 
 function isDefaultAuctionPlaceholderLot(lot)
     if type(lot) ~= "table" then return false end
     local startPrice = tonumber(lot.startPrice or lot.currentPrice or lot.price or lot.cost)
     local stockQuantity = tonumber(lot.stockQuantity or lot.stock or lot.quantity or lot.count)
-    return startPrice ~= nil and startPrice >= 99000 and stockQuantity == 16
+    return startPrice == 100000 and stockQuantity == 16
 end
 
 function parseCompactMoney(text)
@@ -3407,7 +3407,7 @@ function getAuctionDataFromGui()
     local refreshAt = headerDuration > 0 and (serverNow + headerDuration) or 0
 
     for _, card in ipairs(scrollingFrame:GetChildren()) do
-        if card:IsA("GuiObject") and card.Visible == true and string.find(string.lower(card.Name), "template") == nil then
+        if card:IsA("GuiObject") then
             local main = card:FindFirstChild("Main_Frame", true) or card:FindFirstChild("Frame", true) or card
             local priceText = getFirstTextMatching(main, function(text)
                 return string.find(text, "Р’Сћ") or string.find(text, "\194\162")
@@ -3437,7 +3437,7 @@ function getAuctionDataFromGui()
                 local isAuctionLotCard = string.sub(cardKey, 1, 10) == "lotauction" or string.sub(cardKey, 1, 7) == "auction"
                 local looksLikeTemplateAuctionRow = not isAuctionLotCard
                     and currentPrice == 1000 and stock == 16 and duration <= 0 and headerDuration <= 0
-                local looksLikeDefaultDynamic = currentPrice ~= nil and currentPrice >= 99000 and stock == 16
+                local looksLikeDefaultDynamic = currentPrice == 100000 and stock == 16
                 local rowDynamicTrusted = guiDynamicTrusted and not looksLikeDefaultDynamic
 
                 local expired = false
@@ -3458,9 +3458,7 @@ function getAuctionDataFromGui()
                     soldOut = false
                 end
 
-                local nameLower = string.lower(nameText or "")
-                local isFakeSeed = string.find(nameLower, "seed") ~= nil or string.find(nameLower, "семен") ~= nil or string.find(nameLower, "carrot") ~= nil
-                if not looksLikeTemplateAuctionRow and not isFakeSeed then
+                if not looksLikeTemplateAuctionRow then
                     local category = getAuctionGuiCategory(main) or "Auction"
                     local rarity = getAuctionTextAtPath(main, { "Rarity", "Rarity_Text" })
                         or getFirstAttributeByNames(main, { "ItemToolTipRarity", "Rarity" })
@@ -3526,6 +3524,16 @@ function getAuctionDataFromGui()
     end
 
     if #lots == 0 then return nil end
+    -- If every lot still shows default placeholder values, the GUI hasn't finished loading.
+    -- Suppress this result to avoid publishing stale data that gets corrected seconds later.
+    local allDefault = true
+    for _, lot in ipairs(lots) do
+        if not lot.looksLikeDefaultDynamic then
+            allDefault = false
+            break
+        end
+    end
+    if allDefault and #lots > 0 then return nil end
     table.sort(lots, function(a, b)
         return tostring(a.lotId or "") < tostring(b.lotId or "")
     end)
