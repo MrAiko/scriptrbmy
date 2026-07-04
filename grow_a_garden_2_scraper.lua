@@ -3407,7 +3407,7 @@ function getAuctionDataFromGui()
     local refreshAt = headerDuration > 0 and (serverNow + headerDuration) or 0
 
     for _, card in ipairs(scrollingFrame:GetChildren()) do
-        if card:IsA("GuiObject") and isInstanceVisible(card) and string.find(string.lower(card.Name), "template") == nil then
+        if card:IsA("GuiObject") and card.Visible == true and string.find(string.lower(card.Name), "template") == nil then
             local main = card:FindFirstChild("Main_Frame", true) or card:FindFirstChild("Frame", true) or card
             local priceText = getFirstTextMatching(main, function(text)
                 return string.find(text, "Р’Сћ") or string.find(text, "\194\162")
