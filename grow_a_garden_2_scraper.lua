@@ -3315,7 +3315,15 @@ function isDefaultAuctionPlaceholderLot(lot)
     if type(lot) ~= "table" then return false end
     local startPrice = tonumber(lot.startPrice or lot.currentPrice or lot.price or lot.cost)
     local stockQuantity = tonumber(lot.stockQuantity or lot.stock or lot.quantity or lot.count)
-    return startPrice == 100000 and stockQuantity == 16
+    -- Classic exact match
+    if startPrice == 100000 and stockQuantity == 16 then return true end
+    -- Price near 100K (may have decremented) with default stock 16
+    if startPrice and startPrice >= 95000 and startPrice <= 100000 and stockQuantity == 16 then return true end
+    -- No price at all with default stock 16 — snapshot has placeholder shell
+    if startPrice == nil and stockQuantity == 16 then return true end
+    -- Stock 16 with no price formula fields at all (no startPrice, rolledAt, etc.)
+    if stockQuantity == 16 and not tonumber(lot.startPrice) and not tonumber(lot.rolledAt) and not tonumber(lot.expiresAt) and not tonumber(lot.durationSeconds) then return true end
+    return false
 end
 
 function parseCompactMoney(text)
@@ -3437,7 +3445,7 @@ function getAuctionDataFromGui()
                 local isAuctionLotCard = string.sub(cardKey, 1, 10) == "lotauction" or string.sub(cardKey, 1, 7) == "auction"
                 local looksLikeTemplateAuctionRow = not isAuctionLotCard
                     and currentPrice == 1000 and stock == 16 and duration <= 0 and headerDuration <= 0
-                local looksLikeDefaultDynamic = currentPrice == 100000 and stock == 16
+                local looksLikeDefaultDynamic = (currentPrice >= 95000 and currentPrice <= 100000) and stock == 16
                 local rowDynamicTrusted = guiDynamicTrusted and not looksLikeDefaultDynamic
 
                 local expired = false
@@ -3686,6 +3694,22 @@ function getAuctionData()
             })
         end
     end
+
+    -- Filter out useless placeholder lots that have no meaningful data.
+    -- A lot is useless if it has unknown price, no live stock, no timer, and no GUI source.
+    local filteredLots = {}
+    for _, lot in ipairs(lots) do
+        local isUseless = lot.priceUnknown
+            and not lot.soldOut
+            and not lot.expired
+            and lot.dynamicSource ~= "gui"
+            and (lot.expiresAt or 0) <= 0
+            and lot.stockUnknown
+        if not isUseless then
+            table.insert(filteredLots, lot)
+        end
+    end
+    lots = filteredLots
 
     table.sort(lots, function(a, b)
         return tostring(a.lotId or "") < tostring(b.lotId or "")
