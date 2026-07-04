@@ -3458,7 +3458,9 @@ function getAuctionDataFromGui()
                     soldOut = false
                 end
 
-                if not looksLikeTemplateAuctionRow then
+                local nameLower = string.lower(nameText or "")
+                local isFakeSeed = string.find(nameLower, "seed") ~= nil or string.find(nameLower, "семен") ~= nil or string.find(nameLower, "carrot") ~= nil
+                if not looksLikeTemplateAuctionRow and not isFakeSeed then
                     local category = getAuctionGuiCategory(main) or "Auction"
                     local rarity = getAuctionTextAtPath(main, { "Rarity", "Rarity_Text" })
                         or getFirstAttributeByNames(main, { "ItemToolTipRarity", "Rarity" })
