@@ -3704,7 +3704,6 @@ function getAuctionData()
             and not lot.expired
             and lot.dynamicSource ~= "gui"
             and (lot.expiresAt or 0) <= 0
-            and lot.stockUnknown
         if not isUseless then
             table.insert(filteredLots, lot)
         end
