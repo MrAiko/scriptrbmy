@@ -2936,6 +2936,7 @@ function applyAuctionSnapshot(snapshot)
     if incomingHasLots then
         latestAuctionSnapshotAt = latestAuctionAt
     end
+    pcall(sendAuctionUpdateInstant)
     return true
 end
 
@@ -2958,6 +2959,7 @@ function applyAuctionStockUpdate(update, maybeStock)
     latestAuctionStockAt = os.clock()
     latestAuctionAt = latestAuctionStockAt
     writeDebugLog("Auction stock update applied")
+    pcall(sendAuctionUpdateInstant)
     return true
 end
 
@@ -4643,6 +4645,38 @@ function fruitHash(list)
     return h
 end
 
+function sendAuctionUpdateInstant()
+    local ws = getWebSocketClient()
+    if not ws then return false end
+
+    local auctionData = getAuctionData()
+    if type(auctionData) ~= "table" then return false end
+
+    local wsPayload = {
+        type = "update-auction",
+        password = API_PASSWORD,
+        data = auctionData
+    }
+    local encodeOk, encoded = pcall(function() return HttpService:JSONEncode(wsPayload) end)
+    if encodeOk then
+        local sendFunc = ws.Send or ws.send
+        local success, err = pcall(function()
+            sendFunc(ws, encoded)
+        end)
+        if success then
+            if DEBUG then
+                print("[Grow a Garden 2 Stocker] Instant auction update sent via WebSocket!")
+            end
+            return true
+        else
+            if DEBUG then
+                warn("[Grow a Garden 2 Stocker] Failed to send instant auction update: " .. tostring(err))
+            end
+        end
+    end
+    return false
+end
+
 local lastUpdateTime = 0
 local updatePending = false
 local pendingFruitData = nil
@@ -4896,6 +4930,9 @@ safeTaskSpawn(function()
             lastWeatherCatalogHash = weatherCatalogHash
             lastFruitHash = fh
             lastAuctionHash = auctionHash
+            if auctionChanged then
+                pcall(sendAuctionUpdateInstant)
+            end
             -- Pass the freshly scraped fruit list so updateAPI doesn't re-scrape,
             -- and the data sent to the API is guaranteed current.
             updateAPI(freshFruits)
