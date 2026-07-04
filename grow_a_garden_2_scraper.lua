@@ -3315,7 +3315,7 @@ function isDefaultAuctionPlaceholderLot(lot)
     if type(lot) ~= "table" then return false end
     local startPrice = tonumber(lot.startPrice or lot.currentPrice or lot.price or lot.cost)
     local stockQuantity = tonumber(lot.stockQuantity or lot.stock or lot.quantity or lot.count)
-    return startPrice == 100000 and stockQuantity == 16
+    return startPrice ~= nil and startPrice >= 99000 and stockQuantity == 16
 end
 
 function parseCompactMoney(text)
@@ -3437,7 +3437,7 @@ function getAuctionDataFromGui()
                 local isAuctionLotCard = string.sub(cardKey, 1, 10) == "lotauction" or string.sub(cardKey, 1, 7) == "auction"
                 local looksLikeTemplateAuctionRow = not isAuctionLotCard
                     and currentPrice == 1000 and stock == 16 and duration <= 0 and headerDuration <= 0
-                local looksLikeDefaultDynamic = currentPrice == 100000 and stock == 16
+                local looksLikeDefaultDynamic = currentPrice ~= nil and currentPrice >= 99000 and stock == 16
                 local rowDynamicTrusted = guiDynamicTrusted and not looksLikeDefaultDynamic
 
                 local expired = false
