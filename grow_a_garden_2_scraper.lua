@@ -2925,13 +2925,25 @@ function applyAuctionSnapshot(snapshot)
     local nextLotKey = getAuctionSnapshotLotKey(snapshot)
     local lotsChanged = previousLotKey ~= "" and nextLotKey ~= "" and previousLotKey ~= nextLotKey
     latestAuctionSnapshot = snapshot
+    local maxRolledAt = 0
+    local rawLots = getAuctionRawLots(snapshot)
+    if type(rawLots) == "table" then
+        for _, lot in pairs(rawLots) do
+            if type(lot) == "table" then
+                local rolledAt = tonumber(lot.rolledAt or lot.startedAt) or 0
+                if rolledAt > maxRolledAt then
+                    maxRolledAt = rolledAt
+                end
+            end
+        end
+    end
     if lotsChanged then
         latestAuctionSoldOutPrices = {}
         latestAuctionStock = {}
-        latestAuctionRollTime = getServerNow()
+        latestAuctionRollTime = maxRolledAt > 0 and maxRolledAt or getServerNow()
     end
-    if latestAuctionRollTime == 0 then
-        latestAuctionRollTime = getServerNow()
+    if latestAuctionRollTime == 0 or (maxRolledAt > 0 and latestAuctionRollTime ~= maxRolledAt) then
+        latestAuctionRollTime = maxRolledAt > 0 and maxRolledAt or getServerNow()
     end
     if type(snapshot.stock) == "table" then
         latestAuctionStock = normalizeAuctionStockMap(snapshot.stock)
@@ -3771,11 +3783,22 @@ function getAuctionData()
     local rollWindowUnix = tonumber(snapshot.rollWindowUnix) or 0
     local serverNow = getServerNow()
     if rollWindowUnix == 0 then
-        local epochAligned = math.floor(serverNow / rollIntervalSeconds) * rollIntervalSeconds
-        if latestAuctionRollTime > 0 and math.abs(serverNow - epochAligned) > 300 then
-            rollWindowUnix = latestAuctionRollTime
+        local maxRolledAt = 0
+        for _, lot in ipairs(lots) do
+            local rolledAt = tonumber(lot.rolledAt or lot.startedAt) or 0
+            if rolledAt > maxRolledAt then
+                maxRolledAt = rolledAt
+            end
+        end
+        if maxRolledAt > 0 then
+            rollWindowUnix = maxRolledAt
         else
-            rollWindowUnix = epochAligned
+            local epochAligned = math.floor(serverNow / rollIntervalSeconds) * rollIntervalSeconds
+            if latestAuctionRollTime > 0 and math.abs(serverNow - epochAligned) > 300 then
+                rollWindowUnix = latestAuctionRollTime
+            else
+                rollWindowUnix = epochAligned
+            end
         end
     end
     local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
