@@ -23,11 +23,12 @@ local POLL_INTERVAL = 0.5        -- Fast state poll interval; fruit data comes f
 local FRUIT_REQUEST_INTERVAL = 10 -- Fallback remote refresh interval if Snapshot event is missed
 local DEBUG = false             -- Set to true only to diagnose scraper issues
 local MOBILE_SAFE_MODE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-local DESTROY_WORLD_ASSETS = false -- Never destroy Workspace parts; game controllers need plant.Base etc.
+local DESTROY_WORLD_ASSETS = true -- Aggressively remove local 3D junk; protected data containers stay intact.
 -- =================================================
 
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local SharedModules = ReplicatedStorage:WaitForChild("SharedModules", 10)
+local clientOptimized = false
 
 function safeTaskSpawn(fn)
     if type(task) == "table" and type(task.spawn) == "function" then
@@ -79,13 +80,125 @@ end
 -- overhead. All steps are wrapped in pcall so a failure never breaks scraping.
 function optimizeClient()
     local RunService = game:GetService("RunService")
+    local protectedWorkspaceRoots = {
+        gardens = true,
+        activenight = true,
+        weather = true,
+        weatherstate = true,
+        environment = true,
+        activeweather = true
+    }
+    local protectedPlayerGuiRoots = {
+        auction = true,
+        weather = true,
+        weatherui = true,
+        environmentui = true,
+        crateshop = true,
+        gearshop = true,
+        seedshop = true,
+        fruitstockprice = true,
+        optimizeroverlay = true
+    }
+
+    local function optKey(name)
+        return string.lower(tostring(name or "")):gsub("[^%w]", "")
+    end
+
+    local function safeDestroy(instance)
+        if not instance or not instance.Parent then return end
+        safeTaskDefer(function()
+            pcall(function()
+                if instance and instance.Parent then
+                    instance:Destroy()
+                end
+            end)
+        end)
+    end
+
+    local function hasProtectedWorkspaceAncestor(instance)
+        local current = instance
+        while current and current ~= workspace do
+            local key = optKey(current.Name)
+            if protectedWorkspaceRoots[key] then return true end
+            if string.find(key, "weather") or string.find(key, "environment")
+               or string.find(key, "night") or string.find(key, "phase") then
+                return true
+            end
+            if type(getPhaseKey) == "function" and getPhaseKey(current.Name) then return true end
+            if type(cleanWeatherStateName) == "function" and cleanWeatherStateName(current.Name) then return true end
+            if string.find(key, "moon") or string.find(key, "blood")
+               or string.find(key, "gold") or string.find(key, "eclipse") then
+                return true
+            end
+            current = current.Parent
+        end
+        return false
+    end
+
+    local function getCharacterOwner(instance)
+        local current = instance
+        while current and current ~= workspace do
+            local player = Players:GetPlayerFromCharacter(current)
+            if player then return player, current end
+            current = current.Parent
+        end
+        return nil, nil
+    end
+
+    local function optimizePart(part, removePhysics)
+        pcall(function()
+            part.CastShadow = false
+            part.Material = Enum.Material.SmoothPlastic
+            part.Reflectance = 0
+            part.LocalTransparencyModifier = 1
+            if removePhysics then
+                part.CanCollide = false
+                part.CanTouch = false
+                part.CanQuery = false
+            end
+        end)
+    end
+
+    local function isVisualJunk(instance)
+        return instance:IsA("Decal")
+            or instance:IsA("Texture")
+            or instance:IsA("SpecialMesh")
+            or instance:IsA("SurfaceAppearance")
+            or instance:IsA("ParticleEmitter")
+            or instance:IsA("Beam")
+            or instance:IsA("Trail")
+            or instance:IsA("Smoke")
+            or instance:IsA("Fire")
+            or instance:IsA("Sparkles")
+            or instance:IsA("Explosion")
+            or instance:IsA("PostEffect")
+            or instance:IsA("Highlight")
+            or instance:IsA("SelectionBox")
+            or instance:IsA("Light")
+    end
+
+    local function optimizeLocalCharacterInstance(instance)
+        if instance:IsA("Accessory") or instance:IsA("Tool") or instance:IsA("Clothing")
+           or instance:IsA("CharacterMesh") or isVisualJunk(instance) then
+            safeDestroy(instance)
+        elseif instance:IsA("BasePart") then
+            optimizePart(instance, true)
+        elseif instance:IsA("Humanoid") then
+            pcall(function()
+                instance.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+                instance.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+            end)
+        elseif instance:IsA("Animator") or instance:IsA("AnimationController") then
+            safeDestroy(instance)
+        end
+    end
 
     -- PC Roblox background FPS optimization (reduces CPU/GPU load to near-zero)
     if not MOBILE_SAFE_MODE then
         if type(setfpscap) == "function" then
-            pcall(function() setfpscap(5) end)
+            pcall(function() setfpscap(3) end)
         elseif type(getgenv) == "function" and type(getgenv().setfpscap) == "function" then
-            pcall(function() getgenv().setfpscap(5) end)
+            pcall(function() getgenv().setfpscap(3) end)
         end
     end
 
@@ -98,18 +211,14 @@ function optimizeClient()
     end
 
     -- Non-destructive graphics optimization (remove heavy textures, particles, shadows on PC)
-    if not MOBILE_SAFE_MODE then
+    if not MOBILE_SAFE_MODE and not DESTROY_WORLD_ASSETS then
         local function optimizeGraphics(instance)
             if not instance then return end
             pcall(function()
-                if instance:IsA("Decal") or instance:IsA("Texture") or instance:IsA("SpecialMesh") or
-                   instance:IsA("ParticleEmitter") or instance:IsA("Beam") or instance:IsA("Trail") or
-                   instance:IsA("PostEffect") or instance:IsA("Highlight") or instance:IsA("Light") then
-                    instance:Destroy()
+                if isVisualJunk(instance) then
+                    safeDestroy(instance)
                 elseif instance:IsA("BasePart") then
-                    instance.CastShadow = false
-                    instance.Material = Enum.Material.SmoothPlastic
-                    instance.Reflectance = 0
+                    optimizePart(instance, false)
                 end
             end)
         end
@@ -126,6 +235,8 @@ function optimizeClient()
         local lighting = game:GetService("Lighting")
         lighting.GlobalShadows = false
         lighting.OutdoorAmbient = Color3.fromRGB(128, 128, 128)
+        lighting.Brightness = 0
+        lighting.FogEnd = 1
     end)
 
     -- 3. Force lowest graphics quality.
@@ -157,56 +268,120 @@ function optimizeClient()
             if sound:IsA("Sound") then
                 sound:Stop()
                 sound.Volume = 0
+                safeDestroy(sound)
             end
         end
         game.DescendantAdded:Connect(function(desc)
             if desc:IsA("Sound") then
                 desc:Stop()
                 desc.Volume = 0
+                safeDestroy(desc)
             end
         end)
     end)
 
-    -- 7. Optional destructive cleanup. Keep disabled by default: several game
-    --    controllers still read Workspace.Gardens.*.Plants.*.Base on the client.
+    local function isProtectedPlayerGui(instance)
+        local key = optKey(instance and instance.Name)
+        return protectedPlayerGuiRoots[key] == true
+    end
+
+    local function cleanPlayerGuiInstance(instance)
+        if not instance then return end
+        if instance:IsA("ScreenGui") and not isProtectedPlayerGui(instance) then
+            safeDestroy(instance)
+        elseif instance:IsA("ViewportFrame") or instance:IsA("VideoFrame") or instance:IsA("Sound") then
+            safeDestroy(instance)
+        end
+    end
+
+    local function cleanPlayerGui()
+        local pGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
+        if not pGui then return end
+        for _, child in ipairs(pGui:GetChildren()) do
+            cleanPlayerGuiInstance(child)
+            if child.Parent and child:IsA("ScreenGui") then
+                for _, desc in ipairs(child:GetDescendants()) do
+                    cleanPlayerGuiInstance(desc)
+                end
+            end
+        end
+    end
+
+    pcall(function()
+        cleanPlayerGui()
+        PlayerGui.ChildAdded:Connect(function(child)
+            safeTaskDefer(function()
+                cleanPlayerGuiInstance(child)
+            end)
+        end)
+    end)
+
+    -- 7. Destructive local cleanup. Protected roots stay because game/client data
+    --    readers can reference them; everything else is reduced aggressively.
     local function cleanInstance(instance)
         if not instance then return end
         if instance:IsA("Camera") or instance:IsA("Terrain") then return end
         if LocalPlayer and LocalPlayer.Character and (instance == LocalPlayer.Character or instance:IsDescendantOf(LocalPlayer.Character)) then
+            optimizeLocalCharacterInstance(instance)
             return
         end
-        -- Destroy other players' characters locally.
-        local player = Players:GetPlayerFromCharacter(instance)
+
+        local player, character = getCharacterOwner(instance)
         if player and player ~= LocalPlayer then
-            safeTaskDefer(function() pcall(function() instance:Destroy() end) end)
+            safeDestroy(character or instance)
             return
         end
-        -- Walk up the parent chain; if any ancestor is a moon/eclipse asset, keep it.
-        local current = instance
-        while current and current ~= workspace do
-            local nameLower = string.lower(current.Name)
-            if string.find(nameLower, "moon") or string.find(nameLower, "blood")
-               or string.find(nameLower, "gold") or string.find(nameLower, "eclipse") then
-                return
-            end
-            current = current.Parent
+
+        if isVisualJunk(instance) or instance:IsA("Sound")
+           or instance:IsA("BillboardGui") or instance:IsA("SurfaceGui") then
+            safeDestroy(instance)
+            return
         end
-        if instance:IsA("BasePart") or instance:IsA("Decal") or instance:IsA("Texture")
-           or instance:IsA("SpecialMesh") or instance:IsA("ParticleEmitter")
-           or instance:IsA("Beam") or instance:IsA("Trail") or instance:IsA("PostEffect") then
-            safeTaskDefer(function() pcall(function() instance:Destroy() end) end)
+
+        if hasProtectedWorkspaceAncestor(instance) then
+            if instance:IsA("BasePart") then
+                optimizePart(instance, false)
+            end
+            return
+        end
+
+        if instance:IsA("BasePart") or instance:IsA("Accessory") or instance:IsA("Tool") then
+            safeDestroy(instance)
         end
     end
 
     if DESTROY_WORLD_ASSETS and not MOBILE_SAFE_MODE then
-        pcall(function()
+        local function cleanupWorldPass()
             workspace.Terrain:Clear()
-            for _, desc in ipairs(workspace:GetDescendants()) do cleanInstance(desc) end
+            local descendants = workspace:GetDescendants()
+            for index, desc in ipairs(descendants) do
+                cleanInstance(desc)
+                if index % 350 == 0 then safeTaskWait(0.03) end
+            end
+            for index = #descendants, 1, -1 do
+                local desc = descendants[index]
+                if desc and desc.Parent and not hasProtectedWorkspaceAncestor(desc)
+                   and (desc:IsA("Model") or desc:IsA("Folder"))
+                   and #desc:GetChildren() == 0 then
+                    safeDestroy(desc)
+                end
+                if index % 500 == 0 then safeTaskWait(0.03) end
+            end
+        end
+        safeTaskSpawn(function()
+            pcall(cleanupWorldPass)
         end)
         workspace.DescendantAdded:Connect(cleanInstance)
+        safeTaskSpawn(function()
+            while true do
+                safeTaskWait(20)
+                pcall(cleanupWorldPass)
+                pcall(cleanPlayerGui)
+            end
+        end)
     end
 
-    -- 8. Black overlay indicating optimization mode (no brand text).
+    -- 8. Black overlay.
     safeTaskSpawn(function()
         pcall(function()
             local pGui = LocalPlayer:WaitForChild("PlayerGui", 15)
@@ -226,39 +401,11 @@ function optimizeClient()
             frame.BorderSizePixel = 0
             frame.Parent = sg
 
-            local content = Instance.new("Frame")
-            content.Size = UDim2.new(0, 420, 0, 170)
-            content.Position = UDim2.new(0.5, -210, 0.5, -85)
-            content.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-            content.BorderSizePixel = 0
-            content.Parent = frame
-
-            local corner = Instance.new("UICorner")
-            corner.CornerRadius = UDim.new(0, 8)
-            corner.Parent = content
-
-            local stroke = Instance.new("UIStroke")
-            stroke.Color = Color3.fromRGB(0, 170, 255)
-            stroke.Thickness = 1.5
-            stroke.Parent = content
-
-            local status = Instance.new("TextLabel")
-            status.Size = UDim2.new(1, -20, 1, -20)
-            status.Position = UDim2.new(0, 10, 0, 10)
-            status.BackgroundTransparency = 1
-            status.TextColor3 = Color3.fromRGB(220, 220, 220)
-            status.Font = Enum.Font.SourceSans
-            status.TextSize = 16
-            status.TextWrapped = true
-            status.TextYAlignment = Enum.TextYAlignment.Top
-            status.Text = "Optimization: EXTREME (Void Mode)\n\n" ..
-                          "Monitoring stock, weather, moon phases and fruit multipliers in the background...\n\n" ..
-                          "Active & Connected"
-            status.Parent = content
-
             sg.Parent = pGui
         end)
     end)
+
+    clientOptimized = true
 end
 
 -- ================== NAME HELPERS ==================
@@ -1635,6 +1782,9 @@ local weatherCatalogCache = {}
 local WEATHER_CATALOG_RESCAN_INTERVAL = 120
 local WEATHER_CATALOG_SCAN_LIMIT = 5000
 local weatherCatalogCacheAt = -WEATHER_CATALOG_RESCAN_INTERVAL
+local weatherCatalogLiveCache = nil
+local weatherCatalogLiveCacheAt = -999
+local WEATHER_CATALOG_LIVE_CACHE_SECONDS = 5
 
 function getWeatherCatalogScanRoots()
     local roots, seen = {}, {}
@@ -1747,6 +1897,11 @@ function rebuildWeatherCatalogCache()
 end
 
 function getWeatherCatalog()
+    local now = os.clock()
+    if weatherCatalogLiveCache and (now - weatherCatalogLiveCacheAt) < WEATHER_CATALOG_LIVE_CACHE_SECONDS then
+        return weatherCatalogLiveCache
+    end
+
     local catalog = {}
     local function add(rawName, root, allowUnknown)
         if not rawName or rawName == "" or not root then return end
@@ -1795,10 +1950,21 @@ function getWeatherCatalog()
         end
     end
 
+    weatherCatalogLiveCache = catalog
+    weatherCatalogLiveCacheAt = os.clock()
     return catalog
 end
 
+local activeWeatherCache = nil
+local activeWeatherCacheAt = -999
+local ACTIVE_WEATHER_CACHE_SECONDS = 1.0
+
 function getActiveWeatherAndPhase()
+    local now = os.clock()
+    if activeWeatherCache and (now - activeWeatherCacheAt) < ACTIVE_WEATHER_CACHE_SECONDS then
+        return activeWeatherCache.phase, activeWeatherCache.phaseImage, activeWeatherCache.weathers, activeWeatherCache.endTime
+    end
+
     local activePhase = getDefaultPhase()
     
     -- Check for custom Mega Moon event (Mega Moon strictly has Stars or Debris inside ActiveNight)
@@ -1875,6 +2041,13 @@ function getActiveWeatherAndPhase()
     end
     
     activePhaseImage = getPhaseFallbackImage(activePhase) or activePhaseImage
+    activeWeatherCache = {
+        phase = activePhase,
+        phaseImage = activePhaseImage,
+        weathers = activeWeathers,
+        endTime = endTime
+    }
+    activeWeatherCacheAt = os.clock()
     return activePhase, activePhaseImage, activeWeathers, endTime
 end
 
@@ -2240,6 +2413,19 @@ local originalAuctionFramePosition = nil
 local AUCTION_REQUEST_INTERVAL = 3
 local AUCTION_STARTUP_RETRY_INTERVAL = 0.75
 local AUCTION_STARTUP_RETRY_COUNT = 24
+local AUCTION_GUI_CACHE_SECONDS = 0.75
+local AUCTION_DATA_CACHE_SECONDS = 0.5
+local auctionGuiDataCache = nil
+local auctionGuiDataCacheAt = -999
+local auctionDataCache = nil
+local auctionDataCacheAt = -999
+
+function invalidateAuctionCaches()
+    auctionGuiDataCache = nil
+    auctionGuiDataCacheAt = -999
+    auctionDataCache = nil
+    auctionDataCacheAt = -999
+end
 
 function getAuctioneerModule()
     if not cachedAuctioneer then
@@ -2514,13 +2700,52 @@ end
 function getAuctionLotExpiry(lot)
     if type(lot) ~= "table" then return 0 end
     local expiresAt = tonumber(lot.expiresAt or lot.expireAt or lot.endTime or lot.endsAt)
-    if expiresAt and expiresAt > 0 then return expiresAt end
+    if expiresAt and expiresAt > 0 then return math.floor(expiresAt) end
     local rolledAt = tonumber(lot.rolledAt or lot.startedAt)
     local duration = tonumber(lot.durationSeconds or lot.duration or lot.lifetime or lot.last)
     if rolledAt and rolledAt > 0 and duration and duration > 0 then
-        return rolledAt + duration
+        return math.floor(rolledAt + duration)
     end
     return 0
+end
+
+function getAuctionExpiryBounds(lots, serverNow)
+    local firstExpiry = 0
+    local lastExpiry = 0
+    for _, lot in ipairs(lots or {}) do
+        local expiresAt = tonumber(lot and lot.expiresAt) or 0
+        if expiresAt > serverNow then
+            expiresAt = math.floor(expiresAt)
+            if firstExpiry == 0 or expiresAt < firstExpiry then
+                firstExpiry = expiresAt
+            end
+            if expiresAt > lastExpiry then
+                lastExpiry = expiresAt
+            end
+        end
+    end
+    return firstExpiry, lastExpiry
+end
+
+function normalizeAuctionRefreshAt(refreshAt, lots, serverNow)
+    refreshAt = tonumber(refreshAt) or 0
+    serverNow = math.floor(tonumber(serverNow) or getServerNow())
+    if refreshAt > 0 then refreshAt = math.floor(refreshAt) end
+
+    local firstExpiry, lastExpiry = getAuctionExpiryBounds(lots, serverNow)
+    if firstExpiry > 0 then
+        if refreshAt <= serverNow or refreshAt <= 0 then
+            return firstExpiry
+        end
+        -- The roll window can report a 30-minute cycle right after a new auction,
+        -- while the visible lots already expose the real next refresh. Clamp that
+        -- impossible value before it reaches the API/Telegram bot.
+        if lastExpiry > 0 and refreshAt > lastExpiry + 3 then
+            return firstExpiry
+        end
+    end
+
+    return refreshAt
 end
 
 function hasAuctionPriceFormula(lot)
@@ -2907,6 +3132,7 @@ end
 function applyAuctionSnapshot(snapshot)
     snapshot = unwrapAuctionSnapshotPayload(snapshot)
     if type(snapshot) ~= "table" then return false end
+    invalidateAuctionCaches()
     local incomingHasLots = type(getAuctionRawLots(snapshot)) == "table"
     if not incomingHasLots and type(snapshot.stock) ~= "table" and not latestAuctionSnapshot then
         return false
@@ -2965,6 +3191,7 @@ end
 function applyAuctionStockUpdate(update, maybeStock)
     local stockPayload, replaceAll = extractAuctionStockPayload(update, maybeStock)
     if type(stockPayload) ~= "table" then return false end
+    invalidateAuctionCaches()
     local normalizedStock = normalizeAuctionStockMap(stockPayload)
     if next(normalizedStock) == nil then return false end
 
@@ -3430,20 +3657,31 @@ function parseAuctionStockText(stockText)
     return math.max(0, math.floor(value)), false
 end
 
-function getAuctionDataFromGui()
+function getAuctionDataFromGui(force)
+    local nowClock = os.clock()
+    if not force and (nowClock - auctionGuiDataCacheAt) < AUCTION_GUI_CACHE_SECONDS then
+        return auctionGuiDataCache
+    end
+    local function finish(data)
+        auctionGuiDataCache = data
+        auctionGuiDataCacheAt = os.clock()
+        return data
+    end
+
     local auctionGui = PlayerGui and PlayerGui:FindFirstChild("Auction")
-    if not auctionGui then return nil end
+    if not auctionGui then return finish(nil) end
     local hasActiveSnapshot = latestAuctionSnapshot and (os.clock() - latestAuctionSnapshotAt) < 15
-    local guiDynamicTrusted = primeAuctionGuiForLiveValues() or not hasActiveSnapshot
+    local guiPrimed = primeAuctionGuiForLiveValues()
+    local guiDynamicTrusted = guiPrimed or not hasActiveSnapshot
     local frame = auctionGui:FindFirstChild("Frame", true)
     local scrollingFrame = frame and frame:FindFirstChild("ScrollingFrame", true)
-    if not scrollingFrame then return nil end
+    if not scrollingFrame then return finish(nil) end
 
-    local serverNow = getServerNow()
+    local serverNow = math.floor(getServerNow())
     local lots = {}
     local header = frame:FindFirstChild("Header")
-    local headerTimerText = guiDynamicTrusted and getAuctionGuiTimerText(header) or ""
-    local headerDuration = guiDynamicTrusted and parseDurationSeconds(headerTimerText) or 0
+    local headerTimerText = getAuctionGuiTimerText(header) or ""
+    local headerDuration = parseDurationSeconds(headerTimerText)
     local refreshAt = headerDuration > 0 and (serverNow + headerDuration) or 0
 
     for _, card in ipairs(scrollingFrame:GetChildren()) do
@@ -3563,7 +3801,7 @@ function getAuctionDataFromGui()
         end
     end
 
-    if #lots == 0 then return nil end
+    if #lots == 0 then return finish(nil) end
     -- If every lot still shows default placeholder values, the GUI hasn't finished loading.
     -- Suppress this result to avoid publishing stale data that gets corrected seconds later.
     local allDefault = true
@@ -3573,28 +3811,41 @@ function getAuctionDataFromGui()
             break
         end
     end
-    if allDefault and #lots > 0 then return nil end
+    if allDefault and #lots > 0 then return finish(nil) end
     table.sort(lots, function(a, b)
         return tostring(a.lotId or "") < tostring(b.lotId or "")
     end)
-    return {
+    refreshAt = normalizeAuctionRefreshAt(refreshAt, lots, serverNow)
+    return finish({
         lots = lots,
         refreshAt = refreshAt,
         serverNow = serverNow,
         source = "gui",
         dynamicTrusted = guiDynamicTrusted
-    }
+    })
 end
 
 function getAuctionData()
+    local nowClock = os.clock()
+    if auctionDataCache and (nowClock - auctionDataCacheAt) < AUCTION_DATA_CACHE_SECONDS then
+        return auctionDataCache
+    end
+    local function finish(data)
+        if type(data) == "table" then
+            auctionDataCache = data
+            auctionDataCacheAt = os.clock()
+        end
+        return data
+    end
+
     if not latestAuctionSnapshot or (os.clock() - latestAuctionSnapshotAt) > AUCTION_REQUEST_INTERVAL then
         requestAuctionSnapshot(false)
     end
     local snapshot = latestAuctionSnapshot
-    if type(snapshot) ~= "table" then return getAuctionDataFromGui() end
+    if type(snapshot) ~= "table" then return finish(getAuctionDataFromGui()) end
 
     local rawLots = getAuctionRawLots(snapshot)
-    if type(rawLots) ~= "table" then return getAuctionDataFromGui() end
+    if type(rawLots) ~= "table" then return finish(getAuctionDataFromGui()) end
 
     local guiData = getAuctionDataFromGui()
     local guiLotsById = {}
@@ -3773,7 +4024,7 @@ function getAuctionData()
     end)
 
     if #lots == 0 then
-        return getAuctionDataFromGui()
+        return finish(getAuctionDataFromGui())
     end
 
     local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds) or 0
@@ -3781,7 +4032,7 @@ function getAuctionData()
         rollIntervalSeconds = 1800
     end
     local rollWindowUnix = tonumber(snapshot.rollWindowUnix) or 0
-    local serverNow = getServerNow()
+    local serverNow = math.floor(getServerNow())
     if rollWindowUnix == 0 then
         local maxRolledAt = 0
         for _, lot in ipairs(lots) do
@@ -3802,25 +4053,16 @@ function getAuctionData()
         end
     end
     local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
-    local refreshAt = rollWindowUnix + rollIntervalSeconds + timerShiftSeconds
-    if refreshAt <= serverNow then
-        local nextLotExpiry = 0
-        for _, lot in ipairs(lots) do
-            local expiresAt = tonumber(lot.expiresAt) or 0
-            if expiresAt > serverNow and (nextLotExpiry == 0 or expiresAt < nextLotExpiry) then
-                nextLotExpiry = expiresAt
-            end
+    local refreshAt = normalizeAuctionRefreshAt(rollWindowUnix + rollIntervalSeconds + timerShiftSeconds, lots, serverNow)
+    if guiData and tonumber(guiData.refreshAt) then
+        local guiRefreshAt = normalizeAuctionRefreshAt(guiData.refreshAt, lots, serverNow)
+        if guiRefreshAt > serverNow then
+            refreshAt = guiRefreshAt
         end
-        if nextLotExpiry > 0 then
-            refreshAt = nextLotExpiry
-        end
-    end
-    if guiData and tonumber(guiData.refreshAt) and tonumber(guiData.refreshAt) > serverNow then
-        refreshAt = tonumber(guiData.refreshAt)
     end
 
 
-    return {
+    return finish({
         lots = lots,
         stock = latestAuctionStock,
         rollIntervalSeconds = rollIntervalSeconds,
@@ -3828,7 +4070,7 @@ function getAuctionData()
         timerShiftSeconds = timerShiftSeconds,
         refreshAt = refreshAt,
         serverNow = serverNow
-    }
+    })
 end
 
 local fruitImageCache = {}
@@ -5025,7 +5267,7 @@ local function bypassLoadingScreen()
             end)
         end
         
-        if workspace.CurrentCamera and workspace.CurrentCamera.CameraType == Enum.CameraType.Scriptable then
+        if not clientOptimized and workspace.CurrentCamera and workspace.CurrentCamera.CameraType == Enum.CameraType.Scriptable then
             workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
             writeDebugLog("Reset camera locked by loading screen")
         end
