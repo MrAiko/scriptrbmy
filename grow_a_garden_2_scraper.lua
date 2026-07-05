@@ -4261,16 +4261,20 @@ function getAuctionDataFromGui(force)
                 local looksLikeDefaultDynamic = (currentPrice >= 95000 and currentPrice <= 100000) and stock == 16
                 local rowDynamicTrusted = guiDynamicTrusted and not looksLikeDefaultDynamic
 
-                local expired = textExpired == true
+                local expired = textExpired == true and not soldOut
                 if rowDynamicTrusted then
                     local expiredObj = main:FindFirstChild("EXPIRED", true)
-                    if expiredObj and expiredObj:IsA("GuiObject") and expiredObj.Visible then
-                        expired = true
-                    end
                     local outObj = main:FindFirstChild("OUT_OF_STOCK", true)
-                    if outObj and outObj:IsA("GuiObject") and outObj.Visible then
+                    local expiredVisible = expiredObj and expiredObj:IsA("GuiObject") and expiredObj.Visible == true
+                    local outVisible = outObj and outObj:IsA("GuiObject") and outObj.Visible == true
+
+                    if expiredVisible then
+                        expired = true
+                        soldOut = false
+                    elseif outVisible then
                         soldOut = true
                         stock = 0
+                        expired = false
                     end
                 else
                     stock = nil
@@ -4501,11 +4505,21 @@ function getAuctionData()
             if not priceKnown then
                 currentPrice = nil
             end
-            local soldOut = (stock ~= nil and stock <= 0) or (useGuiDynamic and guiLot.soldOut == true)
+            local soldOut = stock ~= nil and stock <= 0
             local lotExpiresAt = placeholderLot and not useGuiDynamic and 0 or getAuctionLotExpiry(lot)
             local expired = lotExpiresAt > 0 and lotExpiresAt <= getServerNow()
-            if useGuiDynamic and guiLot.expired ~= nil then
-                expired = guiLot.expired == true
+            if useGuiDynamic then
+                if guiLot.expired == true then
+                    expired = true
+                    soldOut = false
+                elseif guiLot.soldOut == true then
+                    soldOut = true
+                    expired = false
+                elseif guiLot.expired == false then
+                    expired = false
+                end
+            elseif soldOut then
+                expired = false
             end
             if soldOut and currentPrice ~= nil then
                 local frozenPrice = latestAuctionSoldOutPrices[lotId]
