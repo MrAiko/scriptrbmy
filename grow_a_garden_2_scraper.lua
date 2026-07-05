@@ -708,16 +708,16 @@ local FALLBACK_PHASE_NAMES = {
 }
 
 function findTimeCycleController()
-    -- Never touch PlayerScripts.Controllers.TimeCycleController from executor
-    -- context. Its phase modules are RobloxScript-only and can break the
-    -- game's own controller when required outside a LocalScript.
-    return nil
+    local playerScripts = LocalPlayer and LocalPlayer:FindFirstChild("PlayerScripts")
+    if not playerScripts then return nil end
+    local controllers = findChildByNormalizedName(playerScripts, { "Controllers" })
+    return findChildByNormalizedName(controllers or playerScripts, { "TimeCycleController", "TimeCycle" })
 end
 
 function getPhasesFolder()
-    -- Do not scan/require TimeCycleController.Phases.* modules from an executor:
-    -- some phase modules are RobloxScript-context only and throw in public executors.
-    return nil
+    -- Only read child names. Do not require phase modules from executor context.
+    local controller = findTimeCycleController()
+    return controller and findChildByNormalizedName(controller, { "Phases" }) or nil
 end
 
 function getKnownPhaseNames()
@@ -1261,7 +1261,29 @@ function activeNightHasLiveChildren(activeNight)
     return #children > 0
 end
 
+function readWorkspacePhaseAttribute(attrName)
+    local ok, value = pcall(function()
+        return workspace:GetAttribute(attrName)
+    end)
+    if not ok or type(value) ~= "string" or value == "" then return nil end
+    if getPhaseKey(value) then
+        return cleanPhaseName(value)
+    end
+    return nil
+end
+
 function getWorkspaceActivePhase()
+    -- TimeCycleController starts script.Phases[ActiveWeather], so ActiveWeather
+    -- is the real live phase name (Moon, Bloodmoon, Goldmoon, ...).
+    local attrPhase = readWorkspacePhaseAttribute("ActiveWeather")
+        or readWorkspacePhaseAttribute("CurrentWeather")
+        or readWorkspacePhaseAttribute("ActivePhase")
+        or readWorkspacePhaseAttribute("CurrentPhase")
+        or readWorkspacePhaseAttribute("Phase")
+    if attrPhase then
+        return attrPhase
+    end
+
     local activeNight = workspace:FindFirstChild("ActiveNight")
     if activeNight then
         if activeNight:FindFirstChild("Stars") or activeNight:FindFirstChild("Debris") then
@@ -1846,7 +1868,11 @@ end
 
 function getActiveWeatherFromStateRoots(endTime)
     local weathers = {}
-    local phase = nil
+    local phase = readWorkspacePhaseAttribute("ActiveWeather")
+        or readWorkspacePhaseAttribute("CurrentWeather")
+        or readWorkspacePhaseAttribute("ActivePhase")
+        or readWorkspacePhaseAttribute("CurrentPhase")
+        or readWorkspacePhaseAttribute("Phase")
     local visited = 0
     local stateNames = { "Active", "Playing", "Enabled", "Running", "Current", "CurrentWeather", "ActiveWeather", "Weather" }
 
