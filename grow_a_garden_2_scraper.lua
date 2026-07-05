@@ -29,6 +29,24 @@ local DESTROY_WORLD_ASSETS = true -- Aggressively remove local 3D junk; protecte
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local SharedModules = ReplicatedStorage:WaitForChild("SharedModules", 10)
 local clientOptimized = false
+local SCRAPER_RUN_ID = tostring(os.clock()) .. ":" .. tostring(math.random(1, 1000000000))
+
+pcall(function()
+    local env = getgenv and getgenv() or nil
+    if type(env) == "table" then
+        env.__GAG2_STOCKER_RUN_ID = SCRAPER_RUN_ID
+    end
+end)
+
+function isCurrentScraperRun()
+    local ok, env = pcall(function()
+        return getgenv and getgenv() or nil
+    end)
+    if ok and type(env) == "table" and env.__GAG2_STOCKER_RUN_ID then
+        return env.__GAG2_STOCKER_RUN_ID == SCRAPER_RUN_ID
+    end
+    return true
+end
 
 function safeTaskSpawn(fn)
     if type(task) == "table" and type(task.spawn) == "function" then
@@ -374,6 +392,7 @@ function optimizeClient()
         workspace.DescendantAdded:Connect(cleanInstance)
         safeTaskSpawn(function()
             while true do
+                if not isCurrentScraperRun() then return end
                 safeTaskWait(20)
                 pcall(cleanupWorldPass)
                 pcall(cleanPlayerGui)
@@ -1158,10 +1177,113 @@ end
 
 -- ================== WEATHER / PHASE ==================
 function getDefaultPhase()
-    local clock = game.Lighting.ClockTime
+    local ok, lighting = pcall(function() return game:GetService("Lighting") end)
+    local clock = ok and lighting and tonumber(lighting.ClockTime) or nil
+    if not clock then return "Day" end
     if clock >= 17 and clock < 19.5 then return "Sunset"
     elseif clock >= 6 and clock < 17 then return "Day"
     else return "Moon" end
+end
+
+local phaseSignalEntriesCache = nil
+local PHASE_SIGNAL_PREFIXES = { "active", "current", "currentphase", "phase", "is", "playing" }
+local PHASE_SIGNAL_SUFFIXES = { "active", "playing", "enabled", "running", "started", "visible", "current", "state", "phase" }
+
+function getPhaseSignalEntries()
+    if phaseSignalEntriesCache then return phaseSignalEntriesCache end
+
+    local entries, seen = {}, {}
+    local function addKey(rawKey, displayName)
+        local key = normalizeName(rawKey)
+        if key == "" or seen[key] then return end
+        seen[key] = true
+        table.insert(entries, {
+            key = key,
+            name = cleanPhaseName(displayName),
+            phaseKey = getPhaseKey(displayName) or key
+        })
+    end
+
+    for _, phaseName in ipairs(getKnownPhaseNames()) do
+        local displayName = cleanPhaseName(phaseName)
+        addKey(phaseName, displayName)
+        addKey(displayName, displayName)
+        addKey(getPhaseKey(phaseName), displayName)
+    end
+
+    phaseSignalEntriesCache = entries
+    return entries
+end
+
+function phaseSignalKeyMatches(signalKey, phaseKey)
+    if not signalKey or not phaseKey or signalKey == "" or phaseKey == "" then return false end
+    if signalKey == phaseKey then return true end
+    for _, prefix in ipairs(PHASE_SIGNAL_PREFIXES) do
+        if signalKey == prefix .. phaseKey then return true end
+    end
+    for _, suffix in ipairs(PHASE_SIGNAL_SUFFIXES) do
+        if signalKey == phaseKey .. suffix then return true end
+    end
+    return false
+end
+
+function readPhaseNameFromSignalName(name)
+    local signalKey = normalizeName(name)
+    if signalKey == "" or isTechnicalPhaseName(signalKey) then return nil end
+    if getPhaseKey(signalKey) then
+        return cleanPhaseName(signalKey)
+    end
+    for _, prefix in ipairs(PHASE_SIGNAL_PREFIXES) do
+        if string.sub(signalKey, 1, #prefix) == prefix then
+            local candidate = string.sub(signalKey, #prefix + 1)
+            if getPhaseKey(candidate) then return cleanPhaseName(candidate) end
+        end
+    end
+    for _, suffix in ipairs(PHASE_SIGNAL_SUFFIXES) do
+        if #signalKey > #suffix and string.sub(signalKey, -#suffix) == suffix then
+            local candidate = string.sub(signalKey, 1, #signalKey - #suffix)
+            if getPhaseKey(candidate) then return cleanPhaseName(candidate) end
+        end
+    end
+    for _, entry in ipairs(getPhaseSignalEntries()) do
+        if phaseSignalKeyMatches(signalKey, entry.key)
+           or phaseSignalKeyMatches(signalKey, entry.phaseKey) then
+            return entry.name
+        end
+    end
+    return nil
+end
+
+function activeNightHasLiveChildren(activeNight)
+    if not activeNight then return false end
+    local ok, children = pcall(function() return activeNight:GetChildren() end)
+    if not ok or not children then return false end
+    return #children > 0
+end
+
+function getWorkspaceActivePhase()
+    local activeNight = workspace:FindFirstChild("ActiveNight")
+    if activeNight then
+        if activeNight:FindFirstChild("Stars") or activeNight:FindFirstChild("Debris") then
+            return "Mega Moon"
+        end
+
+        local nightPhase = findActivePhaseAsset(activeNight, false)
+        if nightPhase and not isTechnicalPhaseName(nightPhase) then
+            return nightPhase
+        end
+
+        if hasTruthyStateSignal(activeNight, { "Active", "Playing", "Enabled", "Running", "Started" })
+           or activeNightHasLiveChildren(activeNight) then
+            return "Moon"
+        end
+    end
+
+    local specialPhase = findActivePhaseAsset(workspace, true)
+    if specialPhase and not isTechnicalPhaseName(specialPhase) then
+        return specialPhase
+    end
+    return nil
 end
 
 function isNightPhase(phaseName)
@@ -1637,6 +1759,27 @@ function getWeatherStateScanRoots()
     add(ReplicatedStorage:FindFirstChild("WeatherState"))
     add(ReplicatedStorage:FindFirstChild("Environment"))
     add(ReplicatedStorage:FindFirstChild("ActiveWeather"))
+    add(getWeatherValues())
+    add(ReplicatedStorage:FindFirstChild("TimeCycle"))
+    add(ReplicatedStorage:FindFirstChild("TimeCycleState"))
+    add(ReplicatedStorage:FindFirstChild("CurrentPhase"))
+    add(ReplicatedStorage:FindFirstChild("ActivePhase"))
+    add(workspace:FindFirstChild("TimeCycle"))
+    add(workspace:FindFirstChild("TimeCycleState"))
+    add(workspace:FindFirstChild("CurrentPhase"))
+    add(workspace:FindFirstChild("ActivePhase"))
+    add(workspace:FindFirstChild("Phase"))
+
+    pcall(function()
+        add(game:GetService("Lighting"))
+    end)
+
+    local playerScripts = LocalPlayer and LocalPlayer:FindFirstChild("PlayerScripts")
+    if playerScripts then
+        local controllers = findChildByNormalizedName(playerScripts, { "Controllers" })
+        add(findChildByNormalizedName(playerScripts, { "TimeCycleController", "TimeCycle", "WeatherController", "EnvironmentController" }))
+        add(findChildByNormalizedName(controllers, { "TimeCycleController", "TimeCycle", "WeatherController", "EnvironmentController" }))
+    end
 
     return roots
 end
@@ -1724,6 +1867,10 @@ function getActiveWeatherFromStateRoots(endTime)
         if okAttrs and type(attrs) == "table" then
             for attrKey, attrValue in pairs(attrs) do
                 local attrKeyNorm = normalizeName(attrKey)
+                local phaseFromSignal = readPhaseNameFromSignalName(attrKey)
+                if phaseFromSignal and valueLooksTruthy(attrValue) then
+                    phase = phaseFromSignal
+                end
                 if attrKeyNorm == "weather" or attrKeyNorm == "currentweather" or attrKeyNorm == "activeweather"
                    or attrKeyNorm == "phase" or attrKeyNorm == "currentphase" then
                     local name, isPhase = readWeatherNameFromValue(attrValue)
@@ -1746,9 +1893,19 @@ function getActiveWeatherFromStateRoots(endTime)
             nameFromInstance = cleanWeatherStateName(inst.Name)
         end
         local activeByState = hasTruthyStateSignal(inst, stateNames)
+        local signalPhaseFromInstance = readPhaseNameFromSignalName(inst.Name)
+        local signalPhaseActive = activeByState
+        local signalPhaseValueObject = inst:IsA("BoolValue") or inst:IsA("StringValue")
+            or inst:IsA("IntValue") or inst:IsA("NumberValue")
+        if signalPhaseFromInstance and not signalPhaseActive and signalPhaseValueObject then
+            local okValue, rawValue = pcall(function() return inst.Value end)
+            signalPhaseActive = okValue and valueLooksTruthy(rawValue)
+        end
 
         if attrName then
             addWeather(attrName, inst)
+        elseif signalPhaseFromInstance and signalPhaseActive then
+            phase = signalPhaseFromInstance
         elseif nameFromValue then
             if valueIsPhase then
                 phase = nameFromValue
@@ -1965,22 +2122,8 @@ function getActiveWeatherAndPhase()
         return activeWeatherCache.phase, activeWeatherCache.phaseImage, activeWeatherCache.weathers, activeWeatherCache.endTime
     end
 
-    local activePhase = getDefaultPhase()
-    
-    -- Check for custom Mega Moon event (Mega Moon strictly has Stars or Debris inside ActiveNight)
-    local activeNight = workspace:FindFirstChild("ActiveNight")
-    local isMegaMoon = false
-    if activeNight then
-        if activeNight:FindFirstChild("Stars") or activeNight:FindFirstChild("Debris") then
-            isMegaMoon = true
-        end
-    end
-    if isMegaMoon then
-        activePhase = "Mega Moon"
-    else
-        local workspacePhase = findActivePhaseAsset(workspace, true)
-        if workspacePhase and not isTechnicalPhaseName(workspacePhase) then activePhase = workspacePhase end
-    end
+    local activePhase = nil
+    local workspacePhase = getWorkspaceActivePhase()
 
     local activeWeathers = {}
     local weatherUI = findWeatherUI()
@@ -2033,6 +2176,18 @@ function getActiveWeatherAndPhase()
         uiPhase = uiPhase or statePhase
     end
     if uiPhase and not isTechnicalPhaseName(uiPhase) then activePhase = uiPhase end
+
+    if workspacePhase and not isTechnicalPhaseName(workspacePhase) then
+        local workspaceIsSpecial = not isDefaultPhaseName(workspacePhase)
+        local workspaceIsNight = getPhaseKey(workspacePhase) == "moon"
+        if workspaceIsSpecial or not activePhase or (workspaceIsNight and isDefaultPhaseName(activePhase)) then
+            activePhase = workspacePhase
+        end
+    end
+
+    if not activePhase then
+        activePhase = getDefaultPhase()
+    end
     
     -- Check if the actual phase image matches a known special moon (e.g. Mega Moon)
     local resolvedPhase = getPhaseNameFromImageId(activePhaseImage)
@@ -5016,6 +5171,7 @@ local pendingFruitData = nil
 -- fruits are scraped fresh inside. We ALWAYS send live fruit data (never a stale
 -- cache) so the website/bot reflects in-game multiplier changes immediately.
 function updateAPI(fruitData)
+    if not isCurrentScraperRun() then return end
     pendingFruitData = fruitData or pendingFruitData
     if updatePending then return end
     local now = os.clock()
@@ -5180,6 +5336,7 @@ end)
 
 safeTaskSpawn(function()
     while not fruitSnapshotConnected do
+        if not isCurrentScraperRun() then return end
         safeTaskWait(5)
         connectFruitStockSnapshot(function()
             updateAPI(getFruitMultipliers())
@@ -5189,6 +5346,7 @@ end)
 
 safeTaskSpawn(function()
     while not auctionSnapshotConnected do
+        if not isCurrentScraperRun() then return end
         safeTaskWait(2)
         connectAuctionSnapshot(function()
             updateAPI(nil)
@@ -5199,6 +5357,7 @@ end)
 
 safeTaskSpawn(function()
     while true do
+        if not isCurrentScraperRun() then return end
         local gotSnapshot = requestAuctionSnapshot(not latestAuctionSnapshot)
         if gotSnapshot then
             updateAPI(nil)
@@ -5209,6 +5368,7 @@ end)
 
 safeTaskSpawn(function()
     while not latestFruitEntries do
+        if not isCurrentScraperRun() then return end
         safeTaskWait(5)
         requestFruitSnapshot(true)
     end
@@ -5244,6 +5404,7 @@ local lastAuctionHash = ""
 
 safeTaskSpawn(function()
     while true do
+        if not isCurrentScraperRun() then return end
         safeTaskWait(POLL_INTERVAL)
         local phase, _, weathers = getActiveWeatherAndPhase()
         local weathersHash = getWeathersHash(weathers)
@@ -5327,6 +5488,7 @@ end
 -- poll detected no change (e.g. UI re-opened, values rotated server-side).
 safeTaskSpawn(function()
     while true do
+        if not isCurrentScraperRun() then return end
         pcall(bypassLoadingScreen)
         updateAPI(nil)
         safeTaskWait(UPDATE_INTERVAL)
