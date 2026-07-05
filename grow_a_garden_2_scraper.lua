@@ -3847,12 +3847,17 @@ end
 function parseAuctionStockText(stockText)
     local raw = tostring(stockText or "")
     local lowerStock = string.lower(raw)
+    local expired = string.find(lowerStock, "expired") ~= nil
+        or string.find(lowerStock, "ended") ~= nil
+        or string.find(lowerStock, "истек") ~= nil
+        or string.find(lowerStock, "истёк") ~= nil
     local soldOut = string.find(lowerStock, "sold") ~= nil
-        or string.find(lowerStock, "out") ~= nil
-        or string.find(lowerStock, "expired") ~= nil
+        or string.find(lowerStock, "out of stock") ~= nil
+        or string.find(lowerStock, "sold out") ~= nil
+        or string.find(lowerStock, "%f[%a]out%f[%A]") ~= nil
         or string.find(lowerStock, "нет") ~= nil
         or string.find(lowerStock, "закончился") ~= nil
-    if soldOut then return 0, true end
+    if soldOut or expired then return 0, soldOut, expired end
 
     local parsedStock = raw:match("[xX]%s*([%d,%s%.]+)")
         or raw:match("([%d][%d,%s%.]*)")
@@ -3860,12 +3865,12 @@ function parseAuctionStockText(stockText)
         -- Fallback: strip all non-digits to get pure stock count
         parsedStock = raw:gsub("%D", "")
     end
-    if parsedStock == "" then return nil, false end
+    if parsedStock == "" then return nil, false, false end
 
     local cleaned = parsedStock:gsub("[%s,%.]", "")
     local value = tonumber(cleaned)
-    if value == nil then return nil, false end
-    return math.max(0, math.floor(value)), false
+    if value == nil then return nil, false, false end
+    return math.max(0, math.floor(value)), false, false
 end
 
 function getAuctionDataFromGui(force)
@@ -3916,7 +3921,7 @@ function getAuctionDataFromGui(force)
                 local duration = parseDurationSeconds(timerText)
                 local expiresAt = duration > 0 and (serverNow + duration) or 0
 
-                local stock, soldOut = parseAuctionStockText(stockText)
+                local stock, soldOut, textExpired = parseAuctionStockText(stockText)
 
                 local currentPrice = parseCompactMoney(priceText)
                 local cardLotId = normalizeAuctionLotId(card.Name)
@@ -3927,7 +3932,7 @@ function getAuctionDataFromGui(force)
                 local looksLikeDefaultDynamic = (currentPrice >= 95000 and currentPrice <= 100000) and stock == 16
                 local rowDynamicTrusted = guiDynamicTrusted and not looksLikeDefaultDynamic
 
-                local expired = false
+                local expired = textExpired == true
                 if rowDynamicTrusted then
                     local expiredObj = main:FindFirstChild("EXPIRED", true)
                     if expiredObj and expiredObj:IsA("GuiObject") and expiredObj.Visible then
@@ -3943,6 +3948,7 @@ function getAuctionDataFromGui(force)
                     currentPrice = 0
                     expiresAt = 0
                     soldOut = false
+                    expired = false
                 end
 
                 if not looksLikeTemplateAuctionRow then
