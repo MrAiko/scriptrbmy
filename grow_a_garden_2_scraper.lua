@@ -2071,7 +2071,12 @@ end
 
 function getAuctionHash(auction)
     if type(auction) ~= "table" or type(auction.lots) ~= "table" then return "" end
-    local parts = {}
+    local refreshAt = tonumber(auction.refreshAt) or 0
+    local refreshBucket = refreshAt > 0 and math.floor((refreshAt + 2) / 5) or 0
+    local parts = {
+        "refreshAt:" .. tostring(refreshBucket),
+        "refreshSource:" .. tostring(auction.refreshSource or "")
+    }
     for _, lot in ipairs(auction.lots) do
         table.insert(parts, table.concat({
             tostring(lot.lotId or ""),
@@ -2419,12 +2424,37 @@ local auctionGuiDataCache = nil
 local auctionGuiDataCacheAt = -999
 local auctionDataCache = nil
 local auctionDataCacheAt = -999
+local auctionRefreshProbeToken = 0
+local auctionRefreshProbeActive = false
 
 function invalidateAuctionCaches()
     auctionGuiDataCache = nil
     auctionGuiDataCacheAt = -999
     auctionDataCache = nil
     auctionDataCacheAt = -999
+end
+
+function scheduleAuctionRefreshProbe()
+    if auctionRefreshProbeActive then return end
+    auctionRefreshProbeActive = true
+    auctionRefreshProbeToken = auctionRefreshProbeToken + 1
+    local token = auctionRefreshProbeToken
+    local delays = { 0.35, 0.8, 1.4, 2.4, 3.8, 5.5, 7.5, 10.0 }
+    for index, delaySeconds in ipairs(delays) do
+        safeTaskDelay(delaySeconds, function()
+            if token ~= auctionRefreshProbeToken then return end
+            invalidateAuctionCaches()
+            local auctionData = getAuctionData()
+            local refreshAt = type(auctionData) == "table" and tonumber(auctionData.refreshAt or 0) or 0
+            if refreshAt > getServerNow() then
+                pcall(sendAuctionUpdateInstant)
+                auctionRefreshProbeActive = false
+                auctionRefreshProbeToken = auctionRefreshProbeToken + 1
+            elseif index == #delays then
+                auctionRefreshProbeActive = false
+            end
+        end)
+    end
 end
 
 function getAuctioneerModule()
@@ -3182,6 +3212,9 @@ function applyAuctionSnapshot(snapshot)
         latestAuctionSnapshotAt = latestAuctionAt
     end
     pcall(sendAuctionUpdateInstant)
+    if incomingHasLots then
+        scheduleAuctionRefreshProbe()
+    end
     return true
 end
 
@@ -3676,7 +3709,7 @@ function getAuctionDataFromGui(force)
 
     local serverNow = math.floor(getServerNow())
     local lots = {}
-    local header = frame:FindFirstChild("Header")
+    local header = frame:FindFirstChild("Header", true)
     local headerTimerText = getAuctionGuiTimerText(header) or ""
     local headerDuration = parseDurationSeconds(headerTimerText)
     local refreshAt = headerDuration > 0 and (serverNow + headerDuration) or 0
@@ -4926,11 +4959,28 @@ function fruitHash(list)
     return h
 end
 
+function isAuctionDataComplete(auctionData)
+    return type(auctionData) == "table"
+        and type(auctionData.lots) == "table"
+        and #auctionData.lots > 0
+        and tonumber(auctionData.refreshAt or 0) ~= nil
+        and tonumber(auctionData.refreshAt or 0) > getServerNow()
+end
+
+function getPublishableAuctionData()
+    local auctionData = getAuctionData()
+    if isAuctionDataComplete(auctionData) then
+        return auctionData
+    end
+    scheduleAuctionRefreshProbe()
+    return nil
+end
+
 function sendAuctionUpdateInstant()
     local ws = getWebSocketClient()
     if not ws then return false end
 
-    local auctionData = getAuctionData()
+    local auctionData = getPublishableAuctionData()
     if type(auctionData) ~= "table" then return false end
 
     local wsPayload = {
@@ -5035,7 +5085,7 @@ function updateAPI(fruitData)
             -- Seconds until the next in-game multiplier refresh (dynamic countdown).
             fruitRefreshTimer = getFruitRefreshTimer(),
             calculatorData = getCalculatorData(),
-            auction = getAuctionData()
+            auction = getPublishableAuctionData()
         }
 
         safeTaskSpawn(function()
@@ -5202,7 +5252,7 @@ safeTaskSpawn(function()
         local freshFruits = getFruitMultipliers()
         local fh = fruitHash(freshFruits)
         local fruitChanged = (fh ~= lastFruitHash)
-        local auctionHash = getAuctionHash(getAuctionData())
+        local auctionHash = getAuctionHash(getPublishableAuctionData())
         local auctionChanged = (auctionHash ~= lastAuctionHash)
 
         if phase ~= lastPhase or weathersHash ~= lastWeathersHash or weatherCatalogHash ~= lastWeatherCatalogHash or fruitChanged or auctionChanged then
