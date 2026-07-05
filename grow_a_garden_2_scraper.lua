@@ -2709,43 +2709,40 @@ function getAuctionLotExpiry(lot)
     return 0
 end
 
-function getAuctionExpiryBounds(lots, serverNow)
-    local firstExpiry = 0
-    local lastExpiry = 0
-    for _, lot in ipairs(lots or {}) do
-        local expiresAt = tonumber(lot and lot.expiresAt) or 0
-        if expiresAt > serverNow then
-            expiresAt = math.floor(expiresAt)
-            if firstExpiry == 0 or expiresAt < firstExpiry then
-                firstExpiry = expiresAt
-            end
-            if expiresAt > lastExpiry then
-                lastExpiry = expiresAt
-            end
-        end
-    end
-    return firstExpiry, lastExpiry
-end
-
-function normalizeAuctionRefreshAt(refreshAt, lots, serverNow)
+function normalizeAuctionRefreshAt(refreshAt, serverNow)
     refreshAt = tonumber(refreshAt) or 0
     serverNow = math.floor(tonumber(serverNow) or getServerNow())
     if refreshAt > 0 then refreshAt = math.floor(refreshAt) end
+    return refreshAt > serverNow and refreshAt or 0
+end
 
-    local firstExpiry, lastExpiry = getAuctionExpiryBounds(lots, serverNow)
-    if firstExpiry > 0 then
-        if refreshAt <= serverNow or refreshAt <= 0 then
-            return firstExpiry
-        end
-        -- The roll window can report a 30-minute cycle right after a new auction,
-        -- while the visible lots already expose the real next refresh. Clamp that
-        -- impossible value before it reaches the API/Telegram bot.
-        if lastExpiry > 0 and refreshAt > lastExpiry + 3 then
-            return firstExpiry
+function getAuctionSnapshotRefreshAt(snapshot, serverNow)
+    if type(snapshot) ~= "table" then return 0, "unknown" end
+    serverNow = math.floor(tonumber(serverNow) or getServerNow())
+
+    local refreshKeys = {
+        "refreshAt", "nextRefreshAt", "nextRefreshUnix", "refreshUnix",
+        "auctionRefreshAt", "nextAuctionAt", "nextRollAt", "rollEndsAt"
+    }
+    for _, key in ipairs(refreshKeys) do
+        local refreshAt = normalizeAuctionRefreshAt(snapshot[key], serverNow)
+        if refreshAt > 0 then
+            return refreshAt, "snapshot-" .. key
         end
     end
 
-    return refreshAt
+    local durationKeys = {
+        "refreshIn", "nextRefreshIn", "refreshInSeconds",
+        "nextRefreshSeconds", "secondsUntilRefresh", "timeUntilRefresh"
+    }
+    for _, key in ipairs(durationKeys) do
+        local duration = tonumber(snapshot[key])
+        if duration and duration > 0 then
+            return serverNow + math.floor(duration), "snapshot-" .. key
+        end
+    end
+
+    return 0, "unknown"
 end
 
 function hasAuctionPriceFormula(lot)
@@ -3683,6 +3680,7 @@ function getAuctionDataFromGui(force)
     local headerTimerText = getAuctionGuiTimerText(header) or ""
     local headerDuration = parseDurationSeconds(headerTimerText)
     local refreshAt = headerDuration > 0 and (serverNow + headerDuration) or 0
+    local refreshSource = headerDuration > 0 and "gui-header" or "unknown"
 
     for _, card in ipairs(scrollingFrame:GetChildren()) do
         if card:IsA("GuiObject") then
@@ -3703,9 +3701,6 @@ function getAuctionDataFromGui(force)
             if (priceText or stockText ~= "" or nameText) and normalizeName(card.Name) ~= "uilistlayout" then
                 local duration = parseDurationSeconds(timerText)
                 local expiresAt = duration > 0 and (serverNow + duration) or 0
-                if headerDuration <= 0 and expiresAt > 0 and (refreshAt == 0 or expiresAt < refreshAt) then
-                    refreshAt = expiresAt
-                end
 
                 local stock, soldOut = parseAuctionStockText(stockText)
 
@@ -3815,10 +3810,11 @@ function getAuctionDataFromGui(force)
     table.sort(lots, function(a, b)
         return tostring(a.lotId or "") < tostring(b.lotId or "")
     end)
-    refreshAt = normalizeAuctionRefreshAt(refreshAt, lots, serverNow)
+    refreshAt = normalizeAuctionRefreshAt(refreshAt, serverNow)
     return finish({
         lots = lots,
         refreshAt = refreshAt,
+        refreshSource = refreshSource,
         serverNow = serverNow,
         source = "gui",
         dynamicTrusted = guiDynamicTrusted
@@ -4053,11 +4049,12 @@ function getAuctionData()
         end
     end
     local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
-    local refreshAt = normalizeAuctionRefreshAt(rollWindowUnix + rollIntervalSeconds + timerShiftSeconds, lots, serverNow)
+    local refreshAt, refreshSource = getAuctionSnapshotRefreshAt(snapshot, serverNow)
     if guiData and tonumber(guiData.refreshAt) then
-        local guiRefreshAt = normalizeAuctionRefreshAt(guiData.refreshAt, lots, serverNow)
+        local guiRefreshAt = normalizeAuctionRefreshAt(guiData.refreshAt, serverNow)
         if guiRefreshAt > serverNow then
             refreshAt = guiRefreshAt
+            refreshSource = guiData.refreshSource or "gui-header"
         end
     end
 
@@ -4069,6 +4066,7 @@ function getAuctionData()
         rollWindowUnix = rollWindowUnix,
         timerShiftSeconds = timerShiftSeconds,
         refreshAt = refreshAt,
+        refreshSource = refreshSource,
         serverNow = serverNow
     })
 end
