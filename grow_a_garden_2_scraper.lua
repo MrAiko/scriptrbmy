@@ -1175,6 +1175,306 @@ function scrapeShopSafe(container)
     return success and items or {}
 end
 
+-- ================== DIRECT SHOP DATA SOURCE ==================
+-- The game builds shop UI from SharedModules data and ReplicatedStorage.StockValues.
+-- Read those authoritative sources first; UI scraping stays as a fallback only.
+local DIRECT_SHOP_CACHE = {}
+local DIRECT_SHOP_CACHE_AT = {}
+local DIRECT_SHOP_CACHE_SECONDS = 0.35
+local REQUIRED_SHARED_MODULE_CACHE = {}
+
+local SHOP_RARITY_ORDER = {
+    Common = 1,
+    Uncommon = 2,
+    Rare = 3,
+    Epic = 4,
+    Legendary = 5,
+    Mythic = 6,
+    Super = 7,
+    Secret = 8,
+    Exotic = 9
+}
+
+function formatShopPrice(value)
+    value = tonumber(value)
+    if not value then return "Unknown" end
+    local suffixes = {
+        { 1000000000000000, "Q" },
+        { 1000000000000, "T" },
+        { 1000000000, "B" },
+        { 1000000, "M" },
+        { 1000, "K" }
+    }
+    for _, item in ipairs(suffixes) do
+        local size, suffix = item[1], item[2]
+        if math.abs(value) >= size then
+            local short = value / size
+            local text = string.format("%.3f", short):gsub("0+$", ""):gsub("%.$", "")
+            return text .. suffix .. "\194\162"
+        end
+    end
+    return tostring(math.floor(value)) .. "\194\162"
+end
+
+function readShopImageRef(value)
+    if value == nil then return nil end
+    if typeof(value) == "Instance" then
+        if value:IsA("StringValue") or value:IsA("IntValue") or value:IsA("NumberValue") then
+            return normalizeAssetRef(value.Value)
+        end
+        if value:IsA("ImageLabel") or value:IsA("ImageButton") then
+            return normalizeAssetRef(value.Image)
+        end
+        return nil
+    end
+    return normalizeAssetRef(value)
+end
+
+function getStockValuesShopFolder(shopName)
+    local stockValues = ReplicatedStorage:FindFirstChild("StockValues")
+    return stockValues and stockValues:FindFirstChild(shopName) or nil
+end
+
+function getStockItemsFolder(shopName)
+    local shopFolder = getStockValuesShopFolder(shopName)
+    return shopFolder and shopFolder:FindFirstChild("Items") or nil
+end
+
+function readStockValue(shopName, itemName)
+    local items = getStockItemsFolder(shopName)
+    local stockObj = items and items:FindFirstChild(tostring(itemName or ""))
+    if not stockObj then return 0 end
+    local ok, value = pcall(function()
+        return stockObj.Value
+    end)
+    value = ok and tonumber(value) or 0
+    return math.max(0, math.floor(value or 0))
+end
+
+function getRequiredSharedModule(moduleName)
+    if REQUIRED_SHARED_MODULE_CACHE[moduleName] ~= nil then
+        if REQUIRED_SHARED_MODULE_CACHE[moduleName] == false then return nil end
+        return REQUIRED_SHARED_MODULE_CACHE[moduleName]
+    end
+    local moduleScript = getSharedModule(moduleName)
+    if not moduleScript then return nil end
+    local module = safeRequireModule(moduleScript)
+    if module then
+        REQUIRED_SHARED_MODULE_CACHE[moduleName] = module
+    end
+    return module
+end
+
+function shouldIncludeSeed(seed)
+    if type(seed) ~= "table" or not seed.RestockShop then return false end
+    local enabled = getRequiredSharedModule("SeedShopEnabled")
+    if enabled and enabled.IsSeedEnabled then
+        local ok, result = pcall(function()
+            return enabled.IsSeedEnabled(seed.SeedName)
+        end)
+        if ok then return result == true end
+    end
+    if enabled and enabled.DefaultFor then
+        local ok, result = pcall(function()
+            return enabled.DefaultFor(seed.SeedName)
+        end)
+        if ok then return result == true end
+    end
+    return true
+end
+
+function shouldIncludeGear(gear)
+    if type(gear) ~= "table" then return false end
+    if gear.RobuxOnly or gear.HideFromShop then return false end
+    if not (gear.RestockChance or gear.EquippableGear) then return false end
+    local enabled = getRequiredSharedModule("GearShopABTest")
+    if enabled and enabled.IsGearEnabled then
+        local ok, result = pcall(function()
+            return enabled.IsGearEnabled(LocalPlayer, gear.ItemName)
+        end)
+        if ok then return result == true end
+    end
+    if enabled and enabled.DefaultFor then
+        local ok, result = pcall(function()
+            return enabled.DefaultFor(gear.ItemName)
+        end)
+        if ok then return result == true end
+    end
+    return true
+end
+
+function shouldIncludeCrate(crate)
+    if type(crate) ~= "table" or not crate.RestockChance then return false end
+    local enabled = getRequiredSharedModule("CrateShopEnabled")
+    if enabled and enabled.IsCrateEnabled then
+        local ok, result = pcall(function()
+            return enabled.IsCrateEnabled(crate.Name)
+        end)
+        if ok then return result == true end
+    end
+    if enabled and enabled.DefaultFor then
+        local ok, result = pcall(function()
+            return enabled.DefaultFor(crate.Name)
+        end)
+        if ok then return result == true end
+    end
+    return true
+end
+
+function makeDirectShopItem(name, stock, price, rarity, image, order)
+    if not name or name == "" then return nil end
+    local priceRaw = tonumber(price) or 0
+    return {
+        name = tostring(name),
+        stock = math.max(0, math.floor(tonumber(stock) or 0)),
+        price = formatShopPrice(priceRaw),
+        priceRaw = math.max(0, math.floor(priceRaw)),
+        rarity = rarity or "Common",
+        image = readShopImageRef(image),
+        order = tonumber(order) or 0,
+        source = "direct"
+    }
+end
+
+function sortDirectShopItems(items)
+    table.sort(items, function(a, b)
+        local ao = tonumber(a.order) or 0
+        local bo = tonumber(b.order) or 0
+        if ao ~= bo then return ao < bo end
+        return tostring(a.name or "") < tostring(b.name or "")
+    end)
+    return items
+end
+
+function buildDirectSeedShop()
+    local seedData = getRequiredSharedModule("SeedData")
+    if type(seedData) ~= "table" then return {} end
+    local items = {}
+    for index, seed in ipairs(seedData) do
+        if shouldIncludeSeed(seed) then
+            local name = seed.SeedName
+            local item = makeDirectShopItem(
+                name,
+                readStockValue("SeedShop", name),
+                seed.PurchasePrice,
+                seed.Rarity,
+                seed.SeedImage,
+                seed.SeedShopDisplayOrder or index
+            )
+            if item then table.insert(items, item) end
+        end
+    end
+    return sortDirectShopItems(items)
+end
+
+function buildDirectGearShop()
+    local gearData = getRequiredSharedModule("GearShopData")
+    local rawItems = type(gearData) == "table" and gearData.Data or nil
+    if type(rawItems) ~= "table" then return {} end
+    local items = {}
+    for index, gear in ipairs(rawItems) do
+        if shouldIncludeGear(gear) then
+            local name = gear.ItemName
+            local rarityRank = SHOP_RARITY_ORDER[gear.Rarity or ""] or 0
+            local sortPriority = tonumber(gear.SortPriority) or 0
+            local order = rarityRank * 1000000 + sortPriority * 10000
+            if gear.EquippableGear then
+                order = order + 5000 + ((tonumber(gear.Cost) or 0) / 1000000)
+            else
+                order = order - ((tonumber(gear.RestockChance) or 0) * 100) + (index / 1000)
+            end
+            local item = makeDirectShopItem(
+                name,
+                readStockValue("GearShop", name),
+                gear.Cost or 0,
+                gear.Rarity,
+                gear.IMG,
+                order
+            )
+            if item then table.insert(items, item) end
+        end
+    end
+    return sortDirectShopItems(items)
+end
+
+function buildDirectCrateShop()
+    local crateData = getRequiredSharedModule("CrateData")
+    if type(crateData) ~= "table" or type(crateData.GetAllCrates) ~= "function" then return {} end
+    local ok, crates = pcall(function()
+        return crateData.GetAllCrates()
+    end)
+    if not ok or type(crates) ~= "table" then return {} end
+    local items = {}
+    for index, crate in ipairs(crates) do
+        if shouldIncludeCrate(crate) then
+            local rarityRank = SHOP_RARITY_ORDER[crate.Rarity or ""] or 0
+            local order = rarityRank * 1000000 - ((tonumber(crate.RestockChance) or 0) * 1000) + (index / 1000)
+            local item = makeDirectShopItem(
+                crate.Name,
+                readStockValue("CrateShop", crate.Name),
+                crate.Cost or 0,
+                crate.Rarity,
+                crate.IMG,
+                order
+            )
+            if item then table.insert(items, item) end
+        end
+    end
+    return sortDirectShopItems(items)
+end
+
+function getDirectShopData(shopKey)
+    local now = os.clock()
+    if DIRECT_SHOP_CACHE[shopKey] and (now - (DIRECT_SHOP_CACHE_AT[shopKey] or -999)) < DIRECT_SHOP_CACHE_SECONDS then
+        return DIRECT_SHOP_CACHE[shopKey]
+    end
+
+    local ok, items = pcall(function()
+        if shopKey == "SeedShop_Normal" or shopKey == "SeedShop" then
+            return buildDirectSeedShop()
+        elseif shopKey == "GearShop" then
+            return buildDirectGearShop()
+        elseif shopKey == "CrateShop" then
+            return buildDirectCrateShop()
+        end
+        return {}
+    end)
+
+    if not ok or type(items) ~= "table" then
+        items = {}
+    end
+    DIRECT_SHOP_CACHE[shopKey] = items
+    DIRECT_SHOP_CACHE_AT[shopKey] = now
+    return items
+end
+
+function getShopData(shopKey, fallbackContainer)
+    local directItems = getDirectShopData(shopKey)
+    if type(directItems) == "table" and #directItems > 0 then
+        return directItems
+    end
+    return scrapeShopSafe(fallbackContainer)
+end
+
+function getShopsHash()
+    local parts = {}
+    for _, shopKey in ipairs({ "CrateShop", "GearShop", "SeedShop_Normal" }) do
+        local items = getDirectShopData(shopKey)
+        table.insert(parts, shopKey)
+        for _, item in ipairs(items or {}) do
+            table.insert(parts, table.concat({
+                tostring(item.name or ""),
+                tostring(item.stock or 0),
+                tostring(item.price or ""),
+                tostring(item.priceRaw or ""),
+                tostring(item.rarity or ""),
+                tostring(item.image or "")
+            }, ":"))
+        end
+    end
+    return table.concat(parts, "|")
+end
+
 -- ================== WEATHER / PHASE ==================
 function getDefaultPhase()
     local ok, lighting = pcall(function() return game:GetService("Lighting") end)
@@ -1270,6 +1570,21 @@ function readWorkspacePhaseAttribute(attrName)
         return cleanPhaseName(value)
     end
     return nil
+end
+
+function getWorkspacePhaseEndTime()
+    local ok, value = pcall(function()
+        return workspace:GetAttribute("PhaseDuration")
+    end)
+    value = ok and tonumber(value) or 0
+    local now = os.time()
+    pcall(function()
+        now = workspace:GetServerTimeNow()
+    end)
+    if value and value > now then
+        return math.floor(value)
+    end
+    return 0
 end
 
 function getWorkspaceActivePhase()
@@ -2157,6 +2472,10 @@ function getActiveWeatherAndPhase()
     local timerText = getActiveTimerText()
     local parsedSec = parseTimeToSeconds(timerText)
     local endTime = parsedSec > 0 and (os.time() + parsedSec) or 0
+    local workspacePhaseEndTime = getWorkspacePhaseEndTime()
+    if workspacePhaseEndTime > endTime then
+        endTime = workspacePhaseEndTime
+    end
 
     local activePhaseImage = nil
     local uiPhase = nil
@@ -2950,6 +3269,16 @@ function getAuctionSnapshotRefreshAt(snapshot, serverNow)
         local duration = tonumber(snapshot[key])
         if duration and duration > 0 then
             return serverNow + math.floor(duration), "snapshot-" .. key
+        end
+    end
+
+    local rollWindowUnix = tonumber(snapshot.rollWindowUnix or snapshot.rollWindow or snapshot.startedAt)
+    local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds or snapshot.rollInterval or snapshot.cycleSeconds)
+    local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
+    if rollWindowUnix and rollWindowUnix > 0 and rollIntervalSeconds and rollIntervalSeconds > 0 then
+        local refreshAt = normalizeAuctionRefreshAt(rollWindowUnix + rollIntervalSeconds + timerShiftSeconds, serverNow)
+        if refreshAt > 0 then
+            return refreshAt, "snapshot-roll-window"
         end
     end
 
@@ -4270,6 +4599,13 @@ function getAuctionData()
     end
     local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
     local refreshAt, refreshSource = getAuctionSnapshotRefreshAt(snapshot, serverNow)
+    if refreshAt <= serverNow and rollWindowUnix > 0 and rollIntervalSeconds > 0 then
+        local rollRefreshAt = normalizeAuctionRefreshAt(rollWindowUnix + rollIntervalSeconds + timerShiftSeconds, serverNow)
+        if rollRefreshAt > serverNow then
+            refreshAt = rollRefreshAt
+            refreshSource = "roll-window"
+        end
+    end
     if guiData and tonumber(guiData.refreshAt) then
         local guiRefreshAt = normalizeAuctionRefreshAt(guiData.refreshAt, serverNow)
         if guiRefreshAt > serverNow then
@@ -5263,9 +5599,9 @@ function updateAPI(fruitData)
             },
             weatherCatalog = weatherCatalog,
             shops = {
-                CrateShop = scrapeShopSafe(resolveShopPath("CrateShop", "ScrollingFrame")),
-                GearShop = scrapeShopSafe(resolveShopPath("GearShop", "ScrollingFrame")),
-                SeedShop_Normal = scrapeShopSafe(resolveShopPath("SeedShop", "NormalShop"))
+                CrateShop = getShopData("CrateShop", resolveShopPath("CrateShop", "ScrollingFrame")),
+                GearShop = getShopData("GearShop", resolveShopPath("GearShop", "ScrollingFrame")),
+                SeedShop_Normal = getShopData("SeedShop_Normal", resolveShopPath("SeedShop", "NormalShop"))
             },
             -- ALWAYS send live fruit data (never a stale cache) so the website reflects
             -- in-game multiplier changes immediately.
@@ -5406,23 +5742,156 @@ safeTaskSpawn(function()
     end
 end)
 
+local stockValueConnections = {}
+local stockValuesUpdateQueued = false
+
+function invalidateDirectShopCache(shopName)
+    if shopName == "SeedShop" then
+        DIRECT_SHOP_CACHE["SeedShop_Normal"] = nil
+        DIRECT_SHOP_CACHE_AT["SeedShop_Normal"] = nil
+    end
+    DIRECT_SHOP_CACHE[shopName] = nil
+    DIRECT_SHOP_CACHE_AT[shopName] = nil
+end
+
+function scheduleStockValuesUpdate(shopName, delaySeconds)
+    invalidateDirectShopCache(shopName)
+    if stockValuesUpdateQueued then return end
+    stockValuesUpdateQueued = true
+    safeTaskDelay(delaySeconds or 0.15, function()
+        stockValuesUpdateQueued = false
+        if not isCurrentScraperRun() then return end
+        pcall(function()
+            updateAPI(nil)
+        end)
+    end)
+end
+
+function watchStockValueObject(shopName, valueObject)
+    if not valueObject or stockValueConnections[valueObject] then return end
+    local ok, conn = pcall(function()
+        return valueObject.Changed:Connect(function()
+            scheduleStockValuesUpdate(shopName, 0.08)
+        end)
+    end)
+    if ok and conn then
+        stockValueConnections[valueObject] = conn
+    end
+end
+
+function watchStockItemsFolder(shopName, itemsFolder)
+    if not itemsFolder then return end
+    for _, itemValue in ipairs(itemsFolder:GetChildren()) do
+        watchStockValueObject(shopName, itemValue)
+    end
+    if stockValueConnections[itemsFolder] then return end
+    local childAddedOk, childAddedConn = pcall(function()
+        return itemsFolder.ChildAdded:Connect(function(itemValue)
+            watchStockValueObject(shopName, itemValue)
+            scheduleStockValuesUpdate(shopName, 0.12)
+        end)
+    end)
+    if childAddedOk and childAddedConn then
+        stockValueConnections[itemsFolder] = childAddedConn
+    end
+    pcall(function()
+        itemsFolder.ChildRemoved:Connect(function()
+            scheduleStockValuesUpdate(shopName, 0.12)
+        end)
+    end)
+end
+
+function watchStockShopFolder(shopFolder)
+    if not shopFolder then return end
+    local shopName = shopFolder.Name
+    for _, timerName in ipairs({ "UnixNextRestock", "UnixLastRestock" }) do
+        local timerValue = shopFolder:FindFirstChild(timerName)
+        if timerValue then
+            watchStockValueObject(shopName, timerValue)
+        end
+    end
+    watchStockItemsFolder(shopName, shopFolder:FindFirstChild("Items"))
+    if not stockValueConnections[shopFolder] then
+        local ok, conn = pcall(function()
+            return shopFolder.ChildAdded:Connect(function(child)
+                if child.Name == "Items" then
+                    watchStockItemsFolder(shopName, child)
+                elseif child.Name == "UnixNextRestock" or child.Name == "UnixLastRestock" then
+                    watchStockValueObject(shopName, child)
+                end
+                scheduleStockValuesUpdate(shopName, 0.12)
+            end)
+        end)
+        if ok and conn then
+            stockValueConnections[shopFolder] = conn
+        end
+    end
+end
+
 local StockValues = ReplicatedStorage:WaitForChild("StockValues", 10)
 if StockValues then
     print("[Grow a Garden 2 Stocker] Monitoring StockValues folder for updates...")
     for _, shopFolder in ipairs(StockValues:GetChildren()) do
-        local nextRestock = shopFolder:FindFirstChild("UnixNextRestock")
-        if nextRestock then
-            nextRestock.Changed:Connect(function()
-                safeTaskWait(1.5)
-                updateAPI(nil)
-            end)
-        end
+        watchStockShopFolder(shopFolder)
     end
+    pcall(function()
+        StockValues.ChildAdded:Connect(function(shopFolder)
+            watchStockShopFolder(shopFolder)
+            scheduleStockValuesUpdate(shopFolder.Name, 0.15)
+        end)
+    end)
 else
     if DEBUG then
         warn("[Grow a Garden 2 Stocker] StockValues folder not found in ReplicatedStorage.")
     end
 end
+
+local environmentUpdateQueued = false
+
+function scheduleEnvironmentUpdate(delaySeconds)
+    activeWeatherCache = nil
+    if environmentUpdateQueued then return end
+    environmentUpdateQueued = true
+    safeTaskDelay(delaySeconds or 0.05, function()
+        environmentUpdateQueued = false
+        if not isCurrentScraperRun() then return end
+        pcall(function()
+            updateAPI(nil)
+        end)
+    end)
+end
+
+pcall(function()
+    for _, attrName in ipairs({ "ActivePhase", "ActiveWeather", "CurrentWeather", "CurrentPhase", "Phase", "PhaseDuration" }) do
+        workspace:GetAttributeChangedSignal(attrName):Connect(function()
+            scheduleEnvironmentUpdate(0.03)
+        end)
+    end
+end)
+
+pcall(function()
+    local weatherValues = getWeatherValues()
+    if weatherValues then
+        local okAttrChanged, attrChanged = pcall(function()
+            return weatherValues.AttributeChanged
+        end)
+        if okAttrChanged and attrChanged and attrChanged.Connect then
+            attrChanged:Connect(function()
+                scheduleEnvironmentUpdate(0.03)
+            end)
+        end
+        for _, entry in ipairs((getWeatherDataEntries())) do
+            if entry and entry.rawName then
+                weatherValues:GetAttributeChangedSignal(entry.rawName .. "_Playing"):Connect(function()
+                    scheduleEnvironmentUpdate(0.03)
+                end)
+                weatherValues:GetAttributeChangedSignal(entry.rawName .. "_EndTime"):Connect(function()
+                    scheduleEnvironmentUpdate(0.03)
+                end)
+            end
+        end
+    end
+end)
 
 -- ================== LOOPS ==================
 -- Fast poll: detect phase / weather / fruit-multiplier changes. Fruits are scraped
@@ -5433,6 +5902,7 @@ local lastWeathersHash = ""
 local lastWeatherCatalogHash = ""
 local lastFruitHash = ""
 local lastAuctionHash = ""
+local lastShopsHash = ""
 
 safeTaskSpawn(function()
     while true do
@@ -5447,13 +5917,16 @@ safeTaskSpawn(function()
         local fruitChanged = (fh ~= lastFruitHash)
         local auctionHash = getAuctionHash(getPublishableAuctionData())
         local auctionChanged = (auctionHash ~= lastAuctionHash)
+        local shopsHash = getShopsHash()
+        local shopsChanged = (shopsHash ~= lastShopsHash)
 
-        if phase ~= lastPhase or weathersHash ~= lastWeathersHash or weatherCatalogHash ~= lastWeatherCatalogHash or fruitChanged or auctionChanged then
+        if phase ~= lastPhase or weathersHash ~= lastWeathersHash or weatherCatalogHash ~= lastWeatherCatalogHash or fruitChanged or auctionChanged or shopsChanged then
             lastPhase = phase
             lastWeathersHash = weathersHash
             lastWeatherCatalogHash = weatherCatalogHash
             lastFruitHash = fh
             lastAuctionHash = auctionHash
+            lastShopsHash = shopsHash
             if auctionChanged then
                 pcall(sendAuctionUpdateInstant)
             end
