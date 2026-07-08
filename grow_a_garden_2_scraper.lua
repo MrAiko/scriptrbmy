@@ -9,11 +9,68 @@ end)
 -- Grow a Garden 2 Stock Scraper Script (Extreme-Optimized)
 -- Run this script in a Roblox Executor (e.g. Wave, Synapse, Electron, Solara, etc.)
 
-local HttpService = game:GetService("HttpService")
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local UserInputService = game:GetService("UserInputService")
-local LocalPlayer = Players.LocalPlayer
+local function bootWait(seconds)
+    if type(task) == "table" and type(task.wait) == "function" then
+        return task.wait(seconds)
+    end
+    if type(wait) == "function" then
+        return wait(seconds)
+    end
+end
+
+local function safeGetService(serviceName)
+    local ok, service = pcall(function()
+        return game:GetService(serviceName)
+    end)
+    return ok and service or nil
+end
+
+local function waitForGameLoaded(timeout)
+    local startedAt = os.clock()
+    local okLoaded, loaded = pcall(function()
+        return game:IsLoaded()
+    end)
+    while okLoaded and not loaded and (os.clock() - startedAt) < (timeout or 90) do
+        bootWait(0.25)
+        okLoaded, loaded = pcall(function()
+            return game:IsLoaded()
+        end)
+    end
+    return not okLoaded or loaded
+end
+
+waitForGameLoaded(90)
+
+local HttpService = safeGetService("HttpService")
+local Players = safeGetService("Players")
+local ReplicatedStorage = safeGetService("ReplicatedStorage")
+local UserInputService = safeGetService("UserInputService")
+local TeleportService = safeGetService("TeleportService")
+local GuiService = safeGetService("GuiService")
+
+local function waitForLocalPlayer(timeout)
+    local startedAt = os.clock()
+    local player = Players and Players.LocalPlayer or nil
+    while not player and (os.clock() - startedAt) < (timeout or 60) do
+        bootWait(0.2)
+        player = Players and Players.LocalPlayer or nil
+    end
+    return player
+end
+
+local function waitForChildSoft(parent, childName, timeout)
+    if not parent then return nil end
+    local child = parent:FindFirstChild(childName)
+    if child then return child end
+    local startedAt = os.clock()
+    while parent and parent.Parent and not child and (os.clock() - startedAt) < (timeout or 30) do
+        bootWait(0.15)
+        child = parent:FindFirstChild(childName)
+    end
+    return child
+end
+
+local LocalPlayer = waitForLocalPlayer(60)
 
 -- ================= CONFIGURATION =================
 local API_URL = "https://growagarden2stock.site/api/update-stock"
@@ -22,13 +79,16 @@ local UPDATE_INTERVAL = 30       -- Fallback interval in seconds to update API
 local POLL_INTERVAL = 0.5        -- Fast state poll interval; fruit data comes from FruitStock snapshot
 local FRUIT_REQUEST_INTERVAL = 10 -- Fallback remote refresh interval if Snapshot event is missed
 local DEBUG = false             -- Set to true only to diagnose scraper issues
-local MOBILE_SAFE_MODE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local MOBILE_SAFE_MODE = UserInputService and UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 local DESTROY_WORLD_ASSETS = true -- Aggressively remove local 3D junk; protected data containers stay intact.
+local AUTO_RECONNECT = true       -- Rejoin the game when Roblox shows disconnect/error prompt.
+local LOAD_WATCHDOG_TIMEOUT = 180 -- Rejoin if core game objects never appear after this many seconds.
 -- =================================================
 
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-local SharedModules = ReplicatedStorage:WaitForChild("SharedModules", 10)
+local PlayerGui = waitForChildSoft(LocalPlayer, "PlayerGui", 60)
+local SharedModules = waitForChildSoft(ReplicatedStorage, "SharedModules", 45)
 local clientOptimized = false
+local reconnecting = false
 local SCRAPER_RUN_ID = tostring(os.clock()) .. ":" .. tostring(math.random(1, 1000000000))
 
 pcall(function()
@@ -37,6 +97,19 @@ pcall(function()
         env.__GAG2_STOCKER_RUN_ID = SCRAPER_RUN_ID
     end
 end)
+
+function refreshRuntimeRefs()
+    if Players then
+        LocalPlayer = Players.LocalPlayer or LocalPlayer
+    end
+    if LocalPlayer then
+        PlayerGui = LocalPlayer:FindFirstChild("PlayerGui") or PlayerGui
+    end
+    if ReplicatedStorage then
+        SharedModules = ReplicatedStorage:FindFirstChild("SharedModules") or SharedModules
+    end
+    return LocalPlayer, PlayerGui, SharedModules
+end
 
 function isCurrentScraperRun()
     local ok, env = pcall(function()
@@ -93,10 +166,263 @@ function safeTaskWait(seconds)
     return nil
 end
 
+function getQueueOnTeleport()
+    if type(queue_on_teleport) == "function" then return queue_on_teleport end
+    if type(queueonteleport) == "function" then return queueonteleport end
+    if type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
+        return syn.queue_on_teleport
+    end
+    local ok, env = pcall(function()
+        return getgenv and getgenv() or nil
+    end)
+    if ok and type(env) == "table" then
+        if type(env.queue_on_teleport) == "function" then return env.queue_on_teleport end
+        if type(env.queueonteleport) == "function" then return env.queueonteleport end
+        if type(env.syn) == "table" and type(env.syn.queue_on_teleport) == "function" then
+            return env.syn.queue_on_teleport
+        end
+    end
+    return nil
+end
+
+function getTeleportReloadCode()
+    local loader = [[
+local function w(s)
+    if type(task) == "table" and type(task.wait) == "function" then return task.wait(s) end
+    if type(wait) == "function" then return wait(s) end
+end
+pcall(function()
+    local t0 = os.clock()
+    while not game:IsLoaded() and os.clock() - t0 < 90 do
+        w(0.25)
+    end
+end)
+w(1.5)
+local env = getgenv and getgenv() or {}
+local src = env.__GAG2_STOCKER_RELAUNCH_CODE or env.__GAG2_STOCKER_SOURCE or env.__GAG2_STOCKER_AUTORUN
+if type(src) ~= "string" and type(isfile) == "function" and type(readfile) == "function" then
+    for _, path in ipairs({
+        "grow_a_garden_2_scraper.lua",
+        "Grow_a_Garden_2_Scraper.lua",
+        "gag2_stocker.lua",
+        "GAG2Stocker.lua",
+        "autoexec/grow_a_garden_2_scraper.lua",
+        "scripts/grow_a_garden_2_scraper.lua"
+    }) do
+        local okFile, exists = pcall(function() return isfile(path) end)
+        if okFile and exists then
+            local okRead, content = pcall(function() return readfile(path) end)
+            if okRead and type(content) == "string" and #content > 100 then
+                src = content
+                break
+            end
+        end
+    end
+end
+if type(src) == "string" and #src > 100 then
+    local okLoad, fn = pcall(function() return loadstring(src) end)
+    if okLoad and type(fn) == "function" then
+        pcall(fn)
+    end
+end
+]]
+    local ok, env = pcall(function()
+        return getgenv and getgenv() or nil
+    end)
+    if ok and type(env) == "table" then
+        local src = env.__GAG2_STOCKER_RELAUNCH_CODE or env.__GAG2_STOCKER_SOURCE or env.__GAG2_STOCKER_AUTORUN
+        if type(src) == "string" and #src > 100 then
+            return src
+        end
+    end
+    return loader
+end
+
+function queueScraperAfterTeleport()
+    local queueFunc = getQueueOnTeleport()
+    if not queueFunc then return false end
+    local code = getTeleportReloadCode()
+    local ok = pcall(function()
+        queueFunc(code)
+    end)
+    return ok
+end
+
+function requestReconnect(reason)
+    if not AUTO_RECONNECT or reconnecting then return false end
+    reconnecting = true
+    refreshRuntimeRefs()
+    pcall(function()
+        local env = getgenv and getgenv() or nil
+        if type(env) == "table" then
+            env.__GAG2_STOCKER_LAST_RECONNECT_REASON = tostring(reason or "unknown")
+        end
+    end)
+    queueScraperAfterTeleport()
+    warn("[Grow a Garden 2 Stocker] Reconnecting: " .. tostring(reason or "Roblox disconnect"))
+
+    safeTaskSpawn(function()
+        pcall(function()
+            if type(setfpscap) == "function" then
+                setfpscap(30)
+            end
+        end)
+
+        local player = LocalPlayer or waitForLocalPlayer(10)
+        local placeId = game.PlaceId
+        local jobId = game.JobId
+        for attempt = 1, 5 do
+            local okTeleport = false
+            if TeleportService and player and placeId and placeId ~= 0 then
+                if attempt == 1 and type(jobId) == "string" and jobId ~= "" then
+                    okTeleport = pcall(function()
+                        TeleportService:TeleportToPlaceInstance(placeId, jobId, player)
+                    end)
+                end
+                if not okTeleport then
+                    okTeleport = pcall(function()
+                        TeleportService:Teleport(placeId, player)
+                    end)
+                end
+            end
+            if okTeleport then
+                return
+            end
+            safeTaskWait(math.min(2 + attempt * 2, 12))
+            refreshRuntimeRefs()
+            player = LocalPlayer or player
+        end
+        reconnecting = false
+    end)
+    return true
+end
+
+function isRobloxDisconnectPrompt(instance)
+    if not instance then return false end
+    local name = string.lower(tostring(instance.Name or ""))
+    if name == "errorprompt" or name == "disconnectprompt" then
+        return true
+    end
+    if string.find(name, "error") and (string.find(name, "prompt") or string.find(name, "modal")) then
+        return true
+    end
+    local ok, descendants = pcall(function()
+        return instance:GetDescendants()
+    end)
+    if ok then
+        for _, desc in ipairs(descendants) do
+            local descName = string.lower(tostring(desc.Name or ""))
+            if descName == "errorprompt" or descName == "disconnectprompt" then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function installAutoReconnectWatchdog()
+    if not AUTO_RECONNECT then return end
+
+    pcall(function()
+        if GuiService and GuiService.ErrorMessageChanged then
+            GuiService.ErrorMessageChanged:Connect(function()
+                safeTaskDelay(0.25, function()
+                    requestReconnect("GuiService error message")
+                end)
+            end)
+        end
+    end)
+
+    pcall(function()
+        local CoreGui = safeGetService("CoreGui")
+        if not CoreGui then return end
+        local promptHooked = false
+
+        local function hookPromptGui(robloxPromptGui)
+            if promptHooked or not robloxPromptGui then return end
+            local promptOverlay = robloxPromptGui:FindFirstChild("promptOverlay") or waitForChildSoft(robloxPromptGui, "promptOverlay", 10)
+            if not promptOverlay then return end
+            promptHooked = true
+
+            local function inspectPrompt(child)
+                safeTaskDelay(0.2, function()
+                    if isRobloxDisconnectPrompt(child) then
+                        requestReconnect("Roblox error prompt")
+                    end
+                end)
+            end
+
+            for _, child in ipairs(promptOverlay:GetChildren()) do
+                inspectPrompt(child)
+            end
+            promptOverlay.ChildAdded:Connect(inspectPrompt)
+            promptOverlay.DescendantAdded:Connect(function(desc)
+                if isRobloxDisconnectPrompt(desc) then
+                    requestReconnect("Roblox disconnect descendant")
+                end
+            end)
+        end
+
+        hookPromptGui(CoreGui:FindFirstChild("RobloxPromptGui"))
+        CoreGui.ChildAdded:Connect(function(child)
+            if child.Name == "RobloxPromptGui" then
+                hookPromptGui(child)
+            end
+        end)
+    end)
+
+    pcall(function()
+        if LocalPlayer and LocalPlayer.OnTeleport then
+            LocalPlayer.OnTeleport:Connect(function(state)
+                queueScraperAfterTeleport()
+                if string.find(tostring(state), "Failed", 1, true) then
+                    safeTaskDelay(2, function()
+                        requestReconnect("teleport failed")
+                    end)
+                end
+            end)
+        end
+    end)
+
+    pcall(function()
+        if TeleportService and TeleportService.TeleportInitFailed then
+            TeleportService.TeleportInitFailed:Connect(function(player)
+                if not LocalPlayer or player == LocalPlayer then
+                    safeTaskDelay(2, function()
+                        requestReconnect("teleport init failed")
+                    end)
+                end
+            end)
+        end
+    end)
+
+    safeTaskSpawn(function()
+        local startedAt = os.clock()
+        while true do
+            if not isCurrentScraperRun() then return end
+            safeTaskWait(5)
+            refreshRuntimeRefs()
+            local okLoaded, loaded = pcall(function()
+                return game:IsLoaded()
+            end)
+            local ready = (not okLoaded or loaded) and LocalPlayer and PlayerGui and ReplicatedStorage and SharedModules
+            if ready then
+                startedAt = os.clock()
+            elseif (os.clock() - startedAt) > LOAD_WATCHDOG_TIMEOUT then
+                requestReconnect("load watchdog timeout")
+                return
+            end
+        end
+    end)
+end
+
+installAutoReconnectWatchdog()
+
 -- ================== CLIENT OPTIMIZATION ==================
 -- Aggressively reduce client CPU/GPU/RAM usage so the scraper runs with near-zero
 -- overhead. All steps are wrapped in pcall so a failure never breaks scraping.
 function optimizeClient()
+    refreshRuntimeRefs()
     local RunService = game:GetService("RunService")
     local protectedWorkspaceRoots = {
         gardens = true,
@@ -313,6 +639,7 @@ function optimizeClient()
     end
 
     local function cleanPlayerGui()
+        refreshRuntimeRefs()
         local pGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
         if not pGui then return end
         for _, child in ipairs(pGui:GetChildren()) do
@@ -327,11 +654,13 @@ function optimizeClient()
 
     pcall(function()
         cleanPlayerGui()
-        PlayerGui.ChildAdded:Connect(function(child)
-            safeTaskDefer(function()
-                cleanPlayerGuiInstance(child)
+        if PlayerGui then
+            PlayerGui.ChildAdded:Connect(function(child)
+                safeTaskDefer(function()
+                    cleanPlayerGuiInstance(child)
+                end)
             end)
-        end)
+        end
     end)
 
     -- 7. Destructive local cleanup. Protected roots stay because game/client data
@@ -403,7 +732,8 @@ function optimizeClient()
     -- 8. Black overlay.
     safeTaskSpawn(function()
         pcall(function()
-            local pGui = LocalPlayer:WaitForChild("PlayerGui", 15)
+            refreshRuntimeRefs()
+            local pGui = PlayerGui or waitForChildSoft(LocalPlayer, "PlayerGui", 15)
             if not pGui then return end
             local existing = pGui:FindFirstChild("OptimizerOverlay")
             if existing then existing:Destroy() end
@@ -5554,6 +5884,7 @@ local pendingFruitData = nil
 -- cache) so the website/bot reflects in-game multiplier changes immediately.
 function updateAPI(fruitData)
     if not isCurrentScraperRun() then return end
+    refreshRuntimeRefs()
     pendingFruitData = fruitData or pendingFruitData
     if updatePending then return end
     local now = os.clock()
@@ -5842,7 +6173,8 @@ function watchStockShopFolder(shopFolder)
     end
 end
 
-local StockValues = ReplicatedStorage:WaitForChild("StockValues", 10)
+refreshRuntimeRefs()
+local StockValues = waitForChildSoft(ReplicatedStorage, "StockValues", 20)
 if StockValues then
     print("[Grow a Garden 2 Stocker] Monitoring StockValues folder for updates...")
     for _, shopFolder in ipairs(StockValues:GetChildren()) do
@@ -5922,31 +6254,37 @@ safeTaskSpawn(function()
     while true do
         if not isCurrentScraperRun() then return end
         safeTaskWait(POLL_INTERVAL)
-        local phase, _, weathers = getActiveWeatherAndPhase()
-        local weathersHash = getWeathersHash(weathers)
-        local weatherCatalogHash = getWeatherCatalogHash(getWeatherCatalog())
+        local ok, err = pcall(function()
+            refreshRuntimeRefs()
+            local phase, _, weathers = getActiveWeatherAndPhase()
+            local weathersHash = getWeathersHash(weathers)
+            local weatherCatalogHash = getWeatherCatalogHash(getWeatherCatalog())
 
-        local freshFruits = getFruitMultipliers()
-        local fh = fruitHash(freshFruits)
-        local fruitChanged = (fh ~= lastFruitHash)
-        local auctionHash = getAuctionHash(getPublishableAuctionData())
-        local auctionChanged = (auctionHash ~= lastAuctionHash)
-        local shopsHash = getShopsHash()
-        local shopsChanged = (shopsHash ~= lastShopsHash)
+            local freshFruits = getFruitMultipliers()
+            local fh = fruitHash(freshFruits)
+            local fruitChanged = (fh ~= lastFruitHash)
+            local auctionHash = getAuctionHash(getPublishableAuctionData())
+            local auctionChanged = (auctionHash ~= lastAuctionHash)
+            local shopsHash = getShopsHash()
+            local shopsChanged = (shopsHash ~= lastShopsHash)
 
-        if phase ~= lastPhase or weathersHash ~= lastWeathersHash or weatherCatalogHash ~= lastWeatherCatalogHash or fruitChanged or auctionChanged or shopsChanged then
-            lastPhase = phase
-            lastWeathersHash = weathersHash
-            lastWeatherCatalogHash = weatherCatalogHash
-            lastFruitHash = fh
-            lastAuctionHash = auctionHash
-            lastShopsHash = shopsHash
-            if auctionChanged then
-                pcall(sendAuctionUpdateInstant)
+            if phase ~= lastPhase or weathersHash ~= lastWeathersHash or weatherCatalogHash ~= lastWeatherCatalogHash or fruitChanged or auctionChanged or shopsChanged then
+                lastPhase = phase
+                lastWeathersHash = weathersHash
+                lastWeatherCatalogHash = weatherCatalogHash
+                lastFruitHash = fh
+                lastAuctionHash = auctionHash
+                lastShopsHash = shopsHash
+                if auctionChanged then
+                    pcall(sendAuctionUpdateInstant)
+                end
+                -- Pass the freshly scraped fruit list so updateAPI doesn't re-scrape,
+                -- and the data sent to the API is guaranteed current.
+                updateAPI(freshFruits)
             end
-            -- Pass the freshly scraped fruit list so updateAPI doesn't re-scrape,
-            -- and the data sent to the API is guaranteed current.
-            updateAPI(freshFruits)
+        end)
+        if not ok and DEBUG then
+            warn("[Grow a Garden 2 Stocker] Poll tick failed: " .. tostring(err))
         end
     end
 end)
@@ -5955,8 +6293,9 @@ end)
 -- means "scrape fresh"), guaranteeing the site gets current data even if the fast
 -- poll detected no change (e.g. UI re-opened, values rotated server-side).
 local function bypassLoadingScreen()
-    local PlayerGui = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui", 10)
-    if not PlayerGui then return end
+    refreshRuntimeRefs()
+    local currentPlayerGui = PlayerGui or waitForChildSoft(LocalPlayer, "PlayerGui", 10)
+    if not currentPlayerGui then return end
     
     pcall(function()
         -- 1. Find and destroy LoadingScreenMenu from workspace
@@ -5970,12 +6309,12 @@ local function bypassLoadingScreen()
         -- 2. Unlock all ScreenGuis by disconnecting "Enabled" change connections
         if getconnections then
             pcall(function()
-                for _, conn in ipairs(getconnections(PlayerGui.ChildAdded)) do
+                for _, conn in ipairs(getconnections(currentPlayerGui.ChildAdded)) do
                     pcall(function() conn:Disconnect() end)
                 end
             end)
             
-            for _, child in ipairs(PlayerGui:GetChildren()) do
+            for _, child in ipairs(currentPlayerGui:GetChildren()) do
                 if child:IsA("ScreenGui") then
                     pcall(function()
                         for _, conn in ipairs(getconnections(child:GetPropertyChangedSignal("Enabled"))) do
@@ -5987,7 +6326,7 @@ local function bypassLoadingScreen()
         end
         
         -- 3. Reset camera and spoof loading state attributes
-        local localPlayer = game:GetService("Players").LocalPlayer
+        local localPlayer = LocalPlayer or (Players and Players.LocalPlayer)
         if localPlayer then
             pcall(function()
                 localPlayer:SetAttribute("LoadingScreenActive", false)
