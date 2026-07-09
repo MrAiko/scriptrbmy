@@ -75,9 +75,9 @@ local LocalPlayer = waitForLocalPlayer(60)
 -- ================= CONFIGURATION =================
 local API_URL = "https://growagarden2stock.site/api/update-stock"
 local API_PASSWORD = "mySuperSecretToken123"
-local UPDATE_INTERVAL = 30       -- Fallback interval in seconds to update API
-local POLL_INTERVAL = 0.5        -- Fast state poll interval; fruit data comes from FruitStock snapshot
-local FRUIT_REQUEST_INTERVAL = 10 -- Fallback remote refresh interval if Snapshot event is missed
+local UPDATE_INTERVAL = 30       -- Authoritative safety refresh; normal updates are event-driven.
+local POLL_INTERVAL = 15         -- Lightweight fallback only.  Do not repeatedly rebuild every UI/data tree.
+local FRUIT_REQUEST_INTERVAL = 15 -- Fallback remote refresh interval if Snapshot event is missed
 local DEBUG = false             -- Set to true only to diagnose scraper issues
 local MOBILE_SAFE_MODE = UserInputService and UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 local DESTROY_WORLD_ASSETS = true -- Aggressively remove local 3D junk; protected data containers stay intact.
@@ -448,15 +448,53 @@ function optimizeClient()
         return string.lower(tostring(name or "")):gsub("[^%w]", "")
     end
 
-    local function safeDestroy(instance)
-        if not instance or not instance.Parent then return end
-        safeTaskDefer(function()
+    -- A full map can contain thousands of visual instances.  Creating one task for
+    -- every Destroy call causes a noticeable CPU spike and scheduler churn.  Keep a
+    -- single bounded destroy queue instead; destroying a parent also makes queued
+    -- children harmless no-ops.
+    local destroyQueue = {}
+    local destroyQueueHead = 1
+    local destroyQueueTail = 0
+    local destroyQueued = setmetatable({}, { __mode = "k" })
+    local destroyFlushScheduled = false
+    local DESTROY_BATCH_SIZE = 180
+    local flushDestroyQueue
+
+    flushDestroyQueue = function()
+        destroyFlushScheduled = false
+        local processed = 0
+        while destroyQueueHead <= destroyQueueTail and processed < DESTROY_BATCH_SIZE do
+            local instance = destroyQueue[destroyQueueHead]
+            destroyQueue[destroyQueueHead] = nil
+            destroyQueueHead = destroyQueueHead + 1
+            destroyQueued[instance] = nil
+            processed = processed + 1
             pcall(function()
                 if instance and instance.Parent then
                     instance:Destroy()
                 end
             end)
-        end)
+        end
+
+        if destroyQueueHead > destroyQueueTail then
+            destroyQueue = {}
+            destroyQueueHead = 1
+            destroyQueueTail = 0
+        elseif not destroyFlushScheduled then
+            destroyFlushScheduled = true
+            safeTaskDelay(0.03, flushDestroyQueue)
+        end
+    end
+
+    local function safeDestroy(instance)
+        if not instance or not instance.Parent or destroyQueued[instance] then return end
+        destroyQueued[instance] = true
+        destroyQueueTail = destroyQueueTail + 1
+        destroyQueue[destroyQueueTail] = instance
+        if not destroyFlushScheduled then
+            destroyFlushScheduled = true
+            safeTaskDefer(flushDestroyQueue)
+        end
     end
 
     local function hasProtectedWorkspaceAncestor(instance)
@@ -660,6 +698,14 @@ function optimizeClient()
                     cleanPlayerGuiInstance(child)
                 end)
             end)
+            -- Keep the protected shop/weather screens intact, but discard only the
+            -- expensive dynamic widgets as they are replicated.  This replaces the
+            -- old recurring full PlayerGui walk.
+            PlayerGui.DescendantAdded:Connect(function(desc)
+                if desc:IsA("ViewportFrame") or desc:IsA("VideoFrame") or desc:IsA("Sound") then
+                    safeDestroy(desc)
+                end
+            end)
         end
     end)
 
@@ -692,7 +738,11 @@ function optimizeClient()
             return
         end
 
-        if instance:IsA("BasePart") or instance:IsA("Accessory") or instance:IsA("Tool") then
+        -- An unprotected world root is visual/gameplay clutter for this headless
+        -- scraper.  Removing the whole root is much cheaper than receiving a
+        -- callback for every part it contains.
+        if instance:IsA("Model") or instance:IsA("Folder")
+            or instance:IsA("BasePart") or instance:IsA("Accessory") or instance:IsA("Tool") then
             safeDestroy(instance)
         end
     end
@@ -715,18 +765,74 @@ function optimizeClient()
                 if index % 500 == 0 then safeTaskWait(0.03) end
             end
         end
+
+        -- DescendantAdded can fire for every replicated particle/part.  The old
+        -- direct callback did ancestry walks and destruction immediately for each
+        -- event, then also rescanned all of Workspace every 20 seconds.  Watching
+        -- only top-level additions removes whole unprotected roots at once, while
+        -- the initial pass covers already replicated descendants.
+        local cleanupQueue = {}
+        local cleanupQueueHead = 1
+        local cleanupQueueTail = 0
+        local cleanupQueued = setmetatable({}, { __mode = "k" })
+        local cleanupFlushScheduled = false
+        local WORLD_CLEANUP_BATCH_SIZE = 120
+        local flushCleanupQueue
+
+        local function isWorldCleanupCandidate(instance)
+            if not instance then return false end
+            return instance:IsA("BasePart")
+                or instance:IsA("Model")
+                or instance:IsA("Folder")
+                or instance:IsA("Accessory")
+                or instance:IsA("Tool")
+                or instance:IsA("BillboardGui")
+                or instance:IsA("SurfaceGui")
+                or instance:IsA("Sound")
+                or isVisualJunk(instance)
+        end
+
+        flushCleanupQueue = function()
+            cleanupFlushScheduled = false
+            local processed = 0
+            while cleanupQueueHead <= cleanupQueueTail and processed < WORLD_CLEANUP_BATCH_SIZE do
+                local instance = cleanupQueue[cleanupQueueHead]
+                cleanupQueue[cleanupQueueHead] = nil
+                cleanupQueueHead = cleanupQueueHead + 1
+                cleanupQueued[instance] = nil
+                processed = processed + 1
+                pcall(function()
+                    if instance and instance.Parent then
+                        cleanInstance(instance)
+                    end
+                end)
+            end
+
+            if cleanupQueueHead > cleanupQueueTail then
+                cleanupQueue = {}
+                cleanupQueueHead = 1
+                cleanupQueueTail = 0
+            elseif not cleanupFlushScheduled then
+                cleanupFlushScheduled = true
+                safeTaskDelay(0.08, flushCleanupQueue)
+            end
+        end
+
+        local function queueWorldCleanup(instance)
+            if not isWorldCleanupCandidate(instance) or cleanupQueued[instance] then return end
+            cleanupQueued[instance] = true
+            cleanupQueueTail = cleanupQueueTail + 1
+            cleanupQueue[cleanupQueueTail] = instance
+            if not cleanupFlushScheduled then
+                cleanupFlushScheduled = true
+                safeTaskDelay(0.15, flushCleanupQueue)
+            end
+        end
+
         safeTaskSpawn(function()
             pcall(cleanupWorldPass)
         end)
-        workspace.DescendantAdded:Connect(cleanInstance)
-        safeTaskSpawn(function()
-            while true do
-                if not isCurrentScraperRun() then return end
-                safeTaskWait(20)
-                pcall(cleanupWorldPass)
-                pcall(cleanPlayerGui)
-            end
-        end)
+        workspace.ChildAdded:Connect(queueWorldCleanup)
     end
 
     -- 8. Black overlay.
@@ -835,7 +941,10 @@ local isDecorativeWeatherCatalogName
 local weatherDataCache = nil
 local weatherDataByKeyCache = nil
 local weatherDataCacheAt = -999
-local WEATHER_DATA_REFRESH_INTERVAL = 5
+-- WeatherData and its attribute schema are static for a server session.  Live
+-- playing/end-time values are read separately, so reparsing the catalogue every
+-- few seconds only burns CPU.
+local WEATHER_DATA_REFRESH_INTERVAL = 120
 
 function getWeatherValues()
     return ReplicatedStorage:FindFirstChild("WeatherValues")
@@ -2486,7 +2595,26 @@ function resolveWeatherCardName(instance)
     return nil, false
 end
 
+local weatherFrameCardsCache = nil
+local weatherFrameCardsCacheFrame = nil
+local weatherFrameCardsCacheAt = -999
+local weatherFrameCardsDirty = true
+local WEATHER_FRAME_CARDS_CACHE_SECONDS = 45
+
+function invalidateWeatherFrameCards()
+    weatherFrameCardsCache = nil
+    weatherFrameCardsCacheFrame = nil
+    weatherFrameCardsCacheAt = -999
+    weatherFrameCardsDirty = true
+end
+
 function getWeatherFrameCards(frame)
+    local now = os.clock()
+    if not weatherFrameCardsDirty and weatherFrameCardsCache and weatherFrameCardsCacheFrame == frame
+        and (now - weatherFrameCardsCacheAt) < WEATHER_FRAME_CARDS_CACHE_SECONDS then
+        return weatherFrameCardsCache
+    end
+
     local cards, seen = {}, {}
     local function add(inst)
         if not inst or seen[inst] or not inst:IsA("GuiObject") then return end
@@ -2496,13 +2624,23 @@ function getWeatherFrameCards(frame)
         table.insert(cards, inst)
     end
 
-    if not frame then return cards end
+    if not frame then
+        weatherFrameCardsCache = cards
+        weatherFrameCardsCacheFrame = frame
+        weatherFrameCardsCacheAt = now
+        weatherFrameCardsDirty = false
+        return cards
+    end
     for _, child in ipairs(frame:GetChildren()) do
         add(child)
     end
     for _, desc in ipairs(frame:GetDescendants()) do
         add(desc)
     end
+    weatherFrameCardsCache = cards
+    weatherFrameCardsCacheFrame = frame
+    weatherFrameCardsCacheAt = now
+    weatherFrameCardsDirty = false
     return cards
 end
 
@@ -2574,6 +2712,19 @@ function readWeatherNameFromValue(value)
     return nil, false
 end
 
+-- The fallback state roots can contain thousands of replicated instances.  They
+-- are only needed when the authoritative WeatherValues/UI data has a gap, so keep
+-- the discovered state and rescan only after a real weather event or a slow safety
+-- timeout.  End times are recreated from the current call, not frozen in cache.
+local weatherStateScanCache = nil
+local weatherStateScanCacheAt = -999
+local weatherStateScanDirty = true
+local WEATHER_STATE_SCAN_INTERVAL = 45
+
+function invalidateWeatherStateScan()
+    weatherStateScanDirty = true
+end
+
 function getActiveWeatherFromWeatherValues(endTime, frame)
     local weathers = {}
     local weatherValues = getWeatherValues()
@@ -2623,6 +2774,20 @@ function getActiveWeatherFromWeatherValues(endTime, frame)
 end
 
 function getActiveWeatherFromStateRoots(endTime)
+    local now = os.clock()
+    if not weatherStateScanDirty and weatherStateScanCache
+        and (now - weatherStateScanCacheAt) < WEATHER_STATE_SCAN_INTERVAL then
+        local cachedWeathers = {}
+        for name, info in pairs(weatherStateScanCache.weathers or {}) do
+            cachedWeathers[name] = {
+                playing = true,
+                endTime = endTime or 0,
+                image = info.image
+            }
+        end
+        return cachedWeathers, weatherStateScanCache.phase
+    end
+
     local weathers = {}
     local phase = readWorkspacePhaseAttribute("ActiveWeather")
         or readWorkspacePhaseAttribute("CurrentWeather")
@@ -2714,16 +2879,35 @@ function getActiveWeatherFromStateRoots(endTime)
         end
     end
 
+    local cachedWeathers = {}
+    for name, info in pairs(weathers) do
+        cachedWeathers[name] = {
+            image = info and info.image or nil
+        }
+    end
+    weatherStateScanCache = {
+        phase = phase,
+        weathers = cachedWeathers
+    }
+    weatherStateScanCacheAt = now
+    weatherStateScanDirty = false
     return weathers, phase
 end
 
 local weatherCatalogCache = {}
-local WEATHER_CATALOG_RESCAN_INTERVAL = 120
+local WEATHER_CATALOG_RESCAN_INTERVAL = 600
 local WEATHER_CATALOG_SCAN_LIMIT = 5000
 local weatherCatalogCacheAt = -WEATHER_CATALOG_RESCAN_INTERVAL
 local weatherCatalogLiveCache = nil
 local weatherCatalogLiveCacheAt = -999
-local WEATHER_CATALOG_LIVE_CACHE_SECONDS = 5
+local weatherCatalogLiveDirty = true
+local WEATHER_CATALOG_LIVE_CACHE_SECONDS = 60
+
+function invalidateWeatherCatalogCache()
+    weatherCatalogLiveCache = nil
+    weatherCatalogLiveCacheAt = -999
+    weatherCatalogLiveDirty = true
+end
 
 function getWeatherCatalogScanRoots()
     local roots, seen = {}, {}
@@ -2837,7 +3021,8 @@ end
 
 function getWeatherCatalog()
     local now = os.clock()
-    if weatherCatalogLiveCache and (now - weatherCatalogLiveCacheAt) < WEATHER_CATALOG_LIVE_CACHE_SECONDS then
+    if not weatherCatalogLiveDirty and weatherCatalogLiveCache
+        and (now - weatherCatalogLiveCacheAt) < WEATHER_CATALOG_LIVE_CACHE_SECONDS then
         return weatherCatalogLiveCache
     end
 
@@ -2891,12 +3076,13 @@ function getWeatherCatalog()
 
     weatherCatalogLiveCache = catalog
     weatherCatalogLiveCacheAt = os.clock()
+    weatherCatalogLiveDirty = false
     return catalog
 end
 
 local activeWeatherCache = nil
 local activeWeatherCacheAt = -999
-local ACTIVE_WEATHER_CACHE_SECONDS = 1.0
+local ACTIVE_WEATHER_CACHE_SECONDS = 10
 
 function getActiveWeatherAndPhase()
     local now = os.clock()
@@ -3162,11 +3348,15 @@ local lastAuctionRequestAt = -10
 local auctionGuiPrimedAt = 0
 local auctionGuiAutoHidden = false
 local originalAuctionFramePosition = nil
+-- RequestSnapshot is only a fallback when event delivery is unavailable/stale.
+-- Keep the short value as a remote-call throttle, not a permanent polling rate.
 local AUCTION_REQUEST_INTERVAL = 3
+local AUCTION_SNAPSHOT_STALE_SECONDS = 25
+local AUCTION_EVENT_HEALTH_INTERVAL = 20
 local AUCTION_STARTUP_RETRY_INTERVAL = 0.75
 local AUCTION_STARTUP_RETRY_COUNT = 24
-local AUCTION_GUI_CACHE_SECONDS = 0.75
-local AUCTION_DATA_CACHE_SECONDS = 0.5
+local AUCTION_GUI_CACHE_SECONDS = 3
+local AUCTION_DATA_CACHE_SECONDS = 2
 local auctionGuiDataCache = nil
 local auctionGuiDataCacheAt = -999
 local auctionDataCache = nil
@@ -3969,7 +4159,7 @@ function applyAuctionSnapshot(snapshot)
         latestAuctionSnapshotAt = latestAuctionAt
     end
     pcall(sendAuctionUpdateInstant)
-    if incomingHasLots then
+    if incomingHasLots and (lotsChanged or previousLotKey == "") then
         scheduleAuctionRefreshProbe()
     end
     return true
@@ -4634,7 +4824,7 @@ function getAuctionData()
         return data
     end
 
-    if not latestAuctionSnapshot or (os.clock() - latestAuctionSnapshotAt) > AUCTION_REQUEST_INTERVAL then
+    if not latestAuctionSnapshot or (os.clock() - latestAuctionSnapshotAt) > AUCTION_SNAPSHOT_STALE_SECONDS then
         requestAuctionSnapshot(false)
     end
     local snapshot = latestAuctionSnapshot
@@ -4982,7 +5172,9 @@ end
 -- children and then adjusted by live selling FastFlags.
 local calculatorDataCache = nil
 local calculatorDataCacheAt = -60
-local CALCULATOR_DATA_REFRESH_INTERVAL = 60
+-- Calculator modules/FastFlags are effectively immutable in one server session.
+-- Rebuilding them used to scan executor GC repeatedly every minute.
+local CALCULATOR_DATA_REFRESH_INTERVAL = 300
 local cachedFastFlags = false
 local cachedAsserts = false
 local FAST_FLAG_REPLICA_CACHE = {}
@@ -5224,27 +5416,33 @@ function buildSeedMeta(seedData)
     return meta
 end
 
+local cachedMutationMultiplierResolver = false
+local mutationMultiplierResolverChecked = false
+
+function getCachedMutationMultiplierResolver()
+    if mutationMultiplierResolverChecked then
+        return cachedMutationMultiplierResolver or nil
+    end
+    mutationMultiplierResolverChecked = true
+
+    -- Some executors cannot require the helper directly.  Resolve it at most once
+    -- as a last resort; a getgc(true) walk for every mutation was the largest
+    -- calculator-related CPU spike in the old script.
+    local gc = getgc or (debug and debug.getregistry)
+    if not gc then return nil end
+    pcall(function()
+        for _, value in ipairs(gc(true)) do
+            if type(value) == "table" and type(rawget(value, "ReturnPriceMultiplier")) == "function" then
+                cachedMutationMultiplierResolver = value.ReturnPriceMultiplier
+                break
+            end
+        end
+    end)
+    return cachedMutationMultiplierResolver or nil
+end
+
 function getMutationMultiplier(mutationData, mutationName, rawEntry)
     if type(mutationName) ~= "string" or mutationName == "" then return nil end
-
-    -- Try resolving ReturnPriceMultiplier via GC dynamically to bypass require restrictions
-    local gc = getgc or (debug and debug.getregistry)
-    if gc then
-        local foundFunc = nil
-        pcall(function()
-            for _, v in ipairs(gc(true)) do
-                if type(v) == "table" and rawget(v, "ReturnPriceMultiplier") and type(v.ReturnPriceMultiplier) == "function" then
-                    foundFunc = v.ReturnPriceMultiplier
-                    break
-                end
-            end
-        end)
-        if foundFunc then
-            local ok, value = pcall(foundFunc, mutationName)
-            local n = tonumber(value)
-            if ok and n and n > 0 then return n end
-        end
-    end
 
     if type(mutationData) == "table" and mutationData.ReturnPriceMultiplier then
         local ok, value = pcall(function()
@@ -5261,6 +5459,13 @@ function getMutationMultiplier(mutationData, mutationName, rawEntry)
         local raw = rawEntry.PriceMultiplier or rawEntry.Multiplier or rawEntry.Value or rawEntry.SellMultiplier or rawEntry.SellValueMultiplier
         local n = tonumber(raw)
         if n and n > 0 then return n end
+    end
+
+    local resolver = getCachedMutationMultiplierResolver()
+    if resolver then
+        local ok, value = pcall(resolver, mutationName)
+        local n = tonumber(value)
+        if ok and n and n > 0 then return n end
     end
     return nil
 end
@@ -5989,7 +6194,7 @@ end)
 safeTaskSpawn(function()
     while not fruitSnapshotConnected do
         if not isCurrentScraperRun() then return end
-        safeTaskWait(5)
+        safeTaskWait(10)
         connectFruitStockSnapshot(function()
             updateAPI(getFruitMultipliers())
         end)
@@ -5997,31 +6202,44 @@ safeTaskSpawn(function()
 end)
 
 safeTaskSpawn(function()
-    while not auctionSnapshotConnected do
+    -- Keep attempting to attach both Auction signals, but do not hammer the
+    -- remotes after one of them is already available.
+    while not (auctionSnapshotConnected and auctionStockConnected) do
         if not isCurrentScraperRun() then return end
-        safeTaskWait(2)
+        safeTaskWait(5)
         connectAuctionSnapshot(function()
             updateAPI(nil)
         end)
-        requestAuctionSnapshot(true)
+        if not latestAuctionSnapshot then
+            requestAuctionSnapshot(false)
+        end
     end
 end)
 
 safeTaskSpawn(function()
     while true do
         if not isCurrentScraperRun() then return end
-        local gotSnapshot = requestAuctionSnapshot(not latestAuctionSnapshot)
-        if gotSnapshot then
-            updateAPI(nil)
+        local snapshotAge = latestAuctionSnapshotAt > 0 and (os.clock() - latestAuctionSnapshotAt) or math.huge
+        local eventDriven = auctionSnapshotConnected and auctionStockConnected
+        local snapshotStale = not latestAuctionSnapshot or snapshotAge > AUCTION_SNAPSHOT_STALE_SECONDS
+
+        -- Snapshot/StockUpdate events are authoritative and push changes
+        -- immediately.  Poll only as a health fallback when an event is missing
+        -- or no fresh snapshot has arrived for a while.
+        if not eventDriven or snapshotStale then
+            local gotSnapshot = requestAuctionSnapshot(false)
+            if gotSnapshot then
+                updateAPI(nil)
+            end
         end
-        safeTaskWait(latestAuctionSnapshot and AUCTION_REQUEST_INTERVAL or 1)
+        safeTaskWait(eventDriven and AUCTION_EVENT_HEALTH_INTERVAL or 5)
     end
 end)
 
 safeTaskSpawn(function()
-    while not latestFruitEntries do
+    while latestFruitSnapshotAt <= 0 do
         if not isCurrentScraperRun() then return end
-        safeTaskWait(5)
+        safeTaskWait(10)
         requestFruitSnapshot(true)
     end
 end)
@@ -6230,12 +6448,28 @@ safeTaskSpawn(function()
 end)
 
 local environmentUpdateQueued = false
+local lastEnvironmentDeepInvalidationAt = -999
+local ENVIRONMENT_DEEP_INVALIDATION_MIN_INTERVAL = 1.5
 
 function scheduleEnvironmentUpdate(delaySeconds)
     activeWeatherCache = nil
+    local now = os.clock()
+    -- AttributeChanged may be emitted more than once while the same weather card
+    -- settles.  Keep UI/catalog/state discovery event-driven, but collapse that
+    -- burst so it cannot trigger repeated Descendants scans.
+    if (now - lastEnvironmentDeepInvalidationAt) >= ENVIRONMENT_DEEP_INVALIDATION_MIN_INTERVAL then
+        lastEnvironmentDeepInvalidationAt = now
+        weatherDataCache = nil
+        weatherDataByKeyCache = nil
+        weatherDataCacheAt = -999
+        phaseSignalEntriesCache = nil
+        invalidateWeatherCatalogCache()
+        invalidateWeatherFrameCards()
+        invalidateWeatherStateScan()
+    end
     if environmentUpdateQueued then return end
     environmentUpdateQueued = true
-    safeTaskDelay(delaySeconds or 0.05, function()
+    safeTaskDelay(math.max(tonumber(delaySeconds) or 0.2, 0.15), function()
         environmentUpdateQueued = false
         if not isCurrentScraperRun() then return end
         pcall(function()
@@ -6260,32 +6494,34 @@ pcall(function()
         end)
         if okAttrChanged and attrChanged and attrChanged.Connect then
             attrChanged:Connect(function()
-                scheduleEnvironmentUpdate(0.03)
+                scheduleEnvironmentUpdate(0.15)
             end)
-        end
-        for _, entry in ipairs((getWeatherDataEntries())) do
-            if entry and entry.rawName then
-                weatherValues:GetAttributeChangedSignal(entry.rawName .. "_Playing"):Connect(function()
-                    scheduleEnvironmentUpdate(0.03)
-                end)
-                weatherValues:GetAttributeChangedSignal(entry.rawName .. "_EndTime"):Connect(function()
-                    scheduleEnvironmentUpdate(0.03)
-                end)
-            end
         end
     end
 end)
 
+pcall(function()
+    local weatherUI = findWeatherUI()
+    if weatherUI then
+        -- Cards/icons are normally static, but newly replicated event cards need
+        -- to invalidate the compact card index immediately instead of waiting for
+        -- its normal cache lifetime.
+        weatherUI.DescendantAdded:Connect(function()
+            scheduleEnvironmentUpdate(0.2)
+        end)
+        weatherUI.DescendantRemoving:Connect(function()
+            scheduleEnvironmentUpdate(0.2)
+        end)
+    end
+end)
+
 -- ================== LOOPS ==================
--- Fast poll: detect phase / weather / fruit-multiplier changes. Fruits are scraped
--- once here and passed DIRECTLY to updateAPI (no stale cache) so the website always
--- reflects the latest in-game values the moment they change.
+-- All normal state changes are handled above by StockValues, WeatherValues,
+-- FruitStock and Auctioneer events.  This is deliberately only a low-frequency
+-- safety net for executors/game versions where one of those signals is missing.
 local lastPhase = nil
 local lastWeathersHash = ""
-local lastWeatherCatalogHash = ""
 local lastFruitHash = ""
-local lastAuctionHash = ""
-local lastShopsHash = ""
 
 safeTaskSpawn(function()
     while true do
@@ -6295,28 +6531,15 @@ safeTaskSpawn(function()
             refreshRuntimeRefs()
             local phase, _, weathers = getActiveWeatherAndPhase()
             local weathersHash = getWeathersHash(weathers)
-            local weatherCatalogHash = getWeatherCatalogHash(getWeatherCatalog())
-
             local freshFruits = getFruitMultipliers()
             local fh = fruitHash(freshFruits)
-            local fruitChanged = (fh ~= lastFruitHash)
-            local auctionHash = getAuctionHash(getPublishableAuctionData())
-            local auctionChanged = (auctionHash ~= lastAuctionHash)
-            local shopsHash = getShopsHash()
-            local shopsChanged = (shopsHash ~= lastShopsHash)
 
-            if phase ~= lastPhase or weathersHash ~= lastWeathersHash or weatherCatalogHash ~= lastWeatherCatalogHash or fruitChanged or auctionChanged or shopsChanged then
+            if phase ~= lastPhase or weathersHash ~= lastWeathersHash or fh ~= lastFruitHash then
                 lastPhase = phase
                 lastWeathersHash = weathersHash
-                lastWeatherCatalogHash = weatherCatalogHash
                 lastFruitHash = fh
-                lastAuctionHash = auctionHash
-                lastShopsHash = shopsHash
-                if auctionChanged then
-                    pcall(sendAuctionUpdateInstant)
-                end
-                -- Pass the freshly scraped fruit list so updateAPI doesn't re-scrape,
-                -- and the data sent to the API is guaranteed current.
+                -- Pass the cached/live snapshot through so the fallback does not
+                -- perform a second fruit/catalog/auction/shop reconstruction.
                 updateAPI(freshFruits)
             end
         end)
@@ -6326,10 +6549,13 @@ safeTaskSpawn(function()
     end
 end)
 
--- Fallback periodic update: scrape everything fresh inside updateAPI (fruitData=nil
--- means "scrape fresh"), guaranteeing the site gets current data even if the fast
--- poll detected no change (e.g. UI re-opened, values rotated server-side).
+local loadingScreenBypassApplied = false
+
 local function bypassLoadingScreen()
+    -- Repeating getconnections/GUI walks every API refresh both costs CPU and can
+    -- disconnect the scraper's own listeners.  A fresh teleport runs a new script,
+    -- so one successful pass per script run is enough.
+    if loadingScreenBypassApplied and clientOptimized then return end
     refreshRuntimeRefs()
     local currentPlayerGui = PlayerGui or waitForChildSoft(LocalPlayer, "PlayerGui", 10)
     if not currentPlayerGui then return end
@@ -6375,6 +6601,7 @@ local function bypassLoadingScreen()
             workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
             writeDebugLog("Reset camera locked by loading screen")
         end
+        loadingScreenBypassApplied = true
     end)
 end
 
