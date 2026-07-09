@@ -1766,40 +1766,6 @@ function sortDirectShopItems(items)
     return items
 end
 
--- Keep every live StockValues entry, even when a just-released item is missing
--- from an executor's cached catalogue.  Metadata may be unknown in that rare
--- case, but the site still receives its real name and stock instead of hiding it.
-function appendUnmappedLiveStockItems(items, shopName, stockIndex, overrides, normalizedOverrides)
-    if not stockIndex or not stockIndex.entries then return end
-    local known = {}
-    for _, item in ipairs(items) do
-        local key = normalizeName(item.name)
-        if key ~= "" then known[key] = true end
-    end
-    for _, stockObject in ipairs(stockIndex.entries) do
-        local name = tostring(stockObject.Name or "")
-        local key = normalizeName(name)
-        if name ~= "" and key ~= "" and not known[key] then
-            local item = makeDirectShopItem(
-                shopName,
-                name,
-                stockIndex,
-                nil,
-                "Unknown",
-                nil,
-                999999999,
-                overrides,
-                normalizedOverrides,
-                "stock-only"
-            )
-            if item then
-                known[key] = true
-                table.insert(items, item)
-            end
-        end
-    end
-end
-
 function buildDirectSeedShop()
     local seedData = getRequiredSharedModule("SeedData")
     if type(seedData) ~= "table" then return {} end
@@ -1823,7 +1789,6 @@ function buildDirectSeedShop()
             if item then table.insert(items, item) end
         end
     end
-    appendUnmappedLiveStockItems(items, shopName, stockIndex, overrides, normalizedOverrides)
     return sortDirectShopItems(items)
 end
 
@@ -1859,7 +1824,6 @@ function buildDirectGearShop()
             if item then table.insert(items, item) end
         end
     end
-    appendUnmappedLiveStockItems(items, shopName, stockIndex, overrides, normalizedOverrides)
     return sortDirectShopItems(items)
 end
 
@@ -1893,7 +1857,6 @@ function buildDirectCrateShop()
             if item then table.insert(items, item) end
         end
     end
-    appendUnmappedLiveStockItems(items, shopName, stockIndex, overrides, normalizedOverrides)
     return sortDirectShopItems(items)
 end
 
