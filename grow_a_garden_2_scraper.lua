@@ -72,6 +72,42 @@ end
 
 local LocalPlayer = waitForLocalPlayer(60)
 
+-- Every persistent listener belongs to this script run.  A Roblox executor
+-- keeps old RBXScriptConnection objects alive when the user executes a newer
+-- version of a script in the same session; those orphan listeners were able to
+-- multiply UI/world work after a few restarts.  Dispose the previous run first
+-- and track this run's listeners so the next launch stays at one listener per
+-- signal.
+local activeRunConnections = {}
+
+local function disconnectPreviousRunConnections()
+    pcall(function()
+        local env = getgenv and getgenv() or nil
+        if type(env) ~= "table" then return end
+        local previous = env.__GAG2_STOCKER_CONNECTIONS
+        if type(previous) == "table" then
+            for index = #previous, 1, -1 do
+                local connection = previous[index]
+                pcall(function()
+                    if connection and connection.Disconnect then
+                        connection:Disconnect()
+                    end
+                end)
+                previous[index] = nil
+            end
+        end
+        local previousSocket = env.__GAG2_STOCKER_WEBSOCKET
+        if previousSocket then
+            pcall(function() previousSocket:Close() end)
+            pcall(function() previousSocket:close() end)
+        end
+        env.__GAG2_STOCKER_WEBSOCKET = nil
+        env.__GAG2_STOCKER_CONNECTIONS = activeRunConnections
+    end)
+end
+
+disconnectPreviousRunConnections()
+
 -- ================= CONFIGURATION =================
 local API_URL = "https://growagarden2stock.site/api/update-stock"
 local API_PASSWORD = "mySuperSecretToken123"
@@ -80,6 +116,12 @@ local POLL_INTERVAL = 15         -- Lightweight fallback only.  Do not repeatedl
 local FRUIT_REQUEST_INTERVAL = 15 -- Fallback remote refresh interval if Snapshot event is missed
 local DEBUG = false             -- Set to true only to diagnose scraper issues
 local MOBILE_SAFE_MODE = UserInputService and UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+-- This script does not need a visible game world.  MuMu reports itself as a
+-- touch-only device, which previously disabled the strongest optimizations and
+-- left the entire map rendering at full cost.  Keep the mode explicit so a
+-- person who wants to play manually can turn it off before executing.
+local HEADLESS_SCRAPER_MODE = true
+local HEADLESS_FPS_CAP = 5
 local DESTROY_WORLD_ASSETS = true -- Aggressively remove local 3D junk; protected data containers stay intact.
 local AUTO_RECONNECT = true       -- Rejoin the game when Roblox shows disconnect/error prompt.
 local LOAD_WATCHDOG_TIMEOUT = 180 -- Rejoin if core game objects never appear after this many seconds.
@@ -95,6 +137,7 @@ pcall(function()
     local env = getgenv and getgenv() or nil
     if type(env) == "table" then
         env.__GAG2_STOCKER_RUN_ID = SCRAPER_RUN_ID
+        env.__GAG2_STOCKER_CONNECTIONS = activeRunConnections
     end
 end)
 
@@ -119,6 +162,31 @@ function isCurrentScraperRun()
         return env.__GAG2_STOCKER_RUN_ID == SCRAPER_RUN_ID
     end
     return true
+end
+
+function trackRunConnection(connection)
+    if connection then
+        table.insert(activeRunConnections, connection)
+    end
+    return connection
+end
+
+-- The guard is intentionally inside the callback too: if an executor cannot
+-- disconnect a proprietary signal, an old run becomes an immediate no-op
+-- instead of continuing to scan Roblox instances.
+function connectRunSignal(signal, callback)
+    if not signal or type(callback) ~= "function" then return nil end
+    local connection = nil
+    local ok = pcall(function()
+        connection = signal:Connect(function(...)
+            if not isCurrentScraperRun() then return end
+            return callback(...)
+        end)
+    end)
+    if ok and connection then
+        return trackRunConnection(connection)
+    end
+    return nil
 end
 
 function safeTaskSpawn(fn)
@@ -249,7 +317,7 @@ function queueScraperAfterTeleport()
 end
 
 function requestReconnect(reason)
-    if not AUTO_RECONNECT or reconnecting then return false end
+    if not isCurrentScraperRun() or not AUTO_RECONNECT or reconnecting then return false end
     reconnecting = true
     refreshRuntimeRefs()
     pcall(function()
@@ -262,6 +330,10 @@ function requestReconnect(reason)
     warn("[Grow a Garden 2 Stocker] Reconnecting: " .. tostring(reason or "Roblox disconnect"))
 
     safeTaskSpawn(function()
+        if not isCurrentScraperRun() then
+            reconnecting = false
+            return
+        end
         pcall(function()
             if type(setfpscap) == "function" then
                 setfpscap(30)
@@ -272,6 +344,10 @@ function requestReconnect(reason)
         local placeId = game.PlaceId
         local jobId = game.JobId
         for attempt = 1, 5 do
+            if not isCurrentScraperRun() then
+                reconnecting = false
+                return
+            end
             local okTeleport = false
             if TeleportService and player and placeId and placeId ~= 0 then
                 if attempt == 1 and type(jobId) == "string" and jobId ~= "" then
@@ -325,7 +401,7 @@ function installAutoReconnectWatchdog()
 
     pcall(function()
         if GuiService and GuiService.ErrorMessageChanged then
-            GuiService.ErrorMessageChanged:Connect(function()
+            connectRunSignal(GuiService.ErrorMessageChanged, function()
                 safeTaskDelay(0.25, function()
                     requestReconnect("GuiService error message")
                 end)
@@ -355,8 +431,8 @@ function installAutoReconnectWatchdog()
             for _, child in ipairs(promptOverlay:GetChildren()) do
                 inspectPrompt(child)
             end
-            promptOverlay.ChildAdded:Connect(inspectPrompt)
-            promptOverlay.DescendantAdded:Connect(function(desc)
+            connectRunSignal(promptOverlay.ChildAdded, inspectPrompt)
+            connectRunSignal(promptOverlay.DescendantAdded, function(desc)
                 if isRobloxDisconnectPrompt(desc) then
                     requestReconnect("Roblox disconnect descendant")
                 end
@@ -364,7 +440,7 @@ function installAutoReconnectWatchdog()
         end
 
         hookPromptGui(CoreGui:FindFirstChild("RobloxPromptGui"))
-        CoreGui.ChildAdded:Connect(function(child)
+        connectRunSignal(CoreGui.ChildAdded, function(child)
             if child.Name == "RobloxPromptGui" then
                 hookPromptGui(child)
             end
@@ -373,7 +449,7 @@ function installAutoReconnectWatchdog()
 
     pcall(function()
         if LocalPlayer and LocalPlayer.OnTeleport then
-            LocalPlayer.OnTeleport:Connect(function(state)
+            connectRunSignal(LocalPlayer.OnTeleport, function(state)
                 queueScraperAfterTeleport()
                 if string.find(tostring(state), "Failed", 1, true) then
                     safeTaskDelay(2, function()
@@ -386,7 +462,7 @@ function installAutoReconnectWatchdog()
 
     pcall(function()
         if TeleportService and TeleportService.TeleportInitFailed then
-            TeleportService.TeleportInitFailed:Connect(function(player)
+            connectRunSignal(TeleportService.TeleportInitFailed, function(player)
                 if not LocalPlayer or player == LocalPlayer then
                     safeTaskDelay(2, function()
                         requestReconnect("teleport init failed")
@@ -430,7 +506,11 @@ function optimizeClient()
         weather = true,
         weatherstate = true,
         environment = true,
-        activeweather = true
+        activeweather = true,
+        timecycle = true,
+        timecyclestate = true,
+        currentphase = true,
+        phase = true
     }
     local protectedPlayerGuiRoots = {
         auction = true,
@@ -461,6 +541,13 @@ function optimizeClient()
     local flushDestroyQueue
 
     flushDestroyQueue = function()
+        if not isCurrentScraperRun() then
+            destroyQueue = {}
+            destroyQueueHead = 1
+            destroyQueueTail = 0
+            destroyFlushScheduled = false
+            return
+        end
         destroyFlushScheduled = false
         local processed = 0
         while destroyQueueHead <= destroyQueueTail and processed < DESTROY_BATCH_SIZE do
@@ -487,7 +574,7 @@ function optimizeClient()
     end
 
     local function safeDestroy(instance)
-        if not instance or not instance.Parent or destroyQueued[instance] then return end
+        if not isCurrentScraperRun() or not instance or not instance.Parent or destroyQueued[instance] then return end
         destroyQueued[instance] = true
         destroyQueueTail = destroyQueueTail + 1
         destroyQueue[destroyQueueTail] = instance
@@ -575,20 +662,36 @@ function optimizeClient()
         end
     end
 
-    -- PC Roblox background FPS optimization (reduces CPU/GPU load to near-zero)
-    if not MOBILE_SAFE_MODE then
-        if type(setfpscap) == "function" then
-            pcall(function() setfpscap(3) end)
-        elseif type(getgenv) == "function" and type(getgenv().setfpscap) == "function" then
-            pcall(function() getgenv().setfpscap(3) end)
+    -- MuMu is touch-only, so the former mobile-safe branch never capped its
+    -- frame rate.  A stock scraper is event/network driven; 5 FPS is plenty
+    -- for it and cuts both emulator CPU and rendering wakeups dramatically.
+    local targetFps = HEADLESS_SCRAPER_MODE and HEADLESS_FPS_CAP or 3
+    local fpsSetters = {}
+    local function addFpsSetter(fn)
+        if type(fn) ~= "function" then return end
+        for _, existing in ipairs(fpsSetters) do
+            if existing == fn then return end
         end
+        table.insert(fpsSetters, fn)
+    end
+    addFpsSetter(setfpscap)
+    addFpsSetter(set_fps_cap)
+    pcall(function()
+        local env = getgenv and getgenv() or nil
+        if type(env) == "table" then
+            addFpsSetter(env.setfpscap)
+            addFpsSetter(env.set_fps_cap)
+        end
+    end)
+    for _, setCap in ipairs(fpsSetters) do
+        local ok = pcall(function() setCap(targetFps) end)
+        if ok then break end
     end
 
     -- 1. Stop 3D world rendering entirely.
-    -- Some mobile executors (Delta/Android) become unstable when 3D rendering
-    -- is disabled or the whole Workspace is locally destroyed, so phones use a
-    -- lighter optimization profile.
-    if not MOBILE_SAFE_MODE then
+    -- Headless mode opts into this on MuMu too.  The data sources below are
+    -- replicated modules/events, not rendered pixels.
+    if HEADLESS_SCRAPER_MODE or not MOBILE_SAFE_MODE then
         pcall(function() RunService:Set3dRenderingEnabled(false) end)
     end
 
@@ -608,7 +711,7 @@ function optimizeClient()
             for _, desc in ipairs(workspace:GetDescendants()) do
                 optimizeGraphics(desc)
             end
-            workspace.DescendantAdded:Connect(optimizeGraphics)
+            connectRunSignal(workspace.DescendantAdded, optimizeGraphics)
         end)
     end
 
@@ -628,7 +731,7 @@ function optimizeClient()
     end)
 
     -- 4. Move the camera far away so almost everything is frustum-culled.
-    if not MOBILE_SAFE_MODE then
+    if HEADLESS_SCRAPER_MODE or not MOBILE_SAFE_MODE then
         pcall(function()
             local cam = workspace.CurrentCamera
             if cam then
@@ -643,23 +746,19 @@ function optimizeClient()
         game:GetService("StarterGui"):SetCoreGuiEnabled(Enum.CoreGuiType.All, false)
     end)
 
-    -- 6. Mute all sounds.
+    -- 6. Mute sounds without a global game.DescendantAdded listener.  That
+    -- listener wakes up for every replicated object and is very costly in a
+    -- busy server; unprotected world roots are removed separately below.
     pcall(function()
-        game:GetService("SoundService").AmbientReverb = Enum.ReverbType.NoReverb
-        for _, sound in ipairs(game:GetDescendants()) do
+        local soundService = game:GetService("SoundService")
+        soundService.AmbientReverb = Enum.ReverbType.NoReverb
+        pcall(function() soundService.Volume = 0 end)
+        for _, sound in ipairs(soundService:GetDescendants()) do
             if sound:IsA("Sound") then
                 sound:Stop()
                 sound.Volume = 0
-                safeDestroy(sound)
             end
         end
-        game.DescendantAdded:Connect(function(desc)
-            if desc:IsA("Sound") then
-                desc:Stop()
-                desc.Volume = 0
-                safeDestroy(desc)
-            end
-        end)
     end)
 
     local function isProtectedPlayerGui(instance)
@@ -693,15 +792,16 @@ function optimizeClient()
     pcall(function()
         cleanPlayerGui()
         if PlayerGui then
-            PlayerGui.ChildAdded:Connect(function(child)
+            connectRunSignal(PlayerGui.ChildAdded, function(child)
                 safeTaskDefer(function()
+                    if not isCurrentScraperRun() then return end
                     cleanPlayerGuiInstance(child)
                 end)
             end)
             -- Keep the protected shop/weather screens intact, but discard only the
             -- expensive dynamic widgets as they are replicated.  This replaces the
             -- old recurring full PlayerGui walk.
-            PlayerGui.DescendantAdded:Connect(function(desc)
+            connectRunSignal(PlayerGui.DescendantAdded, function(desc)
                 if desc:IsA("ViewportFrame") or desc:IsA("VideoFrame") or desc:IsA("Sound") then
                     safeDestroy(desc)
                 end
@@ -747,22 +847,17 @@ function optimizeClient()
         end
     end
 
-    if DESTROY_WORLD_ASSETS and not MOBILE_SAFE_MODE then
+    if DESTROY_WORLD_ASSETS and (HEADLESS_SCRAPER_MODE or not MOBILE_SAFE_MODE) then
         local function cleanupWorldPass()
-            workspace.Terrain:Clear()
-            local descendants = workspace:GetDescendants()
-            for index, desc in ipairs(descendants) do
-                cleanInstance(desc)
-                if index % 350 == 0 then safeTaskWait(0.03) end
-            end
-            for index = #descendants, 1, -1 do
-                local desc = descendants[index]
-                if desc and desc.Parent and not hasProtectedWorkspaceAncestor(desc)
-                   and (desc:IsA("Model") or desc:IsA("Folder"))
-                   and #desc:GetChildren() == 0 then
-                    safeDestroy(desc)
-                end
-                if index % 500 == 0 then safeTaskWait(0.03) end
+            pcall(function() workspace.Terrain:Clear() end)
+            -- Destroying an unprotected top-level map root makes a full
+            -- GetDescendants() walk unnecessary.  It is far cheaper at startup
+            -- and preserves the explicitly protected state roots above.
+            local roots = workspace:GetChildren()
+            for index, root in ipairs(roots) do
+                if not isCurrentScraperRun() then return end
+                cleanInstance(root)
+                if index % 24 == 0 then safeTaskWait(0.03) end
             end
         end
 
@@ -793,6 +888,13 @@ function optimizeClient()
         end
 
         flushCleanupQueue = function()
+            if not isCurrentScraperRun() then
+                cleanupQueue = {}
+                cleanupQueueHead = 1
+                cleanupQueueTail = 0
+                cleanupFlushScheduled = false
+                return
+            end
             cleanupFlushScheduled = false
             local processed = 0
             while cleanupQueueHead <= cleanupQueueTail and processed < WORLD_CLEANUP_BATCH_SIZE do
@@ -819,7 +921,7 @@ function optimizeClient()
         end
 
         local function queueWorldCleanup(instance)
-            if not isWorldCleanupCandidate(instance) or cleanupQueued[instance] then return end
+            if not isCurrentScraperRun() or not isWorldCleanupCandidate(instance) or cleanupQueued[instance] then return end
             cleanupQueued[instance] = true
             cleanupQueueTail = cleanupQueueTail + 1
             cleanupQueue[cleanupQueueTail] = instance
@@ -832,7 +934,7 @@ function optimizeClient()
         safeTaskSpawn(function()
             pcall(cleanupWorldPass)
         end)
-        workspace.ChildAdded:Connect(queueWorldCleanup)
+        connectRunSignal(workspace.ChildAdded, queueWorldCleanup)
     end
 
     -- 8. Black overlay.
@@ -1358,10 +1460,13 @@ end
 -- ================== WEBSOCKET CLIENT ==================
 local wsConnection = nil
 local isWsConnecting = false
+local wsNextConnectAttemptAt = 0
+local WEBSOCKET_RECONNECT_COOLDOWN = 12
 
 function getWebSocketClient()
     if wsConnection then return wsConnection end
     if isWsConnecting then return nil end
+    if os.clock() < wsNextConnectAttemptAt then return nil end
     
     local wsConnectFunc = WebSocket and WebSocket.connect or (syn and syn.websocket and syn.websocket.connect)
     if not wsConnectFunc then
@@ -1370,6 +1475,10 @@ function getWebSocketClient()
     
     isWsConnecting = true
     safeTaskSpawn(function()
+        if not isCurrentScraperRun() then
+            isWsConnecting = false
+            return
+        end
         local wsUrl = API_URL:gsub("https://", "wss://"):gsub("http://", "ws://")
         if wsUrl:sub(-10) == "/api/stock" then
             wsUrl = wsUrl:sub(1, -11)
@@ -1387,31 +1496,51 @@ function getWebSocketClient()
         
         isWsConnecting = false
         if success and ws then
+            if not isCurrentScraperRun() then
+                pcall(function() ws:Close() end)
+                pcall(function() ws:close() end)
+                return
+            end
             if DEBUG then
                 print("[Grow a Garden 2 Stocker] WebSocket connected successfully!")
             end
             wsConnection = ws
+            wsNextConnectAttemptAt = 0
+            pcall(function()
+                local env = getgenv and getgenv() or nil
+                if type(env) == "table" then
+                    env.__GAG2_STOCKER_WEBSOCKET = ws
+                end
+            end)
             
             local onMessage = ws.OnMessage or ws.on_message
             local onClose = ws.OnClose or ws.on_close
             
             if onClose then
-                onClose:Connect(function()
+                connectRunSignal(onClose, function()
                     if DEBUG then
                         print("[Grow a Garden 2 Stocker] WebSocket closed.")
                     end
                     wsConnection = nil
+                    wsNextConnectAttemptAt = os.clock() + WEBSOCKET_RECONNECT_COOLDOWN
+                    pcall(function()
+                        local env = getgenv and getgenv() or nil
+                        if type(env) == "table" and env.__GAG2_STOCKER_WEBSOCKET == ws then
+                            env.__GAG2_STOCKER_WEBSOCKET = nil
+                        end
+                    end)
                 end)
             end
             
             if onMessage then
-                onMessage:Connect(function(msg)
+                connectRunSignal(onMessage, function(msg)
                     if DEBUG then
                         print("[Grow a Garden 2 Stocker] WebSocket msg: " .. tostring(msg))
                     end
                 end)
             end
         else
+            wsNextConnectAttemptAt = os.clock() + WEBSOCKET_RECONNECT_COOLDOWN
             warn("[Grow a Garden 2 Stocker] WebSocket connection failed: " .. tostring(ws))
         end
     end)
@@ -3363,12 +3492,33 @@ local auctionDataCache = nil
 local auctionDataCacheAt = -999
 local auctionRefreshProbeToken = 0
 local auctionRefreshProbeActive = false
+local auctionPublishQueued = false
+local AUCTION_PUBLISH_DEBOUNCE_SECONDS = 0.12
 
 function invalidateAuctionCaches()
     auctionGuiDataCache = nil
     auctionGuiDataCacheAt = -999
     auctionDataCache = nil
     auctionDataCacheAt = -999
+end
+
+-- Snapshot and StockUpdate can arrive as a burst.  They contain only auction
+-- state, so publish that compact payload once after the burst instead of
+-- rebuilding/serializing the whole site payload for every individual signal.
+function scheduleAuctionPublish()
+    if not isCurrentScraperRun() or auctionPublishQueued then return end
+    auctionPublishQueued = true
+    safeTaskDelay(AUCTION_PUBLISH_DEBOUNCE_SECONDS, function()
+        auctionPublishQueued = false
+        if not isCurrentScraperRun() then return end
+        local ok, sent = pcall(sendAuctionUpdateInstant)
+        -- Keep the old reliability guarantee: if the compact WebSocket route
+        -- is unavailable, immediately use the normal HTTP/WebSocket stock
+        -- publisher instead of waiting for the periodic safety refresh.
+        if not ok or not sent then
+            updateAPI(nil)
+        end
+    end)
 end
 
 function scheduleAuctionRefreshProbe()
@@ -3379,12 +3529,16 @@ function scheduleAuctionRefreshProbe()
     local delays = { 0.35, 0.8, 1.4, 2.4, 3.8, 5.5, 7.5, 10.0 }
     for index, delaySeconds in ipairs(delays) do
         safeTaskDelay(delaySeconds, function()
+            if not isCurrentScraperRun() then return end
             if token ~= auctionRefreshProbeToken then return end
             invalidateAuctionCaches()
             local auctionData = getAuctionData()
             local refreshAt = type(auctionData) == "table" and tonumber(auctionData.refreshAt or 0) or 0
             if refreshAt > getServerNow() then
-                pcall(sendAuctionUpdateInstant)
+                local ok, sent = pcall(sendAuctionUpdateInstant)
+                if not ok or not sent then
+                    updateAPI(nil)
+                end
                 auctionRefreshProbeActive = false
                 auctionRefreshProbeToken = auctionRefreshProbeToken + 1
             elseif index == #delays then
@@ -3416,7 +3570,7 @@ local function wrapRawRemote(remote)
         end
         wrapper.OnClientEvent = remote.OnClientEvent
         wrapper.Connect = function(self, callback)
-            return remote.OnClientEvent:Connect(callback)
+            return connectRunSignal(remote.OnClientEvent, callback)
         end
     elseif remote:IsA("RemoteFunction") then
         wrapper.Invoke = function(self, ...)
@@ -3558,30 +3712,37 @@ local function connectNetworkSignal(signal, callback)
         return signal.OnClientEvent
     end)
     if okEvent and event and event.Connect then
-        local ok = pcall(function()
-            event:Connect(callback)
+        local ok, connection = pcall(function()
+            return connectRunSignal(event, callback)
         end)
-        if ok then return true end
+        if ok and connection then return true end
     end
 
     local okBindable, bindableEvent = pcall(function()
         return signal.Event
     end)
     if okBindable and bindableEvent and bindableEvent.Connect then
-        local ok = pcall(function()
-            bindableEvent:Connect(callback)
+        local ok, connection = pcall(function()
+            return connectRunSignal(bindableEvent, callback)
         end)
-        if ok then return true end
+        if ok and connection then return true end
     end
 
     local okConnect, connectFn = pcall(function()
         return signal.Connect
     end)
     if okConnect and type(connectFn) == "function" then
+        local connection = nil
         local ok = pcall(function()
-            connectFn(signal, callback)
+            connection = connectFn(signal, function(...)
+                if not isCurrentScraperRun() then return end
+                return callback(...)
+            end)
         end)
-        if ok then return true end
+        if ok and connection then
+            trackRunConnection(connection)
+            return true
+        end
     end
 
     local okOn, onFn = pcall(function()
@@ -4158,7 +4319,7 @@ function applyAuctionSnapshot(snapshot)
     if incomingHasLots then
         latestAuctionSnapshotAt = latestAuctionAt
     end
-    pcall(sendAuctionUpdateInstant)
+    scheduleAuctionPublish()
     if incomingHasLots and (lotsChanged or previousLotKey == "") then
         scheduleAuctionRefreshProbe()
     end
@@ -4185,7 +4346,7 @@ function applyAuctionStockUpdate(update, maybeStock)
     latestAuctionStockAt = os.clock()
     latestAuctionAt = latestAuctionStockAt
     writeDebugLog("Auction stock update applied")
-    pcall(sendAuctionUpdateInstant)
+    scheduleAuctionPublish()
     return true
 end
 
@@ -5085,6 +5246,17 @@ local fruitImagesFolderConnected = false
 local fruitImageCacheBuilt = false
 local fruitListCache = nil
 
+-- FruitImages.Bamboo is currently a Roblox PrivateImage placeholder.  The
+-- verified public Bamboo SeedImages asset is used when that bad image appears.
+local FRUIT_IMAGE_FALLBACKS = {
+    bamboo = "131560215426602"
+}
+local INVALID_FRUIT_IMAGE_ASSETS = {
+    bamboo = {
+        ["70571153233151"] = true
+    }
+}
+
 function getFruitImagesFolder()
     local root = SharedModules or ReplicatedStorage:FindFirstChild("SharedModules")
     local seedData = root and root:FindFirstChild("SeedData")
@@ -5126,7 +5298,7 @@ end
 
 function watchFruitImageEntry(entry)
     if not entry or fruitImagesWatched[entry] then return end
-    fruitImagesWatched[entry] = entry.Changed:Connect(function()
+    fruitImagesWatched[entry] = connectRunSignal(entry.Changed, function()
         setFruitImageCacheValue(entry)
     end)
 end
@@ -5137,11 +5309,11 @@ function ensureFruitImageCache()
 
     if not fruitImagesFolderConnected then
         fruitImagesFolderConnected = true
-        folder.ChildAdded:Connect(function(entry)
+        connectRunSignal(folder.ChildAdded, function(entry)
             setFruitImageCacheValue(entry)
             watchFruitImageEntry(entry)
         end)
-        folder.ChildRemoved:Connect(function(entry)
+        connectRunSignal(folder.ChildRemoved, function(entry)
             removeFruitImageCacheValue(entry)
             local conn = fruitImagesWatched[entry]
             if conn then
@@ -5163,7 +5335,13 @@ function getFruitImage(fruitName)
     ensureFruitImageCache()
     local name = cleanScrapedName(fruitName)
     if not name then return nil end
-    return fruitImageCache[name] or fruitImageCacheByKey[normalizeName(name)]
+    local key = normalizeName(name)
+    local image = fruitImageCache[name] or fruitImageCacheByKey[key]
+    local assetId = normalizeAssetRef(image)
+    if INVALID_FRUIT_IMAGE_ASSETS[key] and INVALID_FRUIT_IMAGE_ASSETS[key][assetId] then
+        image = nil
+    end
+    return image or FRUIT_IMAGE_FALLBACKS[key]
 end
 
 -- ================== FRUIT VALUE CALCULATOR DATA SOURCE ==================
@@ -5618,8 +5796,10 @@ function getCalculatorData()
 
     local sellValueData = safeRequireModule(getSharedModule("SellValueData"))
     local seedData = safeRequireModule(getSharedModule("SeedData"))
+    local seedShopEnabled = safeRequireModule(getSharedModule("SeedShopEnabled"))
     local mutationData = collectMutationEntriesFromInstance(getSharedModule("MutationData"))
-    if type(sellValueData) ~= "table" then
+    local isSeedEnabled = type(seedShopEnabled) == "table" and seedShopEnabled.IsSeedEnabled or nil
+    if type(sellValueData) ~= "table" or type(isSeedEnabled) ~= "function" then
         return calculatorDataCache
     end
 
@@ -5674,7 +5854,13 @@ function getCalculatorData()
     local fruits = {}
     for fruitName, baseValue in pairs(sellValueData) do
         local value = tonumber(baseValue)
-        if type(fruitName) == "string" and value and value >= 0 then
+        local enabledOk, enabled = false, false
+        if type(fruitName) == "string" then
+            enabledOk, enabled = pcall(function()
+                return isSeedEnabled(fruitName)
+            end)
+        end
+        if type(fruitName) == "string" and value and value >= 0 and enabledOk and enabled == true then
             local cleanName = cleanScrapedName(fruitName)
             local meta = seedMeta[fruitName] or seedMeta[normalizeName(fruitName)] or {}
             local averageWeight = tonumber(meta.averageWeight) or getDefaultPlantAverageSize()
@@ -5719,6 +5905,84 @@ local fruitNextRefreshUnix = 0
 local fruitRequestPending = false
 local lastFruitRequestAt = -FRUIT_REQUEST_INTERVAL
 local fruitSnapshotConnected = false
+
+-- FruitImages is only an icon folder. It also contains internal template and
+-- model entries (for example FruitPart), so it must never be used as the
+-- source of truth for the multiplier list. The game's own multiplier UI uses
+-- SellValueData together with SeedShopEnabled.IsSeedEnabled; mirror that
+-- authoritative list here and cache it because these modules do not change on
+-- every stock tick.
+local liveMultiplierFruitCatalog = nil
+local liveMultiplierFruitCatalogAt = -60
+local liveMultiplierFruitCatalogRevision = 0
+local fruitListCacheRevision = -1
+local LIVE_MULTIPLIER_FRUIT_CATALOG_REFRESH_INTERVAL = 60
+
+local function getLiveMultiplierFruitCatalog()
+    local now = os.clock()
+    if liveMultiplierFruitCatalog and (now - liveMultiplierFruitCatalogAt) < LIVE_MULTIPLIER_FRUIT_CATALOG_REFRESH_INTERVAL then
+        return liveMultiplierFruitCatalog
+    end
+
+    local sellValueData = safeRequireModule(getSharedModule("SellValueData"))
+    local seedShopEnabled = safeRequireModule(getSharedModule("SeedShopEnabled"))
+    local isSeedEnabled = type(seedShopEnabled) == "table" and seedShopEnabled.IsSeedEnabled or nil
+
+    -- Fail closed rather than publishing the contents of FruitImages when the
+    -- authoritative game modules are temporarily unavailable. A previously
+    -- validated list remains available, so this cannot create a fake list
+    -- during a short replication delay.
+    if type(sellValueData) ~= "table" or type(isSeedEnabled) ~= "function" then
+        return liveMultiplierFruitCatalog
+    end
+
+    local catalog = {}
+    for fruitName in pairs(sellValueData) do
+        if type(fruitName) == "string" then
+            local cleanName = cleanScrapedName(fruitName)
+            local key = normalizeName(cleanName)
+            if cleanName and cleanName ~= "" and key ~= "" then
+                local enabledOk, enabled = pcall(function()
+                    return isSeedEnabled(fruitName)
+                end)
+                if enabledOk and enabled == true then
+                    catalog[key] = cleanName
+                end
+            end
+        end
+    end
+
+    if next(catalog) == nil then
+        return liveMultiplierFruitCatalog
+    end
+
+    local changed = not liveMultiplierFruitCatalog
+    if not changed then
+        for key, name in pairs(catalog) do
+            if liveMultiplierFruitCatalog[key] ~= name then
+                changed = true
+                break
+            end
+        end
+        if not changed then
+            for key in pairs(liveMultiplierFruitCatalog) do
+                if catalog[key] == nil then
+                    changed = true
+                    break
+                end
+            end
+        end
+    end
+
+    liveMultiplierFruitCatalog = catalog
+    liveMultiplierFruitCatalogAt = now
+    if changed then
+        liveMultiplierFruitCatalogRevision = liveMultiplierFruitCatalogRevision + 1
+        fruitListCache = nil
+        fruitListCacheRevision = -1
+    end
+    return liveMultiplierFruitCatalog
+end
 
 function applyFruitSnapshot(snapshot)
     if type(snapshot) ~= "table" then return false end
@@ -5857,14 +6121,14 @@ function connectFruitStockSnapshot(onSnapshot)
     local connected = false
     local ok, err = pcall(function()
         if snapshotEvent.OnClientEvent then
-            snapshotEvent.OnClientEvent:Connect(function(snapshot)
+            connectRunSignal(snapshotEvent.OnClientEvent, function(snapshot)
                 if applyFruitSnapshot(snapshot) and onSnapshot then
                     onSnapshot()
                 end
             end)
             connected = true
         elseif snapshotEvent.Connect then
-            snapshotEvent:Connect(function(snapshot)
+            connectRunSignal(snapshotEvent, function(snapshot)
                 if applyFruitSnapshot(snapshot) and onSnapshot then
                     onSnapshot()
                 end
@@ -5896,17 +6160,10 @@ function addFruitName(list, seen, name)
     table.insert(list, cleanName)
 end
 
-function getKnownFruitNames()
-    ensureFruitImageCache()
-
+function getKnownFruitNames(liveCatalog)
     local names = {}
     local seen = {}
-
-    for fruitName in pairs(fruitImageCache) do
-        addFruitName(names, seen, fruitName)
-    end
-
-    for fruitName in pairs(latestFruitEntries) do
+    for _, fruitName in pairs(liveCatalog or {}) do
         addFruitName(names, seen, fruitName)
     end
 
@@ -5926,10 +6183,16 @@ function getFruitMultipliers()
     if latestFruitSnapshotAt == 0 or (os.clock() - latestFruitSnapshotAt) > FRUIT_REQUEST_INTERVAL then
         requestFruitSnapshot(false)
     end
-    if fruitListCache and #fruitListCache > 0 then return fruitListCache end
+    local liveCatalog = getLiveMultiplierFruitCatalog()
+    if not liveCatalog then
+        return fruitListCache or {}
+    end
+    if fruitListCache and #fruitListCache > 0 and fruitListCacheRevision == liveMultiplierFruitCatalogRevision then
+        return fruitListCache
+    end
 
     local multipliers = {}
-    for _, fruitName in ipairs(getKnownFruitNames()) do
+    for _, fruitName in ipairs(getKnownFruitNames(liveCatalog)) do
         local entry = getFruitEntry(fruitName)
         local multiplier = entry and tonumber(entry.multiplier) or 1
         local tier = entry and entry.tier or "normal"
@@ -5951,6 +6214,7 @@ function getFruitMultipliers()
 
     if #multipliers > 0 then
         fruitListCache = multipliers
+        fruitListCacheRevision = liveMultiplierFruitCatalogRevision
     end
     return multipliers
 end
@@ -6014,6 +6278,10 @@ function sendAuctionUpdateInstant()
             if DEBUG then
                 warn("[Grow a Garden 2 Stocker] Failed to send instant auction update: " .. tostring(err))
             end
+            pcall(function() ws:Close() end)
+            pcall(function() ws:close() end)
+            wsConnection = nil
+            wsNextConnectAttemptAt = os.clock() + WEBSOCKET_RECONNECT_COOLDOWN
         end
     end
     return false
@@ -6075,6 +6343,10 @@ function updateAPI(fruitData)
             end
         end
 
+        local activeFruitCatalog = getLiveMultiplierFruitCatalog()
+        local activeFruitNames = activeFruitCatalog and getKnownFruitNames(activeFruitCatalog) or nil
+        local liveFruitMultipliers = dataToSend or fruitData or getFruitMultipliers()
+
         local data = {
             password = API_PASSWORD,
             jobId = game.JobId ~= "" and game.JobId or "studio",
@@ -6094,7 +6366,12 @@ function updateAPI(fruitData)
             },
             -- ALWAYS send live fruit data (never a stale cache) so the website reflects
             -- in-game multiplier changes immediately.
-            fruitMultipliers = dataToSend or fruitData or getFruitMultipliers(),
+            fruitMultipliers = liveFruitMultipliers,
+            -- Explicit allow-list from the same live game gate used by the
+            -- official multiplier UI. The server keeps this with the snapshot
+            -- so an old FruitImages/template entry cannot reappear after a
+            -- refresh or reconnect.
+            fruitMultiplierCatalog = activeFruitNames,
             -- Seconds until the next in-game multiplier refresh (dynamic countdown).
             fruitRefreshTimer = getFruitRefreshTimer(),
             calculatorData = getCalculatorData(),
@@ -6102,13 +6379,11 @@ function updateAPI(fruitData)
         }
 
         safeTaskSpawn(function()
-            local encodeOk, encoded = pcall(function() return HttpService:JSONEncode(data) end)
-            if not encodeOk then
-                warn("[Grow a Garden 2 Stocker] JSON encoding failed: " .. tostring(encoded))
-                return
-            end
+            if not isCurrentScraperRun() then return end
 
-            -- Try updating via WebSocket first
+            -- WebSocket is the normal route.  Encode only its wrapper first;
+            -- JSON-encoding the entire stock payload for HTTP as well was
+            -- wasted work whenever the WebSocket send succeeded.
             local ws = getWebSocketClient()
             if ws then
                 local wsPayload = {
@@ -6133,11 +6408,17 @@ function updateAPI(fruitData)
                         pcall(function() ws:Close() end)
                         pcall(function() ws:close() end)
                         wsConnection = nil
+                        wsNextConnectAttemptAt = os.clock() + WEBSOCKET_RECONNECT_COOLDOWN
                     end
                 end
             end
 
             -- Fallback HTTP POST update
+            local encodeOk, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+            if not encodeOk then
+                warn("[Grow a Garden 2 Stocker] JSON encoding failed: " .. tostring(encoded))
+                return
+            end
             local ok, response = makeHttpRequest(API_URL, "POST",
                 { ["Content-Type"] = "application/json", ["X-API-Password"] = API_PASSWORD }, encoded)
             if ok then
@@ -6164,9 +6445,7 @@ pcall(function()
 end)
 
 pcall(function()
-    connectAuctionSnapshot(function()
-        updateAPI(nil)
-    end)
+    connectAuctionSnapshot()
     requestAuctionSnapshot(true)
 end)
 
@@ -6176,10 +6455,11 @@ safeTaskSpawn(function()
             updateAPI(nil)
             return
         end
-        connectAuctionSnapshot(function()
-            updateAPI(nil)
-        end)
-        local gotSnapshot = requestAuctionSnapshot(true)
+        connectAuctionSnapshot()
+        -- The first request is immediate.  Subsequent retries respect the
+        -- endpoint throttle instead of firing up to 24 Remote requests during
+        -- startup when a RemoteEvent simply has no return value.
+        local gotSnapshot = requestAuctionSnapshot(attempt == 1)
         if gotSnapshot or (latestAuctionSnapshot and type(getAuctionRawLots(latestAuctionSnapshot)) == "table") then
             writeDebugLog("Auction startup snapshot ready on attempt " .. tostring(attempt))
             updateAPI(nil)
@@ -6207,9 +6487,7 @@ safeTaskSpawn(function()
     while not (auctionSnapshotConnected and auctionStockConnected) do
         if not isCurrentScraperRun() then return end
         safeTaskWait(5)
-        connectAuctionSnapshot(function()
-            updateAPI(nil)
-        end)
+        connectAuctionSnapshot()
         if not latestAuctionSnapshot then
             requestAuctionSnapshot(false)
         end
@@ -6227,10 +6505,7 @@ safeTaskSpawn(function()
         -- immediately.  Poll only as a health fallback when an event is missing
         -- or no fresh snapshot has arrived for a while.
         if not eventDriven or snapshotStale then
-            local gotSnapshot = requestAuctionSnapshot(false)
-            if gotSnapshot then
-                updateAPI(nil)
-            end
+            requestAuctionSnapshot(false)
         end
         safeTaskWait(eventDriven and AUCTION_EVENT_HEALTH_INTERVAL or 5)
     end
@@ -6240,7 +6515,9 @@ safeTaskSpawn(function()
     while latestFruitSnapshotAt <= 0 do
         if not isCurrentScraperRun() then return end
         safeTaskWait(10)
-        requestFruitSnapshot(true)
+        -- Startup already made an immediate forced request.  Respect the
+        -- remote throttle on retries rather than issuing overlapping calls.
+        requestFruitSnapshot(false)
     end
 end)
 
@@ -6275,7 +6552,7 @@ end
 function watchStockValueObject(shopName, valueObject)
     if not valueObject or stockValueConnections[valueObject] then return end
     local ok, conn = pcall(function()
-        return valueObject:GetPropertyChangedSignal("Value"):Connect(function()
+        return connectRunSignal(valueObject:GetPropertyChangedSignal("Value"), function()
             scheduleStockValuesUpdate(shopName, 0.08)
         end)
     end)
@@ -6291,7 +6568,7 @@ function watchStockItemsFolder(shopName, itemsFolder)
     end
     if stockValueConnections[itemsFolder] then return end
     local childAddedOk, childAddedConn = pcall(function()
-        return itemsFolder.ChildAdded:Connect(function(itemValue)
+        return connectRunSignal(itemsFolder.ChildAdded, function(itemValue)
             watchStockValueObject(shopName, itemValue)
             scheduleStockValuesUpdate(shopName, 0.12)
         end)
@@ -6301,7 +6578,7 @@ function watchStockItemsFolder(shopName, itemsFolder)
     end
     if not stockItemsFolderRemovalConnections[itemsFolder] then
         local childRemovedOk, childRemovedConn = pcall(function()
-            return itemsFolder.ChildRemoved:Connect(function()
+            return connectRunSignal(itemsFolder.ChildRemoved, function()
                 scheduleStockValuesUpdate(shopName, 0.12)
             end)
         end)
@@ -6336,7 +6613,7 @@ function watchShopPriceOverrideFlags()
             for _, signalName in ipairs({ "Changed", "Loaded" }) do
                 local ok, conn = pcall(function()
                     local signal = replica[signalName]
-                    return signal and signal.Connect and signal:Connect(refreshShopPrices) or nil
+                    return signal and signal.Connect and connectRunSignal(signal, refreshShopPrices) or nil
                 end)
                 if ok and conn then
                     connected = true
@@ -6361,7 +6638,7 @@ function watchStockShopFolder(shopFolder)
     watchStockItemsFolder(shopName, shopFolder:FindFirstChild("Items"))
     if not stockValueConnections[shopFolder] then
         local ok, conn = pcall(function()
-            return shopFolder.ChildAdded:Connect(function(child)
+            return connectRunSignal(shopFolder.ChildAdded, function(child)
                 if child.Name == "Items" then
                     watchStockItemsFolder(shopName, child)
                 elseif child.Name == "UnixNextRestock" or child.Name == "UnixLastRestock" then
@@ -6376,7 +6653,7 @@ function watchStockShopFolder(shopFolder)
     end
     if not stockShopFolderRemovalConnections[shopFolder] then
         local ok, conn = pcall(function()
-            return shopFolder.ChildRemoved:Connect(function(child)
+            return connectRunSignal(shopFolder.ChildRemoved, function(child)
                 if child.Name == "Items" or child.Name == "UnixNextRestock" or child.Name == "UnixLastRestock" then
                     scheduleStockValuesUpdate(shopName, 0.12)
                 end
@@ -6396,13 +6673,13 @@ function watchStockValuesFolder(stockValuesFolder)
     if stockValuesFolderConnections[stockValuesFolder] then return end
 
     local _, childAddedConn = pcall(function()
-        return stockValuesFolder.ChildAdded:Connect(function(shopFolder)
+        return connectRunSignal(stockValuesFolder.ChildAdded, function(shopFolder)
             watchStockShopFolder(shopFolder)
             scheduleStockValuesUpdate(shopFolder.Name, 0.15)
         end)
     end)
     local _, childRemovedConn = pcall(function()
-        return stockValuesFolder.ChildRemoved:Connect(function(shopFolder)
+        return connectRunSignal(stockValuesFolder.ChildRemoved, function(shopFolder)
             scheduleStockValuesUpdate(shopFolder.Name, 0.15)
         end)
     end)
@@ -6426,7 +6703,7 @@ else
 end
 
 pcall(function()
-    ReplicatedStorage.ChildAdded:Connect(function(child)
+    connectRunSignal(ReplicatedStorage.ChildAdded, function(child)
         if child.Name ~= "StockValues" then return end
         watchStockValuesFolder(child)
         for _, shopName in ipairs({ "SeedShop", "GearShop", "CrateShop" }) do
@@ -6449,23 +6726,56 @@ end)
 
 local environmentUpdateQueued = false
 local lastEnvironmentDeepInvalidationAt = -999
-local ENVIRONMENT_DEEP_INVALIDATION_MIN_INTERVAL = 1.5
+local environmentDeepRefreshQueued = false
+local ENVIRONMENT_DEEP_INVALIDATION_MIN_INTERVAL = 4
 
-function scheduleEnvironmentUpdate(delaySeconds)
+local function getWeatherAttributeChangeMode(attrName)
+    local key = string.lower(tostring(attrName or "")):gsub("[^%w]", "")
+    if key == "" then return "deep" end
+    -- An absolute end time may arrive separately from the state name.  Publish
+    -- it promptly, but it does not require rebuilding icon/card indices.
+    if key == "endtime" or key == "endsat" then return "light" end
+    if key == "phaseduration" or key == "duration" or key == "timeleft"
+        or key == "remaining" or key == "remainingtime" or key == "timer"
+        or key == "countdown"
+        or string.find(key, "duration", 1, true) ~= nil
+        or string.find(key, "countdown", 1, true) ~= nil
+        or string.find(key, "remaining", 1, true) ~= nil then
+        return "ignore"
+    end
+    return "deep"
+end
+
+local function invalidateEnvironmentDiscoveryCaches()
+    lastEnvironmentDeepInvalidationAt = os.clock()
+    weatherDataCache = nil
+    weatherDataByKeyCache = nil
+    weatherDataCacheAt = -999
+    phaseSignalEntriesCache = nil
+    invalidateWeatherCatalogCache()
+    invalidateWeatherFrameCards()
+    invalidateWeatherStateScan()
+end
+
+function scheduleEnvironmentUpdate(delaySeconds, needsDeepInvalidation)
     activeWeatherCache = nil
     local now = os.clock()
-    -- AttributeChanged may be emitted more than once while the same weather card
-    -- settles.  Keep UI/catalog/state discovery event-driven, but collapse that
-    -- burst so it cannot trigger repeated Descendants scans.
-    if (now - lastEnvironmentDeepInvalidationAt) >= ENVIRONMENT_DEEP_INVALIDATION_MIN_INTERVAL then
-        lastEnvironmentDeepInvalidationAt = now
-        weatherDataCache = nil
-        weatherDataByKeyCache = nil
-        weatherDataCacheAt = -999
-        phaseSignalEntriesCache = nil
-        invalidateWeatherCatalogCache()
-        invalidateWeatherFrameCards()
-        invalidateWeatherStateScan()
+    -- A countdown changing every second is not a weather transition.  Real
+    -- transitions still invalidate immediately; a burst gets one trailing
+    -- rescan instead of repeated GetDescendants() calls every 1–2 seconds.
+    if needsDeepInvalidation ~= false then
+        local elapsed = now - lastEnvironmentDeepInvalidationAt
+        if elapsed >= ENVIRONMENT_DEEP_INVALIDATION_MIN_INTERVAL then
+            invalidateEnvironmentDiscoveryCaches()
+        elseif not environmentDeepRefreshQueued then
+            environmentDeepRefreshQueued = true
+            safeTaskDelay(ENVIRONMENT_DEEP_INVALIDATION_MIN_INTERVAL - elapsed, function()
+                environmentDeepRefreshQueued = false
+                if not isCurrentScraperRun() then return end
+                invalidateEnvironmentDiscoveryCaches()
+                scheduleEnvironmentUpdate(0.05, false)
+            end)
+        end
     end
     if environmentUpdateQueued then return end
     environmentUpdateQueued = true
@@ -6479,8 +6789,8 @@ function scheduleEnvironmentUpdate(delaySeconds)
 end
 
 pcall(function()
-    for _, attrName in ipairs({ "ActivePhase", "ActiveWeather", "CurrentWeather", "CurrentPhase", "Phase", "PhaseDuration" }) do
-        workspace:GetAttributeChangedSignal(attrName):Connect(function()
+    for _, attrName in ipairs({ "ActivePhase", "ActiveWeather", "CurrentWeather", "CurrentPhase", "Phase" }) do
+        connectRunSignal(workspace:GetAttributeChangedSignal(attrName), function()
             scheduleEnvironmentUpdate(0.03)
         end)
     end
@@ -6493,8 +6803,10 @@ pcall(function()
             return weatherValues.AttributeChanged
         end)
         if okAttrChanged and attrChanged and attrChanged.Connect then
-            attrChanged:Connect(function()
-                scheduleEnvironmentUpdate(0.15)
+            connectRunSignal(attrChanged, function(attrName)
+                local changeMode = getWeatherAttributeChangeMode(attrName)
+                if changeMode == "ignore" then return end
+                scheduleEnvironmentUpdate(0.15, changeMode == "deep")
             end)
         end
     end
@@ -6506,10 +6818,10 @@ pcall(function()
         -- Cards/icons are normally static, but newly replicated event cards need
         -- to invalidate the compact card index immediately instead of waiting for
         -- its normal cache lifetime.
-        weatherUI.DescendantAdded:Connect(function()
+        connectRunSignal(weatherUI.DescendantAdded, function()
             scheduleEnvironmentUpdate(0.2)
         end)
-        weatherUI.DescendantRemoving:Connect(function()
+        connectRunSignal(weatherUI.DescendantRemoving, function()
             scheduleEnvironmentUpdate(0.2)
         end)
     end
@@ -6624,4 +6936,7 @@ end)
 bypassLoadingScreen()
 optimizeClient()
 
-print("[Grow a Garden 2 Stocker] Scraper loaded (" .. (MOBILE_SAFE_MODE and "Mobile Safe Mode" or "Extreme Optimization") .. ")!")
+local optimizationModeLabel = HEADLESS_SCRAPER_MODE
+    and ("Headless " .. tostring(HEADLESS_FPS_CAP) .. " FPS")
+    or (MOBILE_SAFE_MODE and "Mobile Safe Mode" or "Extreme Optimization")
+print("[Grow a Garden 2 Stocker] Scraper loaded (" .. optimizationModeLabel .. ")!")
