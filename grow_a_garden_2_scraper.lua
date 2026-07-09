@@ -116,13 +116,17 @@ local POLL_INTERVAL = 15         -- Lightweight fallback only.  Do not repeatedl
 local FRUIT_REQUEST_INTERVAL = 15 -- Fallback remote refresh interval if Snapshot event is missed
 local DEBUG = false             -- Set to true only to diagnose scraper issues
 local MOBILE_SAFE_MODE = UserInputService and UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
--- This script does not need a visible game world.  MuMu reports itself as a
--- touch-only device, which previously disabled the strongest optimizations and
--- left the entire map rendering at full cost.  Keep the mode explicit so a
--- person who wants to play manually can turn it off before executing.
+-- MuMu reports itself as touch-only, so headless rendering must be enabled
+-- explicitly.  Do not mutate/destroy the replicated world or game UI though:
+-- on emulators that can cause Roblox to stream/recreate it in a CPU loop.
 local HEADLESS_SCRAPER_MODE = true
-local HEADLESS_FPS_CAP = 5
-local DESTROY_WORLD_ASSETS = true -- Aggressively remove local 3D junk; protected data containers stay intact.
+-- Very low caps such as 3–5 FPS can make some Android executors busy-spin.
+-- With 3D rendering already off, 15 FPS is the lower, stable MuMu setting.
+local HEADLESS_FPS_CAP = 15
+local DESTROY_WORLD_ASSETS = false
+local MOVE_HEADLESS_CAMERA = false
+local CLEAN_PLAYER_GUI = false
+local BYPASS_LOADING_SCREEN = false
 local AUTO_RECONNECT = true       -- Rejoin the game when Roblox shows disconnect/error prompt.
 local LOAD_WATCHDOG_TIMEOUT = 180 -- Rejoin if core game objects never appear after this many seconds.
 -- =================================================
@@ -663,8 +667,8 @@ function optimizeClient()
     end
 
     -- MuMu is touch-only, so the former mobile-safe branch never capped its
-    -- frame rate.  A stock scraper is event/network driven; 5 FPS is plenty
-    -- for it and cuts both emulator CPU and rendering wakeups dramatically.
+    -- frame rate.  A stock scraper is event/network driven; 15 FPS keeps the
+    -- executor scheduler stable while 3D rendering stays disabled.
     local targetFps = HEADLESS_SCRAPER_MODE and HEADLESS_FPS_CAP or 3
     local fpsSetters = {}
     local function addFpsSetter(fn)
@@ -730,8 +734,9 @@ function optimizeClient()
         settings().Rendering.MeshPartDetailLevel = Enum.MeshPartDetailLevel.Level01
     end)
 
-    -- 4. Move the camera far away so almost everything is frustum-culled.
-    if HEADLESS_SCRAPER_MODE or not MOBILE_SAFE_MODE then
+    -- 4. 3D rendering is already disabled above.  Moving the camera can make
+    -- MuMu continuously stream the map, so it is opt-in rather than default.
+    if MOVE_HEADLESS_CAMERA then
         pcall(function()
             local cam = workspace.CurrentCamera
             if cam then
@@ -789,25 +794,19 @@ function optimizeClient()
         end
     end
 
-    pcall(function()
-        cleanPlayerGui()
-        if PlayerGui then
-            connectRunSignal(PlayerGui.ChildAdded, function(child)
-                safeTaskDefer(function()
-                    if not isCurrentScraperRun() then return end
-                    cleanPlayerGuiInstance(child)
+    if CLEAN_PLAYER_GUI then
+        pcall(function()
+            cleanPlayerGui()
+            if PlayerGui then
+                connectRunSignal(PlayerGui.ChildAdded, function(child)
+                    safeTaskDefer(function()
+                        if not isCurrentScraperRun() then return end
+                        cleanPlayerGuiInstance(child)
+                    end)
                 end)
-            end)
-            -- Keep the protected shop/weather screens intact, but discard only the
-            -- expensive dynamic widgets as they are replicated.  This replaces the
-            -- old recurring full PlayerGui walk.
-            connectRunSignal(PlayerGui.DescendantAdded, function(desc)
-                if desc:IsA("ViewportFrame") or desc:IsA("VideoFrame") or desc:IsA("Sound") then
-                    safeDestroy(desc)
-                end
-            end)
-        end
-    end)
+            end
+        end)
+    end
 
     -- 7. Destructive local cleanup. Protected roots stay because game/client data
     --    readers can reference them; everything else is reduced aggressively.
@@ -5246,14 +5245,15 @@ local fruitImagesFolderConnected = false
 local fruitImageCacheBuilt = false
 local fruitListCache = nil
 
--- FruitImages.Bamboo is currently a Roblox PrivateImage placeholder.  The
--- verified public Bamboo SeedImages asset is used when that bad image appears.
+-- FruitImages.Bamboo is currently a Roblox PrivateImage placeholder.  Use the
+-- harvested Bamboo plant thumbnail, not SeedImages.Bamboo (the seed packet).
 local FRUIT_IMAGE_FALLBACKS = {
-    bamboo = "131560215426602"
+    bamboo = "138389335854784"
 }
 local INVALID_FRUIT_IMAGE_ASSETS = {
     bamboo = {
-        ["70571153233151"] = true
+        ["70571153233151"] = true,
+        ["131560215426602"] = true
     }
 }
 
@@ -6812,20 +6812,11 @@ pcall(function()
     end
 end)
 
-pcall(function()
-    local weatherUI = findWeatherUI()
-    if weatherUI then
-        -- Cards/icons are normally static, but newly replicated event cards need
-        -- to invalidate the compact card index immediately instead of waiting for
-        -- its normal cache lifetime.
-        connectRunSignal(weatherUI.DescendantAdded, function()
-            scheduleEnvironmentUpdate(0.2)
-        end)
-        connectRunSignal(weatherUI.DescendantRemoving, function()
-            scheduleEnvironmentUpdate(0.2)
-        end)
-    end
-end)
+-- WeatherValues and workspace attributes are authoritative and already publish
+-- a real state change immediately.  Listening to every visual child added to
+-- the Weather UI was not: it could turn UI animations into repeated full stock
+-- updates, especially on MuMu.  The low-frequency fallback below still covers
+-- game versions that expose only the UI.
 
 -- ================== LOOPS ==================
 -- All normal state changes are handled above by StockValues, WeatherValues,
@@ -6864,6 +6855,10 @@ end)
 local loadingScreenBypassApplied = false
 
 local function bypassLoadingScreen()
+    if not BYPASS_LOADING_SCREEN then
+        loadingScreenBypassApplied = true
+        return
+    end
     -- Repeating getconnections/GUI walks every API refresh both costs CPU and can
     -- disconnect the scraper's own listeners.  A fresh teleport runs a new script,
     -- so one successful pass per script run is enough.
@@ -6937,6 +6932,6 @@ bypassLoadingScreen()
 optimizeClient()
 
 local optimizationModeLabel = HEADLESS_SCRAPER_MODE
-    and ("Headless " .. tostring(HEADLESS_FPS_CAP) .. " FPS")
+    and ("Safe Headless " .. tostring(HEADLESS_FPS_CAP) .. " FPS")
     or (MOBILE_SAFE_MODE and "Mobile Safe Mode" or "Extreme Optimization")
 print("[Grow a Garden 2 Stocker] Scraper loaded (" .. optimizationModeLabel .. ")!")
