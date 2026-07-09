@@ -44,6 +44,7 @@ waitForGameLoaded(90)
 local HttpService = safeGetService("HttpService")
 local Players = safeGetService("Players")
 local ReplicatedStorage = safeGetService("ReplicatedStorage")
+local ReplicatedFirst = safeGetService("ReplicatedFirst")
 local UserInputService = safeGetService("UserInputService")
 local TeleportService = safeGetService("TeleportService")
 local GuiService = safeGetService("GuiService")
@@ -111,9 +112,9 @@ disconnectPreviousRunConnections()
 -- ================= CONFIGURATION =================
 local API_URL = "https://growagarden2stock.site/api/update-stock"
 local API_PASSWORD = "mySuperSecretToken123"
-local UPDATE_INTERVAL = 30       -- Authoritative safety refresh; normal updates are event-driven.
-local POLL_INTERVAL = 15         -- Lightweight fallback only.  Do not repeatedly rebuild every UI/data tree.
-local FRUIT_REQUEST_INTERVAL = 15 -- Fallback remote refresh interval if Snapshot event is missed
+local UPDATE_INTERVAL = 180      -- Rare safety refresh; normal updates are event-driven.
+local POLL_INTERVAL = 60         -- Lightweight fallback only. Never rebuild every UI/data tree frequently.
+local FRUIT_REQUEST_INTERVAL = 60 -- Fallback remote refresh interval if Snapshot event is missed
 local DEBUG = false             -- Set to true only to diagnose scraper issues
 local MOBILE_SAFE_MODE = UserInputService and UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 -- MuMu reports itself as touch-only, so headless rendering must be enabled
@@ -122,13 +123,16 @@ local MOBILE_SAFE_MODE = UserInputService and UserInputService.TouchEnabled and 
 local HEADLESS_SCRAPER_MODE = true
 -- Very low caps such as 3–5 FPS can make some Android executors busy-spin.
 -- With 3D rendering already off, 15 FPS is the lower, stable MuMu setting.
-local HEADLESS_FPS_CAP = 10 -- Stable low cap; do not use 3-5 FPS on MuMu.
+local HEADLESS_FPS_CAP = 15 -- Very low caps can busy-spin; 15 is stable on MuMu.
 -- Never recursively destroy Workspace/Terrain.  It causes a streaming loop on
 -- Roblox clients.  The aggressive mode below still makes the world invisible,
 -- disables effects/audio/lights and turns 3D rendering off without that loop.
 local NEUTRALIZE_WORLD_VISUALS = true
 local MOVE_HEADLESS_CAMERA = false
 local CLEAN_PLAYER_GUI = true
+local SUSPEND_GAME_LOCAL_SCRIPTS = true -- Scraper uses replicas/remotes directly.
+local CLIENT_SCRIPT_WARMUP_SECONDS = 6  -- Let networking initialize before suspending game scripts.
+local SHOW_OPTIMIZER_OVERLAY = false    -- A permanent full-screen GUI still costs UI/render time.
 local BYPASS_LOADING_SCREEN = true
 local AUTO_RECONNECT = true       -- Rejoin the game when Roblox shows disconnect/error prompt.
 local LOAD_WATCHDOG_TIMEOUT = 180 -- Rejoin if core game objects never appear after this many seconds.
@@ -483,7 +487,7 @@ function installAutoReconnectWatchdog()
         local startedAt = os.clock()
         while true do
             if not isCurrentScraperRun() then return end
-            safeTaskWait(5)
+            safeTaskWait(30)
             refreshRuntimeRefs()
             local okLoaded, loaded = pcall(function()
                 return game:IsLoaded()
@@ -507,26 +511,12 @@ installAutoReconnectWatchdog()
 function optimizeClient()
     refreshRuntimeRefs()
     local RunService = game:GetService("RunService")
-    local protectedPlayerGuiRoots = {
-        auction = true,
-        weather = true,
-        weatherui = true,
-        environmentui = true,
-        crateshop = true,
-        gearshop = true,
-        seedshop = true,
-        fruitstockprice = true,
-        optimizeroverlay = true
-    }
-
-    local function optKey(name)
-        return string.lower(tostring(name or "")):gsub("[^%w]", "")
-    end
+    local renderingDisabled = false
 
     -- No per-instance destroy queue is used: it can trigger Roblox streaming
     -- rebuilds.  Rendering/effects are neutralized once below instead.
     -- MuMu is touch-only, so the former mobile-safe branch never capped its
-    -- frame rate.  A stock scraper is event/network driven; 10 FPS keeps the
+    -- frame rate.  A stock scraper is event/network driven; 15 FPS keeps the
     -- executor scheduler stable while 3D rendering stays disabled.
     local targetFps = HEADLESS_SCRAPER_MODE and HEADLESS_FPS_CAP or 3
     local fpsSetters = {}
@@ -555,7 +545,9 @@ function optimizeClient()
     -- Headless mode opts into this on MuMu too.  The data sources below are
     -- replicated modules/events, not rendered pixels.
     if HEADLESS_SCRAPER_MODE or not MOBILE_SAFE_MODE then
-        pcall(function() RunService:Set3dRenderingEnabled(false) end)
+        renderingDisabled = pcall(function()
+            RunService:Set3dRenderingEnabled(false)
+        end)
     end
 
     -- 2. Minimize lighting/shadow cost.
@@ -605,48 +597,85 @@ function optimizeClient()
         end
     end)
 
-    local function isProtectedPlayerGui(instance)
-        local key = optKey(instance and instance.Name)
-        return protectedPlayerGuiRoots[key] == true
-    end
-
     local function cleanPlayerGui()
         refreshRuntimeRefs()
         local pGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
         if not pGui then return end
         for _, child in ipairs(pGui:GetChildren()) do
-            -- Auction/Weather/shop UIs are read by the scraper.  Keep an entire
-            -- protected root intact rather than deleting a nested ViewportFrame
-            -- or sound that its client controller expects.
-            if not isProtectedPlayerGui(child) then
-                if child:IsA("ScreenGui") or child:IsA("BillboardGui")
-                    or child:IsA("SurfaceGui") or child:IsA("Sound") then
-                    -- Do not destroy a game-managed GUI: some clients recreate it
-                    -- immediately, creating a CPU/GC loop.  Disabling it removes
-                    -- its visual work while leaving its controller idle and stable.
-                    pcall(function()
-                        if child:IsA("Sound") then
-                            child:Stop()
-                            child.Volume = 0
-                        else
-                            child.Enabled = false
-                        end
-                    end)
-                end
+            -- Protected UIs must remain in the tree for fallback data reads, but
+            -- they do not need to be rendered.  ScreenGui.Enabled=false preserves
+            -- every label/value while stopping layout, tween and draw work.
+            if child:IsA("ScreenGui") or child:IsA("BillboardGui")
+                or child:IsA("SurfaceGui") or child:IsA("Sound") then
+                pcall(function()
+                    if child:IsA("Sound") then
+                        child:Stop()
+                        child.Volume = 0
+                    else
+                        child.Enabled = false
+                    end
+                end)
             end
         end
-        -- Protected shop/auction roots keep their text/data replicas alive, but
-        -- their 3D previews and videos are never needed for scraping.
-        for _, visual in ipairs(pGui:GetDescendants()) do
+        -- Nested media/scripts are handled once after the warm-up below. Avoid
+        -- walking a large PlayerGui tree twice during startup.
+    end
+
+    local function suspendLocalScript(instance)
+        if not instance then return false end
+        local isClientScript = instance:IsA("LocalScript")
+        if not isClientScript and instance:IsA("Script") then
             pcall(function()
-                if visual:IsA("ViewportFrame") then
-                    visual.Visible = false
-                elseif visual:IsA("VideoFrame") then
-                    visual.Visible = false
-                    visual:Pause()
-                end
+                isClientScript = instance.RunContext == Enum.RunContext.Client
             end)
         end
+        if not isClientScript then return false end
+        local changed = false
+        pcall(function()
+            if instance.Enabled ~= false then
+                instance.Enabled = false
+                changed = true
+            end
+        end)
+        -- Compatibility with executors/clients that still expose Disabled.
+        pcall(function()
+            if instance.Disabled ~= true then
+                instance.Disabled = true
+                changed = true
+            end
+        end)
+        return changed
+    end
+
+    local function suspendClientRoot(root)
+        if not root then return 0 end
+        local suspended = suspendLocalScript(root) and 1 or 0
+        local ok, descendants = pcall(function() return root:GetDescendants() end)
+        if not ok or type(descendants) ~= "table" then return suspended end
+        for index, instance in ipairs(descendants) do
+            if not isCurrentScraperRun() then return suspended end
+            if suspendLocalScript(instance) then
+                suspended = suspended + 1
+            elseif instance:IsA("VideoFrame") then
+                pcall(function()
+                    instance.Visible = false
+                    instance:Pause()
+                end)
+            elseif instance:IsA("Sound") then
+                pcall(function()
+                    instance:Stop()
+                    instance.Volume = 0
+                end)
+            elseif instance:IsA("Animator") then
+                pcall(function()
+                    for _, track in ipairs(instance:GetPlayingAnimationTracks()) do
+                        track:Stop(0)
+                    end
+                end)
+            end
+            if index % 256 == 0 then safeTaskWait(0.01) end
+        end
+        return suspended
     end
 
     if CLEAN_PLAYER_GUI then
@@ -712,6 +741,10 @@ function optimizeClient()
             safeTaskWait(0.5)
             if not isCurrentScraperRun() then return end
             neutralizeTerrain()
+            -- Set3dRenderingEnabled(false) is already the complete kill-switch.
+            -- A full Workspace property sweep is redundant and can itself pin a
+            -- large emulator for minutes in a streamed map.
+            if renderingDisabled then return end
             local ok, descendants = pcall(function()
                 return workspace:GetDescendants()
             end)
@@ -728,8 +761,48 @@ function optimizeClient()
         end)
     end
 
-    -- 8. Black overlay.
-    safeTaskSpawn(function()
+    if HEADLESS_SCRAPER_MODE and SUSPEND_GAME_LOCAL_SCRIPTS then
+        safeTaskSpawn(function()
+            safeTaskWait(CLIENT_SCRIPT_WARMUP_SECONDS)
+            if not isCurrentScraperRun() then return end
+            refreshRuntimeRefs()
+            local playerScripts = LocalPlayer and LocalPlayer:FindFirstChild("PlayerScripts")
+            local backpack = LocalPlayer and LocalPlayer:FindFirstChildOfClass("Backpack")
+            local suspended = 0
+            suspended = suspended + suspendClientRoot(ReplicatedFirst)
+            suspended = suspended + suspendClientRoot(playerScripts)
+            suspended = suspended + suspendClientRoot(PlayerGui)
+            suspended = suspended + suspendClientRoot(backpack)
+            suspended = suspended + suspendClientRoot(LocalPlayer and LocalPlayer.Character)
+            if DEBUG then
+                print("[Grow a Garden 2 Stocker] Suspended " .. tostring(suspended) .. " game LocalScripts")
+            end
+
+            -- New top-level GUIs/controllers are uncommon. Watching only direct
+            -- children avoids the very noisy PlayerGui.DescendantAdded signal.
+            if PlayerGui then
+                connectRunSignal(PlayerGui.ChildAdded, function(child)
+                    if child.Name == "OptimizerOverlay" then return end
+                    pcall(function()
+                        if child:IsA("ScreenGui") or child:IsA("BillboardGui") or child:IsA("SurfaceGui") then
+                            child.Enabled = false
+                        end
+                    end)
+                    safeTaskDelay(0.5, function() suspendClientRoot(child) end)
+                end)
+            end
+            if playerScripts then
+                connectRunSignal(playerScripts.ChildAdded, function(child)
+                    safeTaskDelay(0.25, function() suspendClientRoot(child) end)
+                end)
+            end
+        end)
+    end
+
+    -- 8. Optional black overlay. Disabled by default because even a blank
+    -- full-screen GUI keeps the 2D renderer active.
+    if SHOW_OPTIMIZER_OVERLAY then
+        safeTaskSpawn(function()
         pcall(function()
             refreshRuntimeRefs()
             local pGui = PlayerGui or waitForChildSoft(LocalPlayer, "PlayerGui", 15)
@@ -751,7 +824,8 @@ function optimizeClient()
 
             sg.Parent = pGui
         end)
-    end)
+        end)
+    end
 
     clientOptimized = true
 end
@@ -1548,7 +1622,7 @@ end
 -- repeatedly walking every UI card on each poll.
 local DIRECT_SHOP_CACHE = {}
 local DIRECT_SHOP_CACHE_AT = {}
-local DIRECT_SHOP_CACHE_SECONDS = 8
+local DIRECT_SHOP_CACHE_SECONDS = 60 -- Stock/price signals invalidate this immediately.
 local REQUIRED_SHARED_MODULE_CACHE = {}
 local STOCK_ITEMS_INDEX_CACHE = {}
 
@@ -3010,7 +3084,7 @@ end
 
 local activeWeatherCache = nil
 local activeWeatherCacheAt = -999
-local ACTIVE_WEATHER_CACHE_SECONDS = 10
+local ACTIVE_WEATHER_CACHE_SECONDS = 30 -- Weather signals invalidate this immediately.
 
 function getActiveWeatherAndPhase()
     local now = os.clock()
@@ -3278,13 +3352,13 @@ local auctionGuiAutoHidden = false
 local originalAuctionFramePosition = nil
 -- RequestSnapshot is only a fallback when event delivery is unavailable/stale.
 -- Keep the short value as a remote-call throttle, not a permanent polling rate.
-local AUCTION_REQUEST_INTERVAL = 3
-local AUCTION_SNAPSHOT_STALE_SECONDS = 25
-local AUCTION_EVENT_HEALTH_INTERVAL = 20
-local AUCTION_STARTUP_RETRY_INTERVAL = 0.75
-local AUCTION_STARTUP_RETRY_COUNT = 24
-local AUCTION_GUI_CACHE_SECONDS = 3
-local AUCTION_DATA_CACHE_SECONDS = 2
+local AUCTION_REQUEST_INTERVAL = 10
+local AUCTION_SNAPSHOT_STALE_SECONDS = 90
+local AUCTION_EVENT_HEALTH_INTERVAL = 60
+local AUCTION_STARTUP_RETRY_INTERVAL = 2
+local AUCTION_STARTUP_RETRY_COUNT = 8
+local AUCTION_GUI_CACHE_SECONDS = 15
+local AUCTION_DATA_CACHE_SECONDS = 15
 local auctionGuiDataCache = nil
 local auctionGuiDataCacheAt = -999
 local auctionDataCache = nil
@@ -5716,7 +5790,7 @@ local liveMultiplierFruitCatalog = nil
 local liveMultiplierFruitCatalogAt = -60
 local liveMultiplierFruitCatalogRevision = 0
 local fruitListCacheRevision = -1
-local LIVE_MULTIPLIER_FRUIT_CATALOG_REFRESH_INTERVAL = 60
+local LIVE_MULTIPLIER_FRUIT_CATALOG_REFRESH_INTERVAL = 300
 
 local function getLiveMultiplierFruitCatalog()
     local now = os.clock()
@@ -6089,12 +6163,86 @@ end
 
 local lastUpdateTime = 0
 local updatePending = false
+local updateInFlight = false
+local updateAfterFlight = false
 local pendingFruitData = nil
 local pendingFreshFruitScrape = false
 -- Shop values often arrive as a small burst (timer + several item values).
 -- Publish the finished state after a tiny coalescing window instead of adding a
 -- visible one-second delay or serializing the same full payload many times.
-local LIVE_UPDATE_DEBOUNCE_SECONDS = 0.15
+local LIVE_UPDATE_DEBOUNCE_SECONDS = 0.75
+
+-- Network requests can yield for several seconds on a weak emulator. Keep at
+-- most one sender alive and retain only the newest payload while it is busy.
+-- This prevents a burst of stock values from becoming dozens of HTTP threads.
+local queuedStockPayload = nil
+local stockPayloadSenderRunning = false
+
+local function transmitStockPayload(data)
+    if not isCurrentScraperRun() then return end
+
+    local ws = getWebSocketClient()
+    if ws then
+        local wsPayload = {
+            type = "update-stock",
+            password = API_PASSWORD,
+            data = data
+        }
+        local encodeOk, encodedWs = pcall(function() return HttpService:JSONEncode(wsPayload) end)
+        if encodeOk then
+            local sendFunc = ws.Send or ws.send
+            local wsSuccess, wsErr = pcall(function()
+                sendFunc(ws, encodedWs)
+            end)
+            if wsSuccess then
+                if DEBUG then
+                    print("[Grow a Garden 2 Stocker] Stock data updated via WebSocket")
+                end
+                return
+            end
+            warn("[Grow a Garden 2 Stocker] WebSocket send failed: " .. tostring(wsErr) .. ". Falling back to HTTP POST...")
+            pcall(function() ws:Close() end)
+            pcall(function() ws:close() end)
+            wsConnection = nil
+            wsNextConnectAttemptAt = os.clock() + WEBSOCKET_RECONNECT_COOLDOWN
+        end
+    end
+
+    local encodeOk, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+    if not encodeOk then
+        warn("[Grow a Garden 2 Stocker] JSON encoding failed: " .. tostring(encoded))
+        return
+    end
+    local ok, response = makeHttpRequest(API_URL, "POST",
+        { ["Content-Type"] = "application/json", ["X-API-Password"] = API_PASSWORD }, encoded)
+    if not ok then
+        warn("[Grow a Garden 2 Stocker] Failed to update stock data: " .. tostring(response))
+    elseif DEBUG then
+        print("[Grow a Garden 2 Stocker] Stock data updated via HTTP POST: " .. tostring(response))
+    end
+end
+
+local function queueStockPayload(data)
+    queuedStockPayload = data
+    if stockPayloadSenderRunning then return end
+    stockPayloadSenderRunning = true
+    safeTaskSpawn(function()
+        while queuedStockPayload and isCurrentScraperRun() do
+            local latest = queuedStockPayload
+            queuedStockPayload = nil
+            local ok, err = pcall(transmitStockPayload, latest)
+            if not ok then
+                warn("[Grow a Garden 2 Stocker] Payload send failed: " .. tostring(err))
+            end
+        end
+        stockPayloadSenderRunning = false
+        -- An update cannot normally arrive between the loop test and this line,
+        -- but keep the queue race-safe for executors with unusual schedulers.
+        if queuedStockPayload and isCurrentScraperRun() then
+            queueStockPayload(queuedStockPayload)
+        end
+    end)
+end
 
 -- updateAPI(fruitData): fruitData is an optional pre-scraped fruit list. If nil,
 -- fruits are scraped fresh inside. We ALWAYS send live fruit data (never a stale
@@ -6109,6 +6257,10 @@ function updateAPI(fruitData)
         pendingFreshFruitScrape = true
     elseif not pendingFreshFruitScrape then
         pendingFruitData = fruitData
+    end
+    if updateInFlight then
+        updateAfterFlight = true
+        return
     end
     if updatePending then return end
     local now = os.clock()
@@ -6130,6 +6282,7 @@ function updateAPI(fruitData)
     pendingFruitData = nil
     pendingFreshFruitScrape = false
 
+    updateInFlight = true
     local success, err = pcall(function()
         local function resolveShopPath(shopName, innerName)
             local shop = findChildByNormalizedName(PlayerGui, { shopName })
@@ -6192,60 +6345,22 @@ function updateAPI(fruitData)
             auction = getPublishableAuctionData()
         }
 
-        safeTaskSpawn(function()
-            if not isCurrentScraperRun() then return end
-
-            -- WebSocket is the normal route.  Encode only its wrapper first;
-            -- JSON-encoding the entire stock payload for HTTP as well was
-            -- wasted work whenever the WebSocket send succeeded.
-            local ws = getWebSocketClient()
-            if ws then
-                local wsPayload = {
-                    type = "update-stock",
-                    password = API_PASSWORD,
-                    data = data
-                }
-                local encodeOk2, encodedWs = pcall(function() return HttpService:JSONEncode(wsPayload) end)
-                if encodeOk2 then
-                    local sendFunc = ws.Send or ws.send
-                    local wsSuccess, wsErr = pcall(function()
-                        sendFunc(ws, encodedWs)
-                    end)
-                    if wsSuccess then
-                        if DEBUG then
-                            print("[Grow a Garden 2 Stocker] Stock data updated instantly via WebSocket!")
-                        end
-                        return -- Success, skip HTTP fallback
-                    else
-                        warn("[Grow a Garden 2 Stocker] WebSocket send failed: " .. tostring(wsErr) .. ". Falling back to HTTP POST...")
-                        -- Reset connection on error
-                        pcall(function() ws:Close() end)
-                        pcall(function() ws:close() end)
-                        wsConnection = nil
-                        wsNextConnectAttemptAt = os.clock() + WEBSOCKET_RECONNECT_COOLDOWN
-                    end
-                end
-            end
-
-            -- Fallback HTTP POST update
-            local encodeOk, encoded = pcall(function() return HttpService:JSONEncode(data) end)
-            if not encodeOk then
-                warn("[Grow a Garden 2 Stocker] JSON encoding failed: " .. tostring(encoded))
-                return
-            end
-            local ok, response = makeHttpRequest(API_URL, "POST",
-                { ["Content-Type"] = "application/json", ["X-API-Password"] = API_PASSWORD }, encoded)
-            if ok then
-                if DEBUG then
-                    print("[Grow a Garden 2 Stocker] Stock data updated via HTTP POST: " .. tostring(response))
-                end
-            else
-                warn("[Grow a Garden 2 Stocker] Failed to update stock data: " .. tostring(response))
-            end
-        end)
+        queueStockPayload(data)
     end)
+    updateInFlight = false
     if not success then
         warn("[Grow a Garden 2 Stocker] Error during updateAPI: " .. tostring(err))
+    end
+    if updateAfterFlight and not updatePending then
+        updateAfterFlight = false
+        updatePending = true
+        safeTaskDelay(LIVE_UPDATE_DEBOUNCE_SECONDS, function()
+            updatePending = false
+            local nextData = pendingFreshFruitScrape and nil or pendingFruitData
+            pendingFruitData = nil
+            pendingFreshFruitScrape = false
+            updateAPI(nextData)
+        end)
     end
 end
 
@@ -6271,7 +6386,7 @@ safeTaskSpawn(function()
         end
         connectAuctionSnapshot()
         -- The first request is immediate.  Subsequent retries respect the
-        -- endpoint throttle instead of firing up to 24 Remote requests during
+        -- endpoint throttle instead of firing many Remote requests during
         -- startup when a RemoteEvent simply has no return value.
         local gotSnapshot = requestAuctionSnapshot(attempt == 1)
         if gotSnapshot or (latestAuctionSnapshot and type(getAuctionRawLots(latestAuctionSnapshot)) == "table") then
@@ -6288,7 +6403,7 @@ end)
 safeTaskSpawn(function()
     while not fruitSnapshotConnected do
         if not isCurrentScraperRun() then return end
-        safeTaskWait(10)
+        safeTaskWait(60)
         connectFruitStockSnapshot(function()
             updateAPI(getFruitMultipliers())
         end)
@@ -6296,11 +6411,12 @@ safeTaskSpawn(function()
 end)
 
 safeTaskSpawn(function()
-    -- Keep attempting to attach both Auction signals, but do not hammer the
-    -- remotes after one of them is already available.
-    while not (auctionSnapshotConnected and auctionStockConnected) do
+    -- Most clients attach immediately. Limit the faster startup retries; the
+    -- health loop below still performs a rare late-attachment attempt.
+    for _ = 1, 12 do
+        if auctionSnapshotConnected and auctionStockConnected then return end
         if not isCurrentScraperRun() then return end
-        safeTaskWait(5)
+        safeTaskWait(10)
         connectAuctionSnapshot()
         if not latestAuctionSnapshot then
             requestAuctionSnapshot(false)
@@ -6318,17 +6434,20 @@ safeTaskSpawn(function()
         -- Snapshot/StockUpdate events are authoritative and push changes
         -- immediately.  Poll only as a health fallback when an event is missing
         -- or no fresh snapshot has arrived for a while.
+        if not eventDriven then
+            connectAuctionSnapshot()
+        end
         if not eventDriven or snapshotStale then
             requestAuctionSnapshot(false)
         end
-        safeTaskWait(eventDriven and AUCTION_EVENT_HEALTH_INTERVAL or 5)
+        safeTaskWait(AUCTION_EVENT_HEALTH_INTERVAL)
     end
 end)
 
 safeTaskSpawn(function()
     while latestFruitSnapshotAt <= 0 do
         if not isCurrentScraperRun() then return end
-        safeTaskWait(10)
+        safeTaskWait(FRUIT_REQUEST_INTERVAL)
         -- Startup already made an immediate forced request.  Respect the
         -- remote throttle on retries rather than issuing overlapping calls.
         requestFruitSnapshot(false)
