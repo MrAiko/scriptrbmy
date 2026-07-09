@@ -117,16 +117,19 @@ local FRUIT_REQUEST_INTERVAL = 15 -- Fallback remote refresh interval if Snapsho
 local DEBUG = false             -- Set to true only to diagnose scraper issues
 local MOBILE_SAFE_MODE = UserInputService and UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 -- MuMu reports itself as touch-only, so headless rendering must be enabled
--- explicitly.  Do not mutate/destroy the replicated world or game UI though:
--- on emulators that can cause Roblox to stream/recreate it in a CPU loop.
+-- explicitly.  The visual sweep below is one-shot and property-only: deleting
+-- replicated map roots makes Roblox stream/rebuild them again and costs more CPU.
 local HEADLESS_SCRAPER_MODE = true
 -- Very low caps such as 3–5 FPS can make some Android executors busy-spin.
 -- With 3D rendering already off, 15 FPS is the lower, stable MuMu setting.
-local HEADLESS_FPS_CAP = 15
-local DESTROY_WORLD_ASSETS = false
+local HEADLESS_FPS_CAP = 10 -- Stable low cap; do not use 3-5 FPS on MuMu.
+-- Never recursively destroy Workspace/Terrain.  It causes a streaming loop on
+-- Roblox clients.  The aggressive mode below still makes the world invisible,
+-- disables effects/audio/lights and turns 3D rendering off without that loop.
+local NEUTRALIZE_WORLD_VISUALS = true
 local MOVE_HEADLESS_CAMERA = false
-local CLEAN_PLAYER_GUI = false
-local BYPASS_LOADING_SCREEN = false
+local CLEAN_PLAYER_GUI = true
+local BYPASS_LOADING_SCREEN = true
 local AUTO_RECONNECT = true       -- Rejoin the game when Roblox shows disconnect/error prompt.
 local LOAD_WATCHDOG_TIMEOUT = 180 -- Rejoin if core game objects never appear after this many seconds.
 -- =================================================
@@ -340,7 +343,7 @@ function requestReconnect(reason)
         end
         pcall(function()
             if type(setfpscap) == "function" then
-                setfpscap(30)
+                setfpscap(HEADLESS_SCRAPER_MODE and HEADLESS_FPS_CAP or 30)
             end
         end)
 
@@ -504,18 +507,6 @@ installAutoReconnectWatchdog()
 function optimizeClient()
     refreshRuntimeRefs()
     local RunService = game:GetService("RunService")
-    local protectedWorkspaceRoots = {
-        gardens = true,
-        activenight = true,
-        weather = true,
-        weatherstate = true,
-        environment = true,
-        activeweather = true,
-        timecycle = true,
-        timecyclestate = true,
-        currentphase = true,
-        phase = true
-    }
     local protectedPlayerGuiRoots = {
         auction = true,
         weather = true,
@@ -532,142 +523,10 @@ function optimizeClient()
         return string.lower(tostring(name or "")):gsub("[^%w]", "")
     end
 
-    -- A full map can contain thousands of visual instances.  Creating one task for
-    -- every Destroy call causes a noticeable CPU spike and scheduler churn.  Keep a
-    -- single bounded destroy queue instead; destroying a parent also makes queued
-    -- children harmless no-ops.
-    local destroyQueue = {}
-    local destroyQueueHead = 1
-    local destroyQueueTail = 0
-    local destroyQueued = setmetatable({}, { __mode = "k" })
-    local destroyFlushScheduled = false
-    local DESTROY_BATCH_SIZE = 180
-    local flushDestroyQueue
-
-    flushDestroyQueue = function()
-        if not isCurrentScraperRun() then
-            destroyQueue = {}
-            destroyQueueHead = 1
-            destroyQueueTail = 0
-            destroyFlushScheduled = false
-            return
-        end
-        destroyFlushScheduled = false
-        local processed = 0
-        while destroyQueueHead <= destroyQueueTail and processed < DESTROY_BATCH_SIZE do
-            local instance = destroyQueue[destroyQueueHead]
-            destroyQueue[destroyQueueHead] = nil
-            destroyQueueHead = destroyQueueHead + 1
-            destroyQueued[instance] = nil
-            processed = processed + 1
-            pcall(function()
-                if instance and instance.Parent then
-                    instance:Destroy()
-                end
-            end)
-        end
-
-        if destroyQueueHead > destroyQueueTail then
-            destroyQueue = {}
-            destroyQueueHead = 1
-            destroyQueueTail = 0
-        elseif not destroyFlushScheduled then
-            destroyFlushScheduled = true
-            safeTaskDelay(0.03, flushDestroyQueue)
-        end
-    end
-
-    local function safeDestroy(instance)
-        if not isCurrentScraperRun() or not instance or not instance.Parent or destroyQueued[instance] then return end
-        destroyQueued[instance] = true
-        destroyQueueTail = destroyQueueTail + 1
-        destroyQueue[destroyQueueTail] = instance
-        if not destroyFlushScheduled then
-            destroyFlushScheduled = true
-            safeTaskDefer(flushDestroyQueue)
-        end
-    end
-
-    local function hasProtectedWorkspaceAncestor(instance)
-        local current = instance
-        while current and current ~= workspace do
-            local key = optKey(current.Name)
-            if protectedWorkspaceRoots[key] then return true end
-            if string.find(key, "weather") or string.find(key, "environment")
-               or string.find(key, "night") or string.find(key, "phase") then
-                return true
-            end
-            if type(getPhaseKey) == "function" and getPhaseKey(current.Name) then return true end
-            if type(cleanWeatherStateName) == "function" and cleanWeatherStateName(current.Name) then return true end
-            if string.find(key, "moon") or string.find(key, "blood")
-               or string.find(key, "gold") or string.find(key, "eclipse") then
-                return true
-            end
-            current = current.Parent
-        end
-        return false
-    end
-
-    local function getCharacterOwner(instance)
-        local current = instance
-        while current and current ~= workspace do
-            local player = Players:GetPlayerFromCharacter(current)
-            if player then return player, current end
-            current = current.Parent
-        end
-        return nil, nil
-    end
-
-    local function optimizePart(part, removePhysics)
-        pcall(function()
-            part.CastShadow = false
-            part.Material = Enum.Material.SmoothPlastic
-            part.Reflectance = 0
-            part.LocalTransparencyModifier = 1
-            if removePhysics then
-                part.CanCollide = false
-                part.CanTouch = false
-                part.CanQuery = false
-            end
-        end)
-    end
-
-    local function isVisualJunk(instance)
-        return instance:IsA("Decal")
-            or instance:IsA("Texture")
-            or instance:IsA("SpecialMesh")
-            or instance:IsA("SurfaceAppearance")
-            or instance:IsA("ParticleEmitter")
-            or instance:IsA("Beam")
-            or instance:IsA("Trail")
-            or instance:IsA("Smoke")
-            or instance:IsA("Fire")
-            or instance:IsA("Sparkles")
-            or instance:IsA("Explosion")
-            or instance:IsA("PostEffect")
-            or instance:IsA("Highlight")
-            or instance:IsA("SelectionBox")
-            or instance:IsA("Light")
-    end
-
-    local function optimizeLocalCharacterInstance(instance)
-        if instance:IsA("Accessory") or instance:IsA("Tool") or instance:IsA("Clothing")
-           or instance:IsA("CharacterMesh") or isVisualJunk(instance) then
-            safeDestroy(instance)
-        elseif instance:IsA("BasePart") then
-            optimizePart(instance, true)
-        elseif instance:IsA("Humanoid") then
-            pcall(function()
-                instance.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
-                instance.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
-            end)
-        elseif instance:IsA("Animator") or instance:IsA("AnimationController") then
-            safeDestroy(instance)
-        end
-    end
-
+    -- No per-instance destroy queue is used: it can trigger Roblox streaming
+    -- rebuilds.  Rendering/effects are neutralized once below instead.
     -- MuMu is touch-only, so the former mobile-safe branch never capped its
-    -- frame rate.  A stock scraper is event/network driven; 15 FPS keeps the
+    -- frame rate.  A stock scraper is event/network driven; 10 FPS keeps the
     -- executor scheduler stable while 3D rendering stays disabled.
     local targetFps = HEADLESS_SCRAPER_MODE and HEADLESS_FPS_CAP or 3
     local fpsSetters = {}
@@ -697,26 +556,6 @@ function optimizeClient()
     -- replicated modules/events, not rendered pixels.
     if HEADLESS_SCRAPER_MODE or not MOBILE_SAFE_MODE then
         pcall(function() RunService:Set3dRenderingEnabled(false) end)
-    end
-
-    -- Non-destructive graphics optimization (remove heavy textures, particles, shadows on PC)
-    if not MOBILE_SAFE_MODE and not DESTROY_WORLD_ASSETS then
-        local function optimizeGraphics(instance)
-            if not instance then return end
-            pcall(function()
-                if isVisualJunk(instance) then
-                    safeDestroy(instance)
-                elseif instance:IsA("BasePart") then
-                    optimizePart(instance, false)
-                end
-            end)
-        end
-        pcall(function()
-            for _, desc in ipairs(workspace:GetDescendants()) do
-                optimizeGraphics(desc)
-            end
-            connectRunSignal(workspace.DescendantAdded, optimizeGraphics)
-        end)
     end
 
     -- 2. Minimize lighting/shadow cost.
@@ -753,7 +592,7 @@ function optimizeClient()
 
     -- 6. Mute sounds without a global game.DescendantAdded listener.  That
     -- listener wakes up for every replicated object and is very costly in a
-    -- busy server; unprotected world roots are removed separately below.
+    -- busy server; the one-shot visual sweep below handles existing sounds too.
     pcall(function()
         local soundService = game:GetService("SoundService")
         soundService.AmbientReverb = Enum.ReverbType.NoReverb
@@ -771,169 +610,122 @@ function optimizeClient()
         return protectedPlayerGuiRoots[key] == true
     end
 
-    local function cleanPlayerGuiInstance(instance)
-        if not instance then return end
-        if instance:IsA("ScreenGui") and not isProtectedPlayerGui(instance) then
-            safeDestroy(instance)
-        elseif instance:IsA("ViewportFrame") or instance:IsA("VideoFrame") or instance:IsA("Sound") then
-            safeDestroy(instance)
-        end
-    end
-
     local function cleanPlayerGui()
         refreshRuntimeRefs()
         local pGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
         if not pGui then return end
         for _, child in ipairs(pGui:GetChildren()) do
-            cleanPlayerGuiInstance(child)
-            if child.Parent and child:IsA("ScreenGui") then
-                for _, desc in ipairs(child:GetDescendants()) do
-                    cleanPlayerGuiInstance(desc)
+            -- Auction/Weather/shop UIs are read by the scraper.  Keep an entire
+            -- protected root intact rather than deleting a nested ViewportFrame
+            -- or sound that its client controller expects.
+            if not isProtectedPlayerGui(child) then
+                if child:IsA("ScreenGui") or child:IsA("BillboardGui")
+                    or child:IsA("SurfaceGui") or child:IsA("Sound") then
+                    -- Do not destroy a game-managed GUI: some clients recreate it
+                    -- immediately, creating a CPU/GC loop.  Disabling it removes
+                    -- its visual work while leaving its controller idle and stable.
+                    pcall(function()
+                        if child:IsA("Sound") then
+                            child:Stop()
+                            child.Volume = 0
+                        else
+                            child.Enabled = false
+                        end
+                    end)
                 end
             end
+        end
+        -- Protected shop/auction roots keep their text/data replicas alive, but
+        -- their 3D previews and videos are never needed for scraping.
+        for _, visual in ipairs(pGui:GetDescendants()) do
+            pcall(function()
+                if visual:IsA("ViewportFrame") then
+                    visual.Visible = false
+                elseif visual:IsA("VideoFrame") then
+                    visual.Visible = false
+                    visual:Pause()
+                end
+            end)
         end
     end
 
     if CLEAN_PLAYER_GUI then
         pcall(function()
             cleanPlayerGui()
-            if PlayerGui then
-                connectRunSignal(PlayerGui.ChildAdded, function(child)
-                    safeTaskDefer(function()
-                        if not isCurrentScraperRun() then return end
-                        cleanPlayerGuiInstance(child)
-                    end)
-                end)
-            end
         end)
     end
 
-    -- 7. Destructive local cleanup. Protected roots stay because game/client data
-    --    readers can reference them; everything else is reduced aggressively.
-    local function cleanInstance(instance)
+    -- Do not destroy replicated Workspace roots or Terrain.  Roblox streams those
+    -- instances back immediately, which is slower than the one-shot visual strip
+    -- below and was the source of the sustained emulator CPU spike.
+    -- 7. Aggressive headless visual strip.  This intentionally runs once and
+    -- never subscribes to Workspace.ChildAdded/DescendantAdded.  Roblox can
+    -- recreate streamed instances after a destructive listener removes them,
+    -- which is the source of the sustained 40-60% CPU regression on MuMu.
+    -- Set3dRenderingEnabled(false) is the actual rendering kill-switch; these
+    -- properties are a local fallback and also stop effect/audio work.
+    local function neutralizeVisualInstance(instance)
         if not instance then return end
-        if instance:IsA("Camera") or instance:IsA("Terrain") then return end
-        if LocalPlayer and LocalPlayer.Character and (instance == LocalPlayer.Character or instance:IsDescendantOf(LocalPlayer.Character)) then
-            optimizeLocalCharacterInstance(instance)
-            return
-        end
-
-        local player, character = getCharacterOwner(instance)
-        if player and player ~= LocalPlayer then
-            safeDestroy(character or instance)
-            return
-        end
-
-        if isVisualJunk(instance) or instance:IsA("Sound")
-           or instance:IsA("BillboardGui") or instance:IsA("SurfaceGui") then
-            safeDestroy(instance)
-            return
-        end
-
-        if hasProtectedWorkspaceAncestor(instance) then
+        pcall(function()
             if instance:IsA("BasePart") then
-                optimizePart(instance, false)
+                instance.CastShadow = false
+                instance.LocalTransparencyModifier = 1
+            elseif instance:IsA("ParticleEmitter") then
+                instance.Enabled = false
+                instance.Rate = 0
+                instance.TimeScale = 0
+            elseif instance:IsA("Beam") or instance:IsA("Trail")
+                or instance:IsA("Smoke") or instance:IsA("Fire")
+                or instance:IsA("Sparkles") then
+                instance.Enabled = false
+            elseif instance:IsA("PointLight") or instance:IsA("SpotLight")
+                or instance:IsA("SurfaceLight") then
+                instance.Enabled = false
+            elseif instance:IsA("PostEffect") or instance:IsA("Highlight")
+                or instance:IsA("BillboardGui") or instance:IsA("SurfaceGui") then
+                instance.Enabled = false
+            elseif instance:IsA("SelectionBox") then
+                instance.Visible = false
+            elseif instance:IsA("Decal") or instance:IsA("Texture") then
+                instance.Transparency = 1
+            elseif instance:IsA("Sound") then
+                instance:Stop()
+                instance.Volume = 0
             end
-            return
-        end
-
-        -- An unprotected world root is visual/gameplay clutter for this headless
-        -- scraper.  Removing the whole root is much cheaper than receiving a
-        -- callback for every part it contains.
-        if instance:IsA("Model") or instance:IsA("Folder")
-            or instance:IsA("BasePart") or instance:IsA("Accessory") or instance:IsA("Tool") then
-            safeDestroy(instance)
-        end
+        end)
     end
 
-    if DESTROY_WORLD_ASSETS and (HEADLESS_SCRAPER_MODE or not MOBILE_SAFE_MODE) then
-        local function cleanupWorldPass()
-            pcall(function() workspace.Terrain:Clear() end)
-            -- Destroying an unprotected top-level map root makes a full
-            -- GetDescendants() walk unnecessary.  It is far cheaper at startup
-            -- and preserves the explicitly protected state roots above.
-            local roots = workspace:GetChildren()
-            for index, root in ipairs(roots) do
-                if not isCurrentScraperRun() then return end
-                cleanInstance(root)
-                if index % 24 == 0 then safeTaskWait(0.03) end
-            end
-        end
+    local function neutralizeTerrain()
+        local terrain = workspace:FindFirstChildOfClass("Terrain")
+        if not terrain then return end
+        pcall(function() terrain.Decoration = false end)
+        pcall(function() terrain.WaterWaveSize = 0 end)
+        pcall(function() terrain.WaterWaveSpeed = 0 end)
+        pcall(function() terrain.WaterReflectance = 0 end)
+        pcall(function() terrain.WaterTransparency = 1 end)
+    end
 
-        -- DescendantAdded can fire for every replicated particle/part.  The old
-        -- direct callback did ancestry walks and destruction immediately for each
-        -- event, then also rescanned all of Workspace every 20 seconds.  Watching
-        -- only top-level additions removes whole unprotected roots at once, while
-        -- the initial pass covers already replicated descendants.
-        local cleanupQueue = {}
-        local cleanupQueueHead = 1
-        local cleanupQueueTail = 0
-        local cleanupQueued = setmetatable({}, { __mode = "k" })
-        local cleanupFlushScheduled = false
-        local WORLD_CLEANUP_BATCH_SIZE = 120
-        local flushCleanupQueue
-
-        local function isWorldCleanupCandidate(instance)
-            if not instance then return false end
-            return instance:IsA("BasePart")
-                or instance:IsA("Model")
-                or instance:IsA("Folder")
-                or instance:IsA("Accessory")
-                or instance:IsA("Tool")
-                or instance:IsA("BillboardGui")
-                or instance:IsA("SurfaceGui")
-                or instance:IsA("Sound")
-                or isVisualJunk(instance)
-        end
-
-        flushCleanupQueue = function()
-            if not isCurrentScraperRun() then
-                cleanupQueue = {}
-                cleanupQueueHead = 1
-                cleanupQueueTail = 0
-                cleanupFlushScheduled = false
-                return
-            end
-            cleanupFlushScheduled = false
-            local processed = 0
-            while cleanupQueueHead <= cleanupQueueTail and processed < WORLD_CLEANUP_BATCH_SIZE do
-                local instance = cleanupQueue[cleanupQueueHead]
-                cleanupQueue[cleanupQueueHead] = nil
-                cleanupQueueHead = cleanupQueueHead + 1
-                cleanupQueued[instance] = nil
-                processed = processed + 1
-                pcall(function()
-                    if instance and instance.Parent then
-                        cleanInstance(instance)
-                    end
-                end)
-            end
-
-            if cleanupQueueHead > cleanupQueueTail then
-                cleanupQueue = {}
-                cleanupQueueHead = 1
-                cleanupQueueTail = 0
-            elseif not cleanupFlushScheduled then
-                cleanupFlushScheduled = true
-                safeTaskDelay(0.08, flushCleanupQueue)
-            end
-        end
-
-        local function queueWorldCleanup(instance)
-            if not isCurrentScraperRun() or not isWorldCleanupCandidate(instance) or cleanupQueued[instance] then return end
-            cleanupQueued[instance] = true
-            cleanupQueueTail = cleanupQueueTail + 1
-            cleanupQueue[cleanupQueueTail] = instance
-            if not cleanupFlushScheduled then
-                cleanupFlushScheduled = true
-                safeTaskDelay(0.15, flushCleanupQueue)
-            end
-        end
-
+    if HEADLESS_SCRAPER_MODE and NEUTRALIZE_WORLD_VISUALS then
         safeTaskSpawn(function()
-            pcall(cleanupWorldPass)
+            -- Let the core UI/data replicas attach first; visual work is not on
+            -- the scraper's critical path.
+            safeTaskWait(0.5)
+            if not isCurrentScraperRun() then return end
+            neutralizeTerrain()
+            local ok, descendants = pcall(function()
+                return workspace:GetDescendants()
+            end)
+            if not ok or type(descendants) ~= "table" then return end
+            for index, instance in ipairs(descendants) do
+                if not isCurrentScraperRun() then return end
+                neutralizeVisualInstance(instance)
+                -- Yield in small batches so startup does not freeze MuMu or
+                -- starve websocket/event handling.
+                if index % 96 == 0 then
+                    safeTaskWait(0.02)
+                end
+            end
         end)
-        connectRunSignal(workspace.ChildAdded, queueWorldCleanup)
     end
 
     -- 8. Black overlay.
@@ -1460,7 +1252,9 @@ end
 local wsConnection = nil
 local isWsConnecting = false
 local wsNextConnectAttemptAt = 0
-local WEBSOCKET_RECONNECT_COOLDOWN = 12
+-- A short reconnect backoff keeps live shop/weather updates on the socket after
+-- a transient emulator/network hiccup.  Failed sends still have HTTP fallback.
+local WEBSOCKET_RECONNECT_COOLDOWN = 3
 
 function getWebSocketClient()
     if wsConnection then return wsConnection end
@@ -1546,6 +1340,12 @@ function getWebSocketClient()
     
     return wsConnection
 end
+
+-- Begin the handshake before the first stock event.  getWebSocketClient is
+-- non-blocking, so this does not delay game loading or event subscriptions.
+safeTaskDefer(function()
+    getWebSocketClient()
+end)
 
 
 -- ================== RESTOCK TIMES ==================
@@ -6290,6 +6090,11 @@ end
 local lastUpdateTime = 0
 local updatePending = false
 local pendingFruitData = nil
+local pendingFreshFruitScrape = false
+-- Shop values often arrive as a small burst (timer + several item values).
+-- Publish the finished state after a tiny coalescing window instead of adding a
+-- visible one-second delay or serializing the same full payload many times.
+local LIVE_UPDATE_DEBOUNCE_SECONDS = 0.15
 
 -- updateAPI(fruitData): fruitData is an optional pre-scraped fruit list. If nil,
 -- fruits are scraped fresh inside. We ALWAYS send live fruit data (never a stale
@@ -6297,24 +6102,33 @@ local pendingFruitData = nil
 function updateAPI(fruitData)
     if not isCurrentScraperRun() then return end
     refreshRuntimeRefs()
-    pendingFruitData = fruitData or pendingFruitData
+    -- A stock/weather event asks for a fresh snapshot.  Never let an older
+    -- fruit-event table win over that newer request while a burst is coalesced.
+    if fruitData == nil then
+        pendingFruitData = nil
+        pendingFreshFruitScrape = true
+    elseif not pendingFreshFruitScrape then
+        pendingFruitData = fruitData
+    end
     if updatePending then return end
     local now = os.clock()
     local elapsed = now - lastUpdateTime
-    if elapsed < 1.0 then
+    if elapsed < LIVE_UPDATE_DEBOUNCE_SECONDS then
         updatePending = true
-        local waitLeft = 1.0 - elapsed
+        local waitLeft = LIVE_UPDATE_DEBOUNCE_SECONDS - elapsed
         safeTaskDelay(waitLeft, function()
             updatePending = false
-            local dataToSend = pendingFruitData
+            local dataToSend = pendingFreshFruitScrape and nil or pendingFruitData
             pendingFruitData = nil
+            pendingFreshFruitScrape = false
             updateAPI(dataToSend)
         end)
         return
     end
     lastUpdateTime = now
-    local dataToSend = pendingFruitData
+    local dataToSend = pendingFreshFruitScrape and nil or pendingFruitData
     pendingFruitData = nil
+    pendingFreshFruitScrape = false
 
     local success, err = pcall(function()
         local function resolveShopPath(shopName, innerName)
@@ -6876,26 +6690,12 @@ local function bypassLoadingScreen()
             end
         end
 
-        -- 2. Unlock all ScreenGuis by disconnecting "Enabled" change connections
-        if getconnections then
-            pcall(function()
-                for _, conn in ipairs(getconnections(currentPlayerGui.ChildAdded)) do
-                    pcall(function() conn:Disconnect() end)
-                end
-            end)
-            
-            for _, child in ipairs(currentPlayerGui:GetChildren()) do
-                if child:IsA("ScreenGui") then
-                    pcall(function()
-                        for _, conn in ipairs(getconnections(child:GetPropertyChangedSignal("Enabled"))) do
-                            pcall(function() conn:Disconnect() end)
-                        end
-                    end)
-                end
-            end
-        end
-        
-        -- 3. Reset camera and spoof loading state attributes
+        -- 2. Never disconnect another controller's GUI signals here.  Games
+        -- commonly rebuild UI after that, which wastes CPU and can hide the
+        -- exact shop/weather replicas used by the scraper.
+
+        -- 3. Mark the local loading state complete without touching unrelated
+        -- event connections.
         local localPlayer = LocalPlayer or (Players and Players.LocalPlayer)
         if localPlayer then
             pcall(function()
@@ -6932,6 +6732,6 @@ bypassLoadingScreen()
 optimizeClient()
 
 local optimizationModeLabel = HEADLESS_SCRAPER_MODE
-    and ("Safe Headless " .. tostring(HEADLESS_FPS_CAP) .. " FPS")
+    and ("Aggressive Headless " .. tostring(HEADLESS_FPS_CAP) .. " FPS")
     or (MOBILE_SAFE_MODE and "Mobile Safe Mode" or "Extreme Optimization")
 print("[Grow a Garden 2 Stocker] Scraper loaded (" .. optimizationModeLabel .. ")!")
