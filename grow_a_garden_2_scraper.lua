@@ -1506,12 +1506,14 @@ function scrapeShopSafe(container)
 end
 
 -- ================== DIRECT SHOP DATA SOURCE ==================
--- The game builds shop UI from SharedModules data and ReplicatedStorage.StockValues.
--- Read those authoritative sources first; UI scraping stays as a fallback only.
+-- Shop UI is only a presentation layer.  The stock values and the shared item
+-- catalogues are authoritative, so keep a compact index of those instead of
+-- repeatedly walking every UI card on each poll.
 local DIRECT_SHOP_CACHE = {}
 local DIRECT_SHOP_CACHE_AT = {}
-local DIRECT_SHOP_CACHE_SECONDS = 0.35
+local DIRECT_SHOP_CACHE_SECONDS = 8
 local REQUIRED_SHARED_MODULE_CACHE = {}
+local STOCK_ITEMS_INDEX_CACHE = {}
 
 local SHOP_RARITY_ORDER = {
     Common = 1,
@@ -1522,22 +1524,53 @@ local SHOP_RARITY_ORDER = {
     Mythic = 6,
     Super = 7,
     Secret = 8,
-    Exotic = 9
+    Exotic = 9,
+    Divine = 10,
+    Prismatic = 11,
+    Transcendent = 12,
+    Transendent = 12
 }
+
+local SHOP_PRICE_SUFFIXES = {
+    { 1000000000000000, "Q" },
+    { 1000000000000, "T" },
+    { 1000000000, "B" },
+    { 1000000, "M" },
+    { 1000, "K" }
+}
+
+local SHOP_PRICE_OVERRIDE_CONFIG = {
+    SeedShop = {
+        flagName = "Game.SeedShop.PriceOverrides",
+        allowsBasePriceSentinel = false
+    },
+    GearShop = {
+        flagName = "Game.GearShop.PriceOverrides",
+        allowsBasePriceSentinel = true
+    },
+    CrateShop = {
+        flagName = "Game.CrateShop.PriceOverrides",
+        allowsBasePriceSentinel = true
+    }
+}
+
+function getCanonicalShopKey(shopKey)
+    if shopKey == "SeedShop" or shopKey == "SeedShop_Normal" then
+        return "SeedShop"
+    end
+    return shopKey
+end
+
+function getDirectShopCacheKey(shopKey)
+    return getCanonicalShopKey(shopKey) == "SeedShop" and "SeedShop_Normal" or shopKey
+end
 
 function formatShopPrice(value)
     value = tonumber(value)
-    if not value then return "Unknown" end
-    local suffixes = {
-        { 1000000000000000, "Q" },
-        { 1000000000000, "T" },
-        { 1000000000, "B" },
-        { 1000000, "M" },
-        { 1000, "K" }
-    }
-    for _, item in ipairs(suffixes) do
+    if not value or value < 0 then return "Unknown" end
+    for _, item in ipairs(SHOP_PRICE_SUFFIXES) do
         local size, suffix = item[1], item[2]
-        if math.abs(value) >= size then
+        if value >= size then
             local short = value / size
             local text = string.format("%.3f", short):gsub("0+$", ""):gsub("%.$", "")
             return text .. suffix .. "\194\162"
@@ -1562,7 +1595,7 @@ end
 
 function getStockValuesShopFolder(shopName)
     local stockValues = ReplicatedStorage:FindFirstChild("StockValues")
-    return stockValues and stockValues:FindFirstChild(shopName) or nil
+    return stockValues and stockValues:FindFirstChild(getCanonicalShopKey(shopName)) or nil
 end
 
 function getStockItemsFolder(shopName)
@@ -1570,20 +1603,63 @@ function getStockItemsFolder(shopName)
     return shopFolder and shopFolder:FindFirstChild("Items") or nil
 end
 
-function readStockValue(shopName, itemName)
-    local items = getStockItemsFolder(shopName)
-    local stockObj = items and items:FindFirstChild(tostring(itemName or ""))
-    if not stockObj then return 0 end
+function invalidateStockItemsIndex(shopName)
+    STOCK_ITEMS_INDEX_CACHE[getCanonicalShopKey(shopName)] = nil
+end
+
+function getStockItemsIndex(shopName)
+    local canonicalShopKey = getCanonicalShopKey(shopName)
+    local itemsFolder = getStockItemsFolder(canonicalShopKey)
+    local cached = STOCK_ITEMS_INDEX_CACHE[canonicalShopKey]
+    if cached and cached.folder == itemsFolder then
+        return cached
+    end
+
+    local index = {
+        folder = itemsFolder,
+        exact = {},
+        normalized = {},
+        entries = {}
+    }
+    if itemsFolder then
+        for _, stockObject in ipairs(itemsFolder:GetChildren()) do
+            local rawName = tostring(stockObject.Name or "")
+            if rawName ~= "" then
+                index.exact[rawName] = stockObject
+                local normalizedName = normalizeName(rawName)
+                if normalizedName ~= "" and not index.normalized[normalizedName] then
+                    index.normalized[normalizedName] = stockObject
+                end
+                table.insert(index.entries, stockObject)
+            end
+        end
+    end
+    STOCK_ITEMS_INDEX_CACHE[canonicalShopKey] = index
+    return index
+end
+
+function readStockObjectValue(stockObject)
+    if not stockObject then return 0 end
     local ok, value = pcall(function()
-        return stockObj.Value
+        return stockObject.Value
     end)
-    value = ok and tonumber(value) or 0
-    return math.max(0, math.floor(value or 0))
+    local numericValue = ok and tonumber(value) or 0
+    return math.max(0, math.floor(numericValue or 0))
+end
+
+function readStockValue(shopName, itemName, stockIndex)
+    local itemKey = tostring(itemName or "")
+    if itemKey == "" then return 0 end
+    stockIndex = stockIndex or getStockItemsIndex(shopName)
+    local stockObject = stockIndex.exact[itemKey]
+    if not stockObject then
+        stockObject = stockIndex.normalized[normalizeName(itemKey)]
+    end
+    return readStockObjectValue(stockObject)
 end
 
 function getRequiredSharedModule(moduleName)
     if REQUIRED_SHARED_MODULE_CACHE[moduleName] ~= nil then
-        if REQUIRED_SHARED_MODULE_CACHE[moduleName] == false then return nil end
         return REQUIRED_SHARED_MODULE_CACHE[moduleName]
     end
     local moduleScript = getSharedModule(moduleName)
@@ -1595,74 +1671,88 @@ function getRequiredSharedModule(moduleName)
     return module
 end
 
-function shouldIncludeSeed(seed)
-    if type(seed) ~= "table" or not seed.RestockShop then return false end
-    local enabled = getRequiredSharedModule("SeedShopEnabled")
-    if enabled and enabled.IsSeedEnabled then
-        local ok, result = pcall(function()
-            return enabled.IsSeedEnabled(seed.SeedName)
-        end)
-        if ok then return result == true end
-    end
-    if enabled and enabled.DefaultFor then
-        local ok, result = pcall(function()
-            return enabled.DefaultFor(seed.SeedName)
-        end)
-        if ok then return result == true end
-    end
-    return true
+-- The in-game controller always builds the full catalogue first and only then
+-- applies its per-player visibility flag.  Filtering here used to make disabled
+-- or not-yet-loaded items disappear from the API entirely (notably Dragon's
+-- Breath), so catalogue membership must not depend on an A/B-test response.
+function isSeedShopCatalogItem(seed)
+    return type(seed) == "table"
+        and seed.RestockShop == true
+        and type(seed.SeedName) == "string"
+        and seed.SeedName ~= ""
 end
 
-function shouldIncludeGear(gear)
-    if type(gear) ~= "table" then return false end
-    if gear.RobuxOnly or gear.HideFromShop then return false end
-    if not (gear.RestockChance or gear.EquippableGear) then return false end
-    local enabled = getRequiredSharedModule("GearShopABTest")
-    if enabled and enabled.IsGearEnabled then
-        local ok, result = pcall(function()
-            return enabled.IsGearEnabled(LocalPlayer, gear.ItemName)
-        end)
-        if ok then return result == true end
-    end
-    if enabled and enabled.DefaultFor then
-        local ok, result = pcall(function()
-            return enabled.DefaultFor(gear.ItemName)
-        end)
-        if ok then return result == true end
-    end
-    return true
+function isGearShopCatalogItem(gear)
+    return type(gear) == "table"
+        and type(gear.ItemName) == "string"
+        and gear.ItemName ~= ""
+        and not gear.RobuxOnly
+        and not gear.HideFromShop
+        and (gear.RestockChance ~= nil or gear.EquippableGear == true)
 end
 
-function shouldIncludeCrate(crate)
-    if type(crate) ~= "table" or not crate.RestockChance then return false end
-    local enabled = getRequiredSharedModule("CrateShopEnabled")
-    if enabled and enabled.IsCrateEnabled then
-        local ok, result = pcall(function()
-            return enabled.IsCrateEnabled(crate.Name)
-        end)
-        if ok then return result == true end
-    end
-    if enabled and enabled.DefaultFor then
-        local ok, result = pcall(function()
-            return enabled.DefaultFor(crate.Name)
-        end)
-        if ok then return result == true end
-    end
-    return true
+function isCrateShopCatalogItem(crate)
+    return type(crate) == "table"
+        and type(crate.Name) == "string"
+        and crate.Name ~= ""
+        and crate.RestockChance ~= nil
 end
 
-function makeDirectShopItem(name, stock, price, rarity, image, order)
-    if not name or name == "" then return nil end
-    local priceRaw = tonumber(price) or 0
+-- getFastFlagValue is defined later in the script, but all shop builds happen
+-- after startup.  It uses the same replicated FastFlag objects as the native UI.
+function getShopPriceOverrides(shopName)
+    local config = SHOP_PRICE_OVERRIDE_CONFIG[getCanonicalShopKey(shopName)]
+    if not config then return {}, {} end
+
+    local overrides = getFastFlagValue(config.flagName, {}, function(asserts)
+        if config.allowsBasePriceSentinel then
+            return asserts.Map(asserts.String, asserts.AnyOf(asserts.FiniteNonNegative, asserts.Equals(-1)))
+        end
+        return asserts.Map(asserts.String, asserts.FiniteNonNegative)
+    end)
+    if type(overrides) ~= "table" then overrides = {} end
+
+    local normalized = {}
+    for itemName, value in pairs(overrides) do
+        if type(itemName) == "string" then
+            local key = normalizeName(itemName)
+            if key ~= "" then normalized[key] = value end
+        end
+    end
+    return overrides, normalized
+end
+
+function getShopPriceOverride(name, overrides, normalizedOverrides)
+    if type(name) ~= "string" then return nil end
+    local value = type(overrides) == "table" and overrides[name] or nil
+    if value == nil and type(normalizedOverrides) == "table" then
+        value = normalizedOverrides[normalizeName(name)]
+    end
+    return tonumber(value)
+end
+
+function resolveShopPrice(name, basePrice, overrides, normalizedOverrides)
+    local base = tonumber(basePrice)
+    if base and base < 0 then base = nil end
+    local override = getShopPriceOverride(name, overrides, normalizedOverrides)
+    if override and override >= 0 then
+        return override
+    end
+    return base
+end
+
+function makeDirectShopItem(shopName, name, stockIndex, basePrice, rarity, image, order, overrides, normalizedOverrides, source)
+    if type(name) ~= "string" or name == "" then return nil end
+    local priceRaw = resolveShopPrice(name, basePrice, overrides, normalizedOverrides)
     return {
-        name = tostring(name),
-        stock = math.max(0, math.floor(tonumber(stock) or 0)),
-        price = formatShopPrice(priceRaw),
-        priceRaw = math.max(0, math.floor(priceRaw)),
+        name = name,
+        stock = readStockValue(shopName, name, stockIndex),
+        price = priceRaw ~= nil and formatShopPrice(priceRaw) or "Unknown",
+        priceRaw = priceRaw,
         rarity = rarity or "Common",
         image = readShopImageRef(image),
         order = tonumber(order) or 0,
-        source = "direct"
+        source = source or "direct"
     }
 end
 
@@ -1676,24 +1766,64 @@ function sortDirectShopItems(items)
     return items
 end
 
+-- Keep every live StockValues entry, even when a just-released item is missing
+-- from an executor's cached catalogue.  Metadata may be unknown in that rare
+-- case, but the site still receives its real name and stock instead of hiding it.
+function appendUnmappedLiveStockItems(items, shopName, stockIndex, overrides, normalizedOverrides)
+    if not stockIndex or not stockIndex.entries then return end
+    local known = {}
+    for _, item in ipairs(items) do
+        local key = normalizeName(item.name)
+        if key ~= "" then known[key] = true end
+    end
+    for _, stockObject in ipairs(stockIndex.entries) do
+        local name = tostring(stockObject.Name or "")
+        local key = normalizeName(name)
+        if name ~= "" and key ~= "" and not known[key] then
+            local item = makeDirectShopItem(
+                shopName,
+                name,
+                stockIndex,
+                nil,
+                "Unknown",
+                nil,
+                999999999,
+                overrides,
+                normalizedOverrides,
+                "stock-only"
+            )
+            if item then
+                known[key] = true
+                table.insert(items, item)
+            end
+        end
+    end
+end
+
 function buildDirectSeedShop()
     local seedData = getRequiredSharedModule("SeedData")
     if type(seedData) ~= "table" then return {} end
+    local shopName = "SeedShop"
+    local stockIndex = getStockItemsIndex(shopName)
+    local overrides, normalizedOverrides = getShopPriceOverrides(shopName)
     local items = {}
-    for index, seed in ipairs(seedData) do
-        if shouldIncludeSeed(seed) then
-            local name = seed.SeedName
+    for index, seed in pairs(seedData) do
+        if isSeedShopCatalogItem(seed) then
             local item = makeDirectShopItem(
-                name,
-                readStockValue("SeedShop", name),
+                shopName,
+                seed.SeedName,
+                stockIndex,
                 seed.PurchasePrice,
                 seed.Rarity,
                 seed.SeedImage,
-                seed.SeedShopDisplayOrder or index
+                seed.SeedShopDisplayOrder or tonumber(index) or 999999,
+                overrides,
+                normalizedOverrides
             )
             if item then table.insert(items, item) end
         end
     end
+    appendUnmappedLiveStockItems(items, shopName, stockIndex, overrides, normalizedOverrides)
     return sortDirectShopItems(items)
 end
 
@@ -1701,29 +1831,35 @@ function buildDirectGearShop()
     local gearData = getRequiredSharedModule("GearShopData")
     local rawItems = type(gearData) == "table" and gearData.Data or nil
     if type(rawItems) ~= "table" then return {} end
+    local shopName = "GearShop"
+    local stockIndex = getStockItemsIndex(shopName)
+    local overrides, normalizedOverrides = getShopPriceOverrides(shopName)
     local items = {}
-    for index, gear in ipairs(rawItems) do
-        if shouldIncludeGear(gear) then
-            local name = gear.ItemName
+    for index, gear in pairs(rawItems) do
+        if isGearShopCatalogItem(gear) then
             local rarityRank = SHOP_RARITY_ORDER[gear.Rarity or ""] or 0
             local sortPriority = tonumber(gear.SortPriority) or 0
             local order = rarityRank * 1000000 + sortPriority * 10000
             if gear.EquippableGear then
                 order = order + 5000 + ((tonumber(gear.Cost) or 0) / 1000000)
             else
-                order = order - ((tonumber(gear.RestockChance) or 0) * 100) + (index / 1000)
+                order = order - ((tonumber(gear.RestockChance) or 0) * 100) + ((tonumber(index) or 0) / 1000)
             end
             local item = makeDirectShopItem(
-                name,
-                readStockValue("GearShop", name),
-                gear.Cost or 0,
+                shopName,
+                gear.ItemName,
+                stockIndex,
+                gear.Cost,
                 gear.Rarity,
                 gear.IMG,
-                order
+                order,
+                overrides,
+                normalizedOverrides
             )
             if item then table.insert(items, item) end
         end
     end
+    appendUnmappedLiveStockItems(items, shopName, stockIndex, overrides, normalizedOverrides)
     return sortDirectShopItems(items)
 end
 
@@ -1734,37 +1870,49 @@ function buildDirectCrateShop()
         return crateData.GetAllCrates()
     end)
     if not ok or type(crates) ~= "table" then return {} end
+
+    local shopName = "CrateShop"
+    local stockIndex = getStockItemsIndex(shopName)
+    local overrides, normalizedOverrides = getShopPriceOverrides(shopName)
     local items = {}
-    for index, crate in ipairs(crates) do
-        if shouldIncludeCrate(crate) then
+    for index, crate in pairs(crates) do
+        if isCrateShopCatalogItem(crate) then
             local rarityRank = SHOP_RARITY_ORDER[crate.Rarity or ""] or 0
-            local order = rarityRank * 1000000 - ((tonumber(crate.RestockChance) or 0) * 1000) + (index / 1000)
+            local order = rarityRank * 1000000 - ((tonumber(crate.RestockChance) or 0) * 1000) + ((tonumber(index) or 0) / 1000)
             local item = makeDirectShopItem(
+                shopName,
                 crate.Name,
-                readStockValue("CrateShop", crate.Name),
-                crate.Cost or 0,
+                stockIndex,
+                crate.Cost,
                 crate.Rarity,
                 crate.IMG,
-                order
+                order,
+                overrides,
+                normalizedOverrides
             )
             if item then table.insert(items, item) end
         end
     end
+    appendUnmappedLiveStockItems(items, shopName, stockIndex, overrides, normalizedOverrides)
     return sortDirectShopItems(items)
 end
 
 function getDirectShopData(shopKey)
+    local cacheKey = getDirectShopCacheKey(shopKey)
     local now = os.clock()
-    if DIRECT_SHOP_CACHE[shopKey] and (now - (DIRECT_SHOP_CACHE_AT[shopKey] or -999)) < DIRECT_SHOP_CACHE_SECONDS then
-        return DIRECT_SHOP_CACHE[shopKey]
+    local cachedItems = DIRECT_SHOP_CACHE[cacheKey]
+    if type(cachedItems) == "table" and #cachedItems > 0
+        and (now - (DIRECT_SHOP_CACHE_AT[cacheKey] or -999)) < DIRECT_SHOP_CACHE_SECONDS then
+        return cachedItems
     end
 
+    local canonicalShopKey = getCanonicalShopKey(shopKey)
     local ok, items = pcall(function()
-        if shopKey == "SeedShop_Normal" or shopKey == "SeedShop" then
+        if canonicalShopKey == "SeedShop" then
             return buildDirectSeedShop()
-        elseif shopKey == "GearShop" then
+        elseif canonicalShopKey == "GearShop" then
             return buildDirectGearShop()
-        elseif shopKey == "CrateShop" then
+        elseif canonicalShopKey == "CrateShop" then
             return buildDirectCrateShop()
         end
         return {}
@@ -1773,8 +1921,8 @@ function getDirectShopData(shopKey)
     if not ok or type(items) ~= "table" then
         items = {}
     end
-    DIRECT_SHOP_CACHE[shopKey] = items
-    DIRECT_SHOP_CACHE_AT[shopKey] = now
+    DIRECT_SHOP_CACHE[cacheKey] = items
+    DIRECT_SHOP_CACHE_AT[cacheKey] = now
     return items
 end
 
@@ -2941,201 +3089,7 @@ function getCatalogImageByName(catalog, name)
     return nil
 end
 
--- Legacy GUI parser retained only as dead fallback/reference; active code below uses
--- FruitImages + FruitStock snapshots and never calls these legacy* functions.
-function legacyGetFruitRefreshTimer()
-    return nil
-end
-
-function legacyGetFruitMultipliers()
-    if true then return {} end
-    local multipliers = {}
-    local success, err = pcall(function()
-        local fruitStockPrice = PlayerGui:FindFirstChild("FruitStockPrice")
-        if not fruitStockPrice then
-            for _, child in ipairs(PlayerGui:GetChildren()) do
-                if child:IsA("ScreenGui") then
-                    local nl = string.lower(child.Name)
-                    if string.find(nl, "fruit") and (string.find(nl, "stock") or string.find(nl, "price") or string.find(nl, "multiplier")) then
-                        fruitStockPrice = child
-                        break
-                    end
-                end
-            end
-        end
-        if not fruitStockPrice then return end
-
-        local scrollingFrame = fruitStockPrice:FindFirstChildOfClass("ScrollingFrame")
-            or fruitStockPrice:FindFirstChild("ScrollingFrame", true)
-        if not scrollingFrame then
-            for _, desc in ipairs(fruitStockPrice:GetDescendants()) do
-                if desc:IsA("Frame") and desc.Name ~= "Frame" then
-                    for _, c in ipairs(desc:GetChildren()) do
-                        local cl = string.lower(c.Name)
-                        if string.find(cl, "card") or string.find(cl, "fruit") then
-                            scrollingFrame = desc
-                            break
-                        end
-                    end
-                    if scrollingFrame then break end
-                end
-            end
-        end
-        if not scrollingFrame then return end
-
-        local seen = {}
-        for _, card in ipairs(scrollingFrame:GetChildren()) do
-            if card:IsA("GuiObject") and isInstanceVisible(card) then
-                local nameLower = string.lower(card.Name)
-                local isLayoutOrTemplate = string.find(nameLower, "layout") or string.find(nameLower, "padding")
-                    or string.find(nameLower, "constraint") or nameLower == "template" or nameLower == "itemtemplate"
-                if not isLayoutOrTemplate then
-                    local frameInner = card:FindFirstChild("Frame") or card:FindFirstChildOfClass("Frame")
-
-                    -- Multiplier value
-                    local multText, multiplierLabel = nil, nil
-                    if frameInner then
-                        multiplierLabel = findChildByNormalizedName(frameInner, { "Multiplier" })
-                        if multiplierLabel and multiplierLabel:IsA("TextLabel") then
-                            multText = multiplierLabel.Text or ""
-                        end
-                    end
-                    if not multText or multText == "" then
-                        local searchRoot = frameInner or card
-                        for _, desc in ipairs(searchRoot:GetDescendants()) do
-                            if desc:IsA("TextLabel") and desc.Text and desc.Text ~= "" then
-                                local cleanText = desc.Text:gsub(",", ".")
-                                local num = string.match(cleanText, "([%d%.]+)")
-                                if num then
-                                    local lowerText = string.lower(desc.Text)
-                                    if string.find(lowerText, "x") or string.find(lowerText, "РЎвЂ¦") or string.find(lowerText, "%*") 
-                                       or string.match(cleanText, "^%s*[%d%.]+%s*$") then
-                                        multText = num
-                                        multiplierLabel = desc
-                                        break
-                                    end
-                                end
-                            end
-                        end
-                    end
-                    if not multText then multText = "1" end
-                    local valNum = tonumber(string.match(multText:gsub(",", "."), "([%d%.]+)")) or 1.0
-
-                    -- Image
-                    local imageAssetId = nil
-                    if frameInner then
-                        local fruitVector = findChildByNormalizedName(frameInner, { "FruitVector" })
-                        if fruitVector and (fruitVector:IsA("ImageLabel") or fruitVector:IsA("ImageButton")) then
-                            imageAssetId = string.match(fruitVector.Image or "", "%d+")
-                        end
-                    end
-                    if not imageAssetId then
-                        local searchRoot = frameInner or card
-                        for _, desc in ipairs(searchRoot:GetDescendants()) do
-                            if (desc:IsA("ImageLabel") or desc:IsA("ImageButton")) then
-                                local dn = string.lower(desc.Name)
-                                if dn ~= "beveleffect" and dn ~= "sunburst" and dn ~= "shadow" then
-                                    local aid = string.match(desc.Image or "", "%d+")
-                                    if aid and aid ~= "112886786873408" then
-                                        imageAssetId = aid
-                                        break
-                                    end
-                                end
-                            end
-                        end
-                    end
-
-                    -- Name: attribute > StringValue > label > asset map
-                    local fruitName = nil
-                    local toolTipAttr = card:GetAttribute("SeedToolTip") or (frameInner and frameInner:GetAttribute("SeedToolTip"))
-                    if toolTipAttr and type(toolTipAttr) == "string" and toolTipAttr ~= "" then
-                        fruitName = cleanScrapedName(toolTipAttr)
-                    end
-                    if not fruitName then
-                        local toolTipVal = card:FindFirstChild("SeedToolTip", true)
-                        if toolTipVal and (toolTipVal:IsA("StringValue") or toolTipVal:IsA("TextLabel")) then
-                            local text = toolTipVal:IsA("StringValue") and toolTipVal.Value or toolTipVal.Text
-                            if text and text ~= "" then fruitName = cleanScrapedName(text) end
-                        end
-                    end
-                    if not fruitName and frameInner then
-                        for _, child in ipairs(frameInner:GetChildren()) do
-                            if child:IsA("TextLabel") and child ~= multiplierLabel then
-                                local cn = string.lower(child.Name)
-                                if cn == "big" or cn == "mega" or cn == "title" or cn == "fruitname" or cn == "name" then
-                                    local text = child.Text or ""
-                                    if text ~= "" and not string.find(text, "[%d]") and not string.find(string.lower(text), "^x") then
-                                        local cleanText = text:gsub("^%s*(.-)%s*$", "%1")
-                                        if cleanText ~= "" then fruitName = cleanText; break end
-                                    end
-                                end
-                            end
-                        end
-                        if not fruitName then
-                            for _, child in ipairs(frameInner:GetChildren()) do
-                                if child:IsA("TextLabel") and child ~= multiplierLabel then
-                                    local cn = string.lower(child.Name)
-                                    if cn ~= "multiplier" and cn ~= "cost_text" and cn ~= "stock_text" and cn ~= "rarity_text" then
-                                        local text = child.Text or ""
-                                        if text ~= "" and not string.find(text, "[%d]") and not string.find(string.lower(text), "^x") then
-                                            local cleanText = text:gsub("^%s*(.-)%s*$", "%1")
-                                            if cleanText ~= "" then fruitName = cleanText; break end
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                    if not fruitName and imageAssetId and assetToItemNameMap[imageAssetId] then
-                        fruitName = assetToItemNameMap[imageAssetId]
-                    end
-                    if not fruitName then
-                        local searchRoot = frameInner or card
-                        for _, desc in ipairs(searchRoot:GetDescendants()) do
-                            if desc:IsA("TextLabel") and desc ~= multiplierLabel
-                               and not (multiplierLabel and desc:IsDescendantOf(multiplierLabel)) then
-                                local dn = string.lower(desc.Name)
-                                if dn ~= "multiplier" and dn ~= "cost_text" and dn ~= "stock_text" and dn ~= "rarity_text" then
-                                    local text = desc.Text or ""
-                                    if text ~= "" and not string.find(text, "[%d]") and not string.find(string.lower(text), "^x") then
-                                        local cleanText = text:gsub("^%s*(.-)%s*$", "%1")
-                                        if cleanText ~= "" then fruitName = cleanText; break end
-                                    end
-                                end
-                            end
-                        end
-                    end
-
-                    local key
-                    if fruitName then key = fruitName
-                    elseif imageAssetId then key = "Asset_" .. imageAssetId
-                    else key = "Unknown_" .. tostring(#multipliers + 1) end
-
-                    if seen[key] then
-                        if valNum > (multipliers[seen[key]].multiplier or 0) then
-                            multipliers[seen[key]].multiplier = valNum
-                        end
-                    else
-                        seen[key] = (#multipliers + 1)
-                        table.insert(multipliers, {
-                            name = fruitName,
-                            image = imageAssetId,
-                            key = key,
-                            multiplier = valNum
-                        })
-                    end
-                end
-            end
-        end
-    end)
-    if not success and DEBUG then
-        warn("[Grow a Garden 2 Stocker] Error getting fruit multipliers: " .. tostring(err))
-    end
-    return multipliers
-end
-
--- Active fruit multiplier source:
--- FruitImages gives fruit name -> image id, FruitStock snapshot gives fruit name -> multiplier/tier.
+-- Fruit multipliers are sourced from FruitImages and FruitStock snapshots.
 function cleanScrapedName(name)
     if not name then return nil end
     local str = tostring(name)
@@ -5068,6 +5022,7 @@ local calculatorDataCacheAt = -60
 local CALCULATOR_DATA_REFRESH_INTERVAL = 60
 local cachedFastFlags = false
 local cachedAsserts = false
+local FAST_FLAG_REPLICA_CACHE = {}
 
 function getUserGeneratedChild(...)
     local node = ReplicatedStorage:FindFirstChild("UserGenerated")
@@ -5098,26 +5053,42 @@ function getAssertsModule()
     return module
 end
 
-function getFastFlagValue(flagName, defaultValue, assertFactory)
+function getFastFlagReplica(flagName, defaultValue, assertFactory)
+    if type(flagName) ~= "string" or flagName == "" then return nil end
+    local cached = FAST_FLAG_REPLICA_CACHE[flagName]
+    if cached then return cached end
+
     local fastFlags = getFastFlagsModule()
-    local asserts = getAssertsModule()
-    if not (fastFlags and fastFlags.Replicated and asserts and assertFactory) then
-        return defaultValue
+    if not fastFlags then return nil end
+
+    -- UI modules may have already registered this key.  Reuse that replica
+    -- instead of calling Replicated twice (the game rejects duplicate keys).
+    local existing = nil
+    if type(fastFlags.Get) == "function" then
+        local okExisting, result = pcall(fastFlags.Get, flagName)
+        if okExisting then existing = result end
+    end
+    if existing and type(existing.Get) == "function" then
+        FAST_FLAG_REPLICA_CACHE[flagName] = existing
+        return existing
     end
 
+    local asserts = getAssertsModule()
+    if not (fastFlags.Replicated and asserts and assertFactory) then return nil end
     local okAssert, assertValue = pcall(function()
         return assertFactory(asserts)
     end)
-    if not okAssert then
-        return defaultValue
-    end
+    if not okAssert then return nil end
 
-    local okFlag, flag = pcall(function()
-        return fastFlags.Replicated(flagName, assertValue, defaultValue)
-    end)
-    if not (okFlag and flag and flag.Get) then
-        return defaultValue
-    end
+    local okFlag, flag = pcall(fastFlags.Replicated, flagName, assertValue, defaultValue)
+    if not (okFlag and flag and type(flag.Get) == "function") then return nil end
+    FAST_FLAG_REPLICA_CACHE[flagName] = flag
+    return flag
+end
+
+function getFastFlagValue(flagName, defaultValue, assertFactory)
+    local flag = getFastFlagReplica(flagName, defaultValue, assertFactory)
+    if not flag then return defaultValue end
 
     local okValue, value = pcall(function()
         return flag:Get()
@@ -5819,11 +5790,16 @@ end
 -- ================== STATE POLLING + UPDATE ==================
 -- Compact hash of a fruit list, used by the fast poll to detect value changes.
 function fruitHash(list)
-    local h = ""
-    for _, m in ipairs(list) do
-        h = h .. (m.key or "?") .. ":" .. tostring(m.multiplier) .. ":" .. tostring(m.tier) .. ":" .. tostring(m.image) .. "|"
+    local parts = {}
+    for index, m in ipairs(list or {}) do
+        parts[index] = table.concat({
+            tostring(m.key or "?"),
+            tostring(m.multiplier),
+            tostring(m.tier),
+            tostring(m.image)
+        }, ":")
     end
-    return h
+    return table.concat(parts, "|")
 end
 
 function isAuctionDataComplete(auctionData)
@@ -6088,15 +6064,18 @@ safeTaskSpawn(function()
 end)
 
 local stockValueConnections = {}
+local stockItemsFolderRemovalConnections = {}
+local stockShopFolderRemovalConnections = {}
+local stockValuesFolderConnections = {}
 local stockValuesUpdateQueued = false
+local shopPriceOverrideConnections = {}
 
 function invalidateDirectShopCache(shopName)
-    if shopName == "SeedShop" then
-        DIRECT_SHOP_CACHE["SeedShop_Normal"] = nil
-        DIRECT_SHOP_CACHE_AT["SeedShop_Normal"] = nil
-    end
-    DIRECT_SHOP_CACHE[shopName] = nil
-    DIRECT_SHOP_CACHE_AT[shopName] = nil
+    local canonicalShopKey = getCanonicalShopKey(shopName)
+    local cacheKey = getDirectShopCacheKey(canonicalShopKey)
+    invalidateStockItemsIndex(canonicalShopKey)
+    DIRECT_SHOP_CACHE[cacheKey] = nil
+    DIRECT_SHOP_CACHE_AT[cacheKey] = nil
 end
 
 function scheduleStockValuesUpdate(shopName, delaySeconds)
@@ -6115,7 +6094,7 @@ end
 function watchStockValueObject(shopName, valueObject)
     if not valueObject or stockValueConnections[valueObject] then return end
     local ok, conn = pcall(function()
-        return valueObject.Changed:Connect(function()
+        return valueObject:GetPropertyChangedSignal("Value"):Connect(function()
             scheduleStockValuesUpdate(shopName, 0.08)
         end)
     end)
@@ -6139,11 +6118,54 @@ function watchStockItemsFolder(shopName, itemsFolder)
     if childAddedOk and childAddedConn then
         stockValueConnections[itemsFolder] = childAddedConn
     end
-    pcall(function()
-        itemsFolder.ChildRemoved:Connect(function()
-            scheduleStockValuesUpdate(shopName, 0.12)
+    if not stockItemsFolderRemovalConnections[itemsFolder] then
+        local childRemovedOk, childRemovedConn = pcall(function()
+            return itemsFolder.ChildRemoved:Connect(function()
+                scheduleStockValuesUpdate(shopName, 0.12)
+            end)
         end)
-    end)
+        if childRemovedOk and childRemovedConn then
+            stockItemsFolderRemovalConnections[itemsFolder] = childRemovedConn
+        end
+    end
+end
+
+function getShopPriceOverrideReplica(shopName)
+    local canonicalShopKey = getCanonicalShopKey(shopName)
+    local config = SHOP_PRICE_OVERRIDE_CONFIG[canonicalShopKey]
+    if not config then return nil end
+    local replica = getFastFlagReplica(config.flagName)
+    if replica then return replica end
+
+    -- Register the flag with the exact schema used by the native shop code,
+    -- then retrieve the cached replica for Changed/Loaded subscriptions.
+    getShopPriceOverrides(canonicalShopKey)
+    return getFastFlagReplica(config.flagName)
+end
+
+function watchShopPriceOverrideFlags()
+    for shopName in pairs(SHOP_PRICE_OVERRIDE_CONFIG) do
+        local watchedShopName = shopName
+        local replica = getShopPriceOverrideReplica(watchedShopName)
+        if replica and not shopPriceOverrideConnections[replica] then
+            local function refreshShopPrices()
+                scheduleStockValuesUpdate(watchedShopName, 0.08)
+            end
+            local connected = false
+            for _, signalName in ipairs({ "Changed", "Loaded" }) do
+                local ok, conn = pcall(function()
+                    local signal = replica[signalName]
+                    return signal and signal.Connect and signal:Connect(refreshShopPrices) or nil
+                end)
+                if ok and conn then
+                    connected = true
+                end
+            end
+            if connected then
+                shopPriceOverrideConnections[replica] = true
+            end
+        end
+    end
 end
 
 function watchStockShopFolder(shopFolder)
@@ -6171,26 +6193,78 @@ function watchStockShopFolder(shopFolder)
             stockValueConnections[shopFolder] = conn
         end
     end
+    if not stockShopFolderRemovalConnections[shopFolder] then
+        local ok, conn = pcall(function()
+            return shopFolder.ChildRemoved:Connect(function(child)
+                if child.Name == "Items" or child.Name == "UnixNextRestock" or child.Name == "UnixLastRestock" then
+                    scheduleStockValuesUpdate(shopName, 0.12)
+                end
+            end)
+        end)
+        if ok and conn then
+            stockShopFolderRemovalConnections[shopFolder] = conn
+        end
+    end
+end
+
+function watchStockValuesFolder(stockValuesFolder)
+    if not stockValuesFolder then return end
+    for _, shopFolder in ipairs(stockValuesFolder:GetChildren()) do
+        watchStockShopFolder(shopFolder)
+    end
+    if stockValuesFolderConnections[stockValuesFolder] then return end
+
+    local _, childAddedConn = pcall(function()
+        return stockValuesFolder.ChildAdded:Connect(function(shopFolder)
+            watchStockShopFolder(shopFolder)
+            scheduleStockValuesUpdate(shopFolder.Name, 0.15)
+        end)
+    end)
+    local _, childRemovedConn = pcall(function()
+        return stockValuesFolder.ChildRemoved:Connect(function(shopFolder)
+            scheduleStockValuesUpdate(shopFolder.Name, 0.15)
+        end)
+    end)
+    if childAddedConn or childRemovedConn then
+        stockValuesFolderConnections[stockValuesFolder] = {
+            added = childAddedConn,
+            removed = childRemovedConn
+        }
+    end
 end
 
 refreshRuntimeRefs()
 local StockValues = waitForChildSoft(ReplicatedStorage, "StockValues", 20)
 if StockValues then
     print("[Grow a Garden 2 Stocker] Monitoring StockValues folder for updates...")
-    for _, shopFolder in ipairs(StockValues:GetChildren()) do
-        watchStockShopFolder(shopFolder)
-    end
-    pcall(function()
-        StockValues.ChildAdded:Connect(function(shopFolder)
-            watchStockShopFolder(shopFolder)
-            scheduleStockValuesUpdate(shopFolder.Name, 0.15)
-        end)
-    end)
+    watchStockValuesFolder(StockValues)
 else
     if DEBUG then
         warn("[Grow a Garden 2 Stocker] StockValues folder not found in ReplicatedStorage.")
     end
 end
+
+pcall(function()
+    ReplicatedStorage.ChildAdded:Connect(function(child)
+        if child.Name ~= "StockValues" then return end
+        watchStockValuesFolder(child)
+        for _, shopName in ipairs({ "SeedShop", "GearShop", "CrateShop" }) do
+            scheduleStockValuesUpdate(shopName, 0.15)
+        end
+    end)
+end)
+
+watchShopPriceOverrideFlags()
+
+-- If the replicated flags arrive after the script, retry a few times.  Even if
+-- an executor blocks their events, getDirectShopData re-reads them at cache expiry.
+safeTaskSpawn(function()
+    for _ = 1, 6 do
+        if not isCurrentScraperRun() then return end
+        watchShopPriceOverrideFlags()
+        safeTaskWait(2)
+    end
+end)
 
 local environmentUpdateQueued = false
 
