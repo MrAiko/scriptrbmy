@@ -1813,7 +1813,7 @@ end
 -- after startup.  It uses the same replicated FastFlag objects as the native UI.
 function getShopPriceOverrides(shopName)
     local config = SHOP_PRICE_OVERRIDE_CONFIG[getCanonicalShopKey(shopName)]
-    if not config then return {}, {} end
+    if not config then return {} end
 
     local overrides = getFastFlagValue(config.flagName, {}, function(asserts)
         if config.allowsBasePriceSentinel then
@@ -1822,39 +1822,36 @@ function getShopPriceOverrides(shopName)
         return asserts.Map(asserts.String, asserts.FiniteNonNegative)
     end)
     if type(overrides) ~= "table" then overrides = {} end
-
-    local normalized = {}
-    for itemName, value in pairs(overrides) do
-        if type(itemName) == "string" then
-            local key = normalizeName(itemName)
-            if key ~= "" then normalized[key] = value end
-        end
-    end
-    return overrides, normalized
+    return overrides
 end
 
-function getShopPriceOverride(name, overrides, normalizedOverrides)
+function getShopPriceOverride(name, overrides)
     if type(name) ~= "string" then return nil end
     local value = type(overrides) == "table" and overrides[name] or nil
-    if value == nil and type(normalizedOverrides) == "table" then
-        value = normalizedOverrides[normalizeName(name)]
+
+    -- Match RestockStoreController exactly: price overrides are keyed by the
+    -- item's original catalogue name.  Normalizing apostrophes/spaces here made
+    -- malformed or legacy flag keys affect a different live item (Dragon's
+    -- Breath was receiving 90M instead of its 130M catalogue price).
+    if type(value) ~= "number" or value ~= value or value == math.huge or value == -math.huge then
+        return nil
     end
-    return tonumber(value)
+    return value
 end
 
-function resolveShopPrice(name, basePrice, overrides, normalizedOverrides)
+function resolveShopPrice(name, basePrice, overrides)
     local base = tonumber(basePrice)
-    if base and base < 0 then base = nil end
-    local override = getShopPriceOverride(name, overrides, normalizedOverrides)
+    if base and (base < 0 or base ~= base or base == math.huge or base == -math.huge) then base = nil end
+    local override = getShopPriceOverride(name, overrides)
     if override and override >= 0 then
         return override
     end
     return base
 end
 
-function makeDirectShopItem(shopName, name, stockIndex, basePrice, rarity, image, order, overrides, normalizedOverrides, source)
+function makeDirectShopItem(shopName, name, stockIndex, basePrice, rarity, image, order, overrides, source)
     if type(name) ~= "string" or name == "" then return nil end
-    local priceRaw = resolveShopPrice(name, basePrice, overrides, normalizedOverrides)
+    local priceRaw = resolveShopPrice(name, basePrice, overrides)
     return {
         name = name,
         stock = readStockValue(shopName, name, stockIndex),
@@ -1882,7 +1879,7 @@ function buildDirectSeedShop()
     if type(seedData) ~= "table" then return {} end
     local shopName = "SeedShop"
     local stockIndex = getStockItemsIndex(shopName)
-    local overrides, normalizedOverrides = getShopPriceOverrides(shopName)
+    local overrides = getShopPriceOverrides(shopName)
     local items = {}
     for index, seed in pairs(seedData) do
         if isSeedShopCatalogItem(seed) then
@@ -1894,8 +1891,7 @@ function buildDirectSeedShop()
                 seed.Rarity,
                 seed.SeedImage,
                 seed.SeedShopDisplayOrder or tonumber(index) or 999999,
-                overrides,
-                normalizedOverrides
+                overrides
             )
             if item then table.insert(items, item) end
         end
@@ -1909,7 +1905,7 @@ function buildDirectGearShop()
     if type(rawItems) ~= "table" then return {} end
     local shopName = "GearShop"
     local stockIndex = getStockItemsIndex(shopName)
-    local overrides, normalizedOverrides = getShopPriceOverrides(shopName)
+    local overrides = getShopPriceOverrides(shopName)
     local items = {}
     for index, gear in pairs(rawItems) do
         if isGearShopCatalogItem(gear) then
@@ -1929,8 +1925,7 @@ function buildDirectGearShop()
                 gear.Rarity,
                 gear.IMG,
                 order,
-                overrides,
-                normalizedOverrides
+                overrides
             )
             if item then table.insert(items, item) end
         end
@@ -1948,7 +1943,7 @@ function buildDirectCrateShop()
 
     local shopName = "CrateShop"
     local stockIndex = getStockItemsIndex(shopName)
-    local overrides, normalizedOverrides = getShopPriceOverrides(shopName)
+    local overrides = getShopPriceOverrides(shopName)
     local items = {}
     for index, crate in pairs(crates) do
         if isCrateShopCatalogItem(crate) then
@@ -1962,8 +1957,7 @@ function buildDirectCrateShop()
                 crate.Rarity,
                 crate.IMG,
                 order,
-                overrides,
-                normalizedOverrides
+                overrides
             )
             if item then table.insert(items, item) end
         end
