@@ -1665,6 +1665,18 @@ local SHOP_PRICE_OVERRIDE_CONFIG = {
     }
 }
 
+-- The downloaded catalogue says 130M, while the currently replicated flag can
+-- report the stale 90M pair. Keep this exception deliberately narrow so valid
+-- live balance changes (for example Super Sprinkler 300K -> 3M) still apply.
+local KNOWN_BAD_SHOP_PRICE_OVERRIDES = {
+    SeedShop = {
+        ["Dragon's Breath"] = {
+            base = 130000000,
+            override = 90000000
+        }
+    }
+}
+
 function getCanonicalShopKey(shopKey)
     if shopKey == "SeedShop" or shopKey == "SeedShop_Normal" then
         return "SeedShop"
@@ -1809,8 +1821,6 @@ function isCrateShopCatalogItem(crate)
         and crate.RestockChance ~= nil
 end
 
--- getFastFlagValue is defined later in the script, but all shop builds happen
--- after startup.  It uses the same replicated FastFlag objects as the native UI.
 function getShopPriceOverrides(shopName)
     local config = SHOP_PRICE_OVERRIDE_CONFIG[getCanonicalShopKey(shopName)]
     if not config then return {} end
@@ -1821,29 +1831,31 @@ function getShopPriceOverrides(shopName)
         end
         return asserts.Map(asserts.String, asserts.FiniteNonNegative)
     end)
-    if type(overrides) ~= "table" then overrides = {} end
-    return overrides
+    return type(overrides) == "table" and overrides or {}
 end
 
 function getShopPriceOverride(name, overrides)
-    if type(name) ~= "string" then return nil end
-    local value = type(overrides) == "table" and overrides[name] or nil
-
-    -- Match RestockStoreController exactly: price overrides are keyed by the
-    -- item's original catalogue name.  Normalizing apostrophes/spaces here made
-    -- malformed or legacy flag keys affect a different live item (Dragon's
-    -- Breath was receiving 90M instead of its 130M catalogue price).
+    if type(name) ~= "string" or type(overrides) ~= "table" then return nil end
+    local value = overrides[name]
     if type(value) ~= "number" or value ~= value or value == math.huge or value == -math.huge then
         return nil
     end
     return value
 end
 
-function resolveShopPrice(name, basePrice, overrides)
+function isKnownBadShopPriceOverride(shopName, name, basePrice, overridePrice)
+    local shopExceptions = KNOWN_BAD_SHOP_PRICE_OVERRIDES[getCanonicalShopKey(shopName)]
+    local exception = shopExceptions and shopExceptions[name] or nil
+    return exception ~= nil
+        and basePrice == exception.base
+        and overridePrice == exception.override
+end
+
+function resolveShopPrice(shopName, name, basePrice, overrides)
     local base = tonumber(basePrice)
     if base and (base < 0 or base ~= base or base == math.huge or base == -math.huge) then base = nil end
     local override = getShopPriceOverride(name, overrides)
-    if override and override >= 0 then
+    if override and override >= 0 and not isKnownBadShopPriceOverride(shopName, name, base, override) then
         return override
     end
     return base
@@ -1851,7 +1863,7 @@ end
 
 function makeDirectShopItem(shopName, name, stockIndex, basePrice, rarity, image, order, overrides, source)
     if type(name) ~= "string" or name == "" then return nil end
-    local priceRaw = resolveShopPrice(name, basePrice, overrides)
+    local priceRaw = resolveShopPrice(shopName, name, basePrice, overrides)
     return {
         name = name,
         stock = readStockValue(shopName, name, stockIndex),
@@ -6522,8 +6534,7 @@ function getShopPriceOverrideReplica(shopName)
     local replica = getFastFlagReplica(config.flagName)
     if replica then return replica end
 
-    -- Register the flag with the exact schema used by the native shop code,
-    -- then retrieve the cached replica for Changed/Loaded subscriptions.
+    -- Register the exact native schema if the shop UI has not done so yet.
     getShopPriceOverrides(canonicalShopKey)
     return getFastFlagReplica(config.flagName)
 end
@@ -6533,22 +6544,18 @@ function watchShopPriceOverrideFlags()
         local watchedShopName = shopName
         local replica = getShopPriceOverrideReplica(watchedShopName)
         if replica and not shopPriceOverrideConnections[replica] then
+            local connected = false
             local function refreshShopPrices()
                 scheduleStockValuesUpdate(watchedShopName, 0.08)
             end
-            local connected = false
             for _, signalName in ipairs({ "Changed", "Loaded" }) do
                 local ok, conn = pcall(function()
                     local signal = replica[signalName]
                     return signal and signal.Connect and connectRunSignal(signal, refreshShopPrices) or nil
                 end)
-                if ok and conn then
-                    connected = true
-                end
+                if ok and conn then connected = true end
             end
-            if connected then
-                shopPriceOverrideConnections[replica] = true
-            end
+            if connected then shopPriceOverrideConnections[replica] = true end
         end
     end
 end
@@ -6641,8 +6648,8 @@ end)
 
 watchShopPriceOverrideFlags()
 
--- If the replicated flags arrive after the script, retry a few times.  Even if
--- an executor blocks their events, getDirectShopData re-reads them at cache expiry.
+-- Flags can register a moment after startup. Retrying briefly keeps live price
+-- changes event-driven without adding a permanent polling loop.
 safeTaskSpawn(function()
     for _ = 1, 6 do
         if not isCurrentScraperRun() then return end
