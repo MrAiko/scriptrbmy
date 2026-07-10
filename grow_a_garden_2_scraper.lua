@@ -116,6 +116,7 @@ local UPDATE_INTERVAL = 180      -- Rare safety refresh; normal updates are even
 local POLL_INTERVAL = 60         -- Lightweight fallback only. Never rebuild every UI/data tree frequently.
 local FRUIT_REQUEST_INTERVAL = 60 -- Fallback remote refresh interval if Snapshot event is missed
 local DEBUG = false             -- Set to true only to diagnose scraper issues
+local ALLOW_GUI_FALLBACK = false -- v185 exposes every tracked value through replicas/attributes/network snapshots.
 local MOBILE_SAFE_MODE = UserInputService and UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 -- MuMu reports itself as touch-only, so headless rendering must be enabled
 -- explicitly.  The visual sweep below is one-shot and property-only: deleting
@@ -1665,6 +1666,20 @@ local SHOP_PRICE_OVERRIDE_CONFIG = {
     }
 }
 
+local SHOP_LIMITED_CONFIG = {
+    SeedShop = {
+        moduleName = "SeedShopLimited",
+        flagName = "Game.SeedShop.LimitedEndTimes",
+        overrideFolderName = "SeedShopLimitedOverrides"
+    },
+    CrateShop = {
+        moduleName = "CrateShopLimited",
+        flagName = "Game.CrateShop.LimitedEndTimes",
+        overrideFolderName = "CrateShopLimitedOverrides"
+    }
+}
+local LIMITED_EXPIRY_SCHEDULE = {}
+
 -- The downloaded catalogue says 130M, while the currently replicated flag can
 -- report the stale 90M pair. Keep this exception deliberately narrow so valid
 -- live balance changes (for example Super Sprinkler 300K -> 3M) still apply.
@@ -1803,6 +1818,7 @@ function isSeedShopCatalogItem(seed)
         and seed.RestockShop == true
         and type(seed.SeedName) == "string"
         and seed.SeedName ~= ""
+        and not isShopLimitedItemExpired("SeedShop", seed.SeedName)
 end
 
 function isGearShopCatalogItem(gear)
@@ -1819,6 +1835,67 @@ function isCrateShopCatalogItem(crate)
         and type(crate.Name) == "string"
         and crate.Name ~= ""
         and crate.RestockChance ~= nil
+        and not isShopLimitedItemExpired("CrateShop", crate.Name)
+end
+
+function getShopLimitedEndTime(shopName, itemName)
+    local config = SHOP_LIMITED_CONFIG[getCanonicalShopKey(shopName)]
+    if not config or type(itemName) ~= "string" or itemName == "" then return nil end
+
+    local module = getRequiredSharedModule(config.moduleName)
+    if type(module) == "table" and type(module.GetEndTime) == "function" then
+        local ok, endTime = pcall(module.GetEndTime, itemName)
+        endTime = ok and tonumber(endTime) or nil
+        if endTime and endTime > 0 then return endTime end
+    end
+
+    -- Keep the native override-folder precedence even if an executor cannot
+    -- require the limited-item helper module.
+    local overrideFolder = ReplicatedStorage:FindFirstChild(config.overrideFolderName)
+    local override = overrideFolder and overrideFolder:FindFirstChild(itemName)
+    if override and override:IsA("NumberValue") and tonumber(override.Value) and override.Value > 0 then
+        return tonumber(override.Value)
+    end
+
+    local endTimes = getFastFlagValue(config.flagName, {}, function(asserts)
+        return asserts.Map(asserts.String, asserts.FiniteNonNegative)
+    end)
+    local endTime = type(endTimes) == "table" and tonumber(endTimes[itemName]) or nil
+    return endTime and endTime > 0 and endTime or nil
+end
+
+function isShopLimitedItemExpired(shopName, itemName)
+    local config = SHOP_LIMITED_CONFIG[getCanonicalShopKey(shopName)]
+    if not config then return false end
+
+    local module = getRequiredSharedModule(config.moduleName)
+    if type(module) == "table" and type(module.IsExpired) == "function" then
+        local ok, expired = pcall(module.IsExpired, itemName)
+        if ok then return expired == true end
+    end
+
+    local endTime = getShopLimitedEndTime(shopName, itemName)
+    if not endTime then return false end
+    local ok, serverNow = pcall(function() return workspace:GetServerTimeNow() end)
+    return endTime <= (ok and serverNow or os.time())
+end
+
+function scheduleShopLimitedExpiry(shopName, itemName, endTime)
+    endTime = tonumber(endTime)
+    if not endTime or endTime <= 0 then return end
+    local key = getCanonicalShopKey(shopName) .. ":" .. tostring(itemName)
+    if LIMITED_EXPIRY_SCHEDULE[key] == endTime then return end
+    LIMITED_EXPIRY_SCHEDULE[key] = endTime
+
+    local ok, serverNow = pcall(function() return workspace:GetServerTimeNow() end)
+    local delaySeconds = endTime - (ok and serverNow or os.time())
+    if delaySeconds <= 0 then return end
+    safeTaskDelay(delaySeconds + 0.1, function()
+        if not isCurrentScraperRun() or LIMITED_EXPIRY_SCHEDULE[key] ~= endTime then return end
+        LIMITED_EXPIRY_SCHEDULE[key] = nil
+        invalidateDirectShopCache(shopName)
+        if type(updateAPI) == "function" then updateAPI(nil) end
+    end)
 end
 
 function getShopPriceOverrides(shopName)
@@ -1905,7 +1982,11 @@ function buildDirectSeedShop()
                 seed.SeedShopDisplayOrder or tonumber(index) or 999999,
                 overrides
             )
-            if item then table.insert(items, item) end
+            if item then
+                item.limitedEndTime = getShopLimitedEndTime(shopName, seed.SeedName)
+                scheduleShopLimitedExpiry(shopName, seed.SeedName, item.limitedEndTime)
+                table.insert(items, item)
+            end
         end
     end
     return sortDirectShopItems(items)
@@ -1971,7 +2052,11 @@ function buildDirectCrateShop()
                 order,
                 overrides
             )
-            if item then table.insert(items, item) end
+            if item then
+                item.limitedEndTime = getShopLimitedEndTime(shopName, crate.Name)
+                scheduleShopLimitedExpiry(shopName, crate.Name, item.limitedEndTime)
+                table.insert(items, item)
+            end
         end
     end
     return sortDirectShopItems(items)
@@ -2011,7 +2096,11 @@ function getShopData(shopKey, fallbackContainer)
     if type(directItems) == "table" and #directItems > 0 then
         return directItems
     end
-    return scrapeShopSafe(fallbackContainer)
+    if ALLOW_GUI_FALLBACK then
+        local container = type(fallbackContainer) == "function" and fallbackContainer() or fallbackContainer
+        return scrapeShopSafe(container)
+    end
+    return {}
 end
 
 function getShopsHash()
@@ -3035,50 +3124,52 @@ function getWeatherCatalog()
     end
 
     local catalog = {}
-    local function add(rawName, root, allowUnknown)
-        if not rawName or rawName == "" or not root then return end
+    local function add(rawName, rawImage, isPhase)
+        if type(rawName) ~= "string" or rawName == "" then return end
         if isTechnicalPhaseName(rawName) or isDecorativeWeatherCatalogName(rawName) then return end
-        local image = findImageId(root, rawName)
-        if not image then return end
-        local displayName = cleanWeatherStateName(rawName) or (isWeatherPhaseName(rawName) and cleanPhaseName(rawName) or (allowUnknown and formatCamelCase(rawName) or nil))
-        if not displayName or displayName == "" then displayName = rawName end
-        if not isWeatherImageValidForName(displayName, image) then return end
-        catalog[displayName] = {
-            name = displayName,
-            image = image
-        }
-    end
-
-    local weatherUI = findWeatherUI()
-    local frame = weatherUI and (weatherUI:FindFirstChild("Frame") or weatherUI)
-    if frame then
-        for _, child in ipairs(getWeatherFrameCards(frame)) do
-            local displayName = resolveWeatherCardName(child)
-            add(displayName or child.Name, child, true)
+        local displayName = isPhase and cleanPhaseName(rawName)
+            or cleanWeatherStateName(rawName)
+            or formatCamelCase(rawName)
+            or rawName
+        local image = normalizeWeatherImageRef(rawImage)
+        if image and not isWeatherImageValidForName(displayName, image) then image = nil end
+        local existing = catalog[displayName]
+        if not existing or (not existing.image and image) then
+            catalog[displayName] = { name = displayName, image = image }
         end
     end
+
+    -- WeatherData and TimeCycleData are the same catalogues consumed by the
+    -- v185 controllers. Reading them avoids all PlayerGui and ReplicatedStorage
+    -- descendant scans and keeps image selection deterministic.
     for _, entry in ipairs(getWeatherDataEntries()) do
-        if not catalog[entry.name] then
-            local card = frame and (findWeatherFrameCard(frame, entry.rawName) or findWeatherFrameCard(frame, entry.name)) or nil
-            local image = entry.image or (card and findImageId(card, entry.name) or nil)
-            if image and not isWeatherImageValidForName(entry.name, image) then image = nil end
-            catalog[entry.name] = { name = entry.name, image = image }
+        add(entry.name or entry.rawName, entry.image, false)
+    end
+
+    local timeCycleData = getRequiredSharedModule("TimeCycleData")
+    local phases = type(timeCycleData) == "table" and timeCycleData.Data or nil
+    if type(phases) == "table" then
+        for phaseName, phaseInfo in pairs(phases) do
+            if type(phaseInfo) == "table" and type(phaseInfo.Weathers) == "table" then
+                for weatherName, weatherInfo in pairs(phaseInfo.Weathers) do
+                    if type(weatherInfo) == "table" then
+                        add(weatherName, weatherInfo.Image or weatherInfo.IMG or weatherInfo.Icon, true)
+                    end
+                end
+            end
         end
     end
 
-    local phases = getPhasesFolder()
-    if phases then
-        for _, child in ipairs(phases:GetChildren()) do
-            add(child.Name, child)
-        end
-    end
-
-    if (os.clock() - weatherCatalogCacheAt) > WEATHER_CATALOG_RESCAN_INTERVAL then
-        pcall(rebuildWeatherCatalogCache)
-    end
-    for name, item in pairs(weatherCatalogCache) do
-        if not catalog[name] then
-            catalog[name] = item
+    local phaseNames = {
+        day = "Day", sunset = "Sunset", moon = "Moon",
+        bloodmoon = "Blood Moon", goldmoon = "Gold Moon",
+        chainedmoon = "Chained Moon", pizzamoon = "Pizza Moon",
+        rainbowmoon = "Rainbow Moon", solareclipse = "Solar Eclipse",
+        megamoon = "Mega Moon"
+    }
+    for phaseKey, image in pairs(PHASE_FALLBACK_IMAGES) do
+        if phaseNames[phaseKey] then
+            add(phaseNames[phaseKey], image, true)
         end
     end
 
@@ -3098,84 +3189,26 @@ function getActiveWeatherAndPhase()
         return activeWeatherCache.phase, activeWeatherCache.phaseImage, activeWeatherCache.weathers, activeWeatherCache.endTime
     end
 
-    local activePhase = nil
-    local workspacePhase = getWorkspaceActivePhase()
+    -- TimeCycleController treats ActivePhase as the broad phase and
+    -- ActiveWeather as the selected day/moon variant. Both are replicated
+    -- Workspace attributes, so no visual-state inference is necessary.
+    local rawActiveWeather = workspace:GetAttribute("ActiveWeather")
+    local rawActivePhase = workspace:GetAttribute("ActivePhase")
+    local activePhase = type(rawActiveWeather) == "string" and rawActiveWeather ~= "" and cleanPhaseName(rawActiveWeather)
+        or type(rawActivePhase) == "string" and rawActivePhase ~= "" and cleanPhaseName(rawActivePhase)
+        or getDefaultPhase()
+    local endTime = getWorkspacePhaseEndTime()
+    local activeWeathers, valuesEndTime = getActiveWeatherFromWeatherValues(endTime, nil)
+    if valuesEndTime and valuesEndTime > endTime then endTime = valuesEndTime end
 
-    local activeWeathers = {}
-    local weatherUI = findWeatherUI()
-    local frame = weatherUI and (weatherUI:FindFirstChild("Frame") or weatherUI)
-    local timerText = getActiveTimerText()
-    local parsedSec = parseTimeToSeconds(timerText)
-    local endTime = parsedSec > 0 and (os.time() + parsedSec) or 0
-    local workspacePhaseEndTime = getWorkspacePhaseEndTime()
-    if workspacePhaseEndTime > endTime then
-        endTime = workspacePhaseEndTime
-    end
-
-    local activePhaseImage = nil
-    local uiPhase = nil
-    local valuesWeathers, valuesEndTime = getActiveWeatherFromWeatherValues(endTime, frame)
-    if valuesEndTime and valuesEndTime > endTime then
-        endTime = valuesEndTime
-    end
-    for weatherName, info in pairs(valuesWeathers or {}) do
-        activeWeathers[weatherName] = info
-    end
-
-    if frame then
-        for _, child in ipairs(getWeatherFrameCards(frame)) do
-            if child:IsA("GuiObject") and isWeatherCardActive(child) then
-                local weatherName, isPhase = resolveWeatherCardName(child)
-                local name = weatherName or child.Name
-                if not isPhase then
-                    weatherName = cleanWeatherStateName(name) or weatherName or formatCamelCase(name)
-                    local existing = activeWeathers[weatherName] or {}
-                    local image = existing.image or findImageId(child, weatherName)
-                    if image and not isWeatherImageValidForName(weatherName, image) then
-                        image = nil
-                    end
-                    activeWeathers[weatherName] = {
-                        playing = true,
-                        endTime = existing.endTime or endTime,
-                        image = image
-                    }
-                else
-                    activePhaseImage = findImageId(child, name)
-                    uiPhase = cleanPhaseName(name)
-                end
-            end
+    local weatherCatalog = getWeatherCatalog()
+    local activePhaseImage = getCatalogImageByName(weatherCatalog, activePhase)
+        or getPhaseFallbackImage(activePhase)
+    for weatherName, info in pairs(activeWeathers or {}) do
+        if info and not info.image then
+            info.image = getCatalogImageByName(weatherCatalog, weatherName)
         end
     end
-    local stateWeathers, statePhase = getActiveWeatherFromStateRoots(endTime)
-    for weatherName, info in pairs(stateWeathers or {}) do
-        if not activeWeathers[weatherName] then
-            activeWeathers[weatherName] = info
-        end
-    end
-    if statePhase and not isTechnicalPhaseName(statePhase) then
-        uiPhase = uiPhase or statePhase
-    end
-    if uiPhase and not isTechnicalPhaseName(uiPhase) then activePhase = uiPhase end
-
-    if workspacePhase and not isTechnicalPhaseName(workspacePhase) then
-        local workspaceIsSpecial = not isDefaultPhaseName(workspacePhase)
-        local workspaceIsNight = getPhaseKey(workspacePhase) == "moon"
-        if workspaceIsSpecial or not activePhase or (workspaceIsNight and isDefaultPhaseName(activePhase)) then
-            activePhase = workspacePhase
-        end
-    end
-
-    if not activePhase then
-        activePhase = getDefaultPhase()
-    end
-    
-    -- Check if the actual phase image matches a known special moon (e.g. Mega Moon)
-    local resolvedPhase = getPhaseNameFromImageId(activePhaseImage)
-    if resolvedPhase then
-        activePhase = resolvedPhase
-    end
-    
-    activePhaseImage = getPhaseFallbackImage(activePhase) or activePhaseImage
     activeWeatherCache = {
         phase = activePhase,
         phaseImage = activePhaseImage,
@@ -3439,9 +3472,164 @@ function getAuctioneerModule()
 end
 
 function getMailboxItemCatalog()
-    -- Avoid requiring PlayerScripts modules from executor context. Auction cards
-    -- already expose the final image/name/rarity in PlayerGui.Auction.
-    return nil
+    if cachedMailboxItemCatalog ~= false then return cachedMailboxItemCatalog end
+
+    -- Rebuild the small, data-only portion of MailboxItemCatalog from shared
+    -- modules. Requiring the original PlayerScripts module starts UI/controllers;
+    -- this resolver provides the same auction metadata without that CPU cost.
+    local categories = {}
+    local allByName = {}
+    local function add(category, name, image, rarity, displayName)
+        if type(name) ~= "string" or name == "" then return end
+        local itemKey = normalizeName(name)
+        local categoryKey = normalizeName(category)
+        if itemKey == "" or categoryKey == "" then return end
+        local meta = {
+            name = type(displayName) == "string" and displayName ~= "" and displayName or name,
+            image = readShopImageRef(image),
+            rarity = type(rarity) == "string" and rarity or ""
+        }
+        categories[categoryKey] = categories[categoryKey] or {}
+        local existing = categories[categoryKey][itemKey]
+        if not existing or (not existing.image and meta.image) then
+            categories[categoryKey][itemKey] = meta
+        end
+        local global = allByName[itemKey]
+        if not global or (not global.image and meta.image) then allByName[itemKey] = meta end
+    end
+
+    local function firstField(entry, fields)
+        if type(entry) ~= "table" then return nil end
+        for _, field in ipairs(fields) do
+            if entry[field] ~= nil then return entry[field] end
+        end
+        return nil
+    end
+
+    local function ingest(category, data, nameFields, imageFields, rarityFields)
+        if type(data) ~= "table" then return end
+        local rows = type(data.Data) == "table" and data.Data or data
+        for key, entry in pairs(rows) do
+            if type(entry) == "table" then
+                local name = firstField(entry, nameFields)
+                if not name and type(key) == "string" then name = key end
+                add(category, name, firstField(entry, imageFields), firstField(entry, rarityFields), name)
+            end
+        end
+    end
+
+    local seedData = getRequiredSharedModule("SeedData")
+    if type(seedData) == "table" then
+        for _, seed in pairs(seedData) do
+            if type(seed) == "table" and type(seed.SeedName) == "string" then
+                add("Seeds", seed.SeedName, seed.SeedImage, seed.Rarity, seed.SeedName)
+                add("HarvestedFruits", seed.SeedName, seed.FruitImage, seed.Rarity, seed.SeedName)
+            end
+        end
+    end
+
+    ingest("Gears", getRequiredSharedModule("GearShopData"),
+        { "ItemName", "Name" }, { "IMG", "Image", "Icon" }, { "Rarity" })
+    ingest("Sprinklers", getRequiredSharedModule("SprinklerData"),
+        { "SprinklerName", "ItemName", "Name" }, { "Image", "IMG", "Icon" }, { "Rarity" })
+    ingest("WateringCans", getRequiredSharedModule("WateringcanData"),
+        { "Name", "ItemName" }, { "Image", "IMG", "Icon" }, { "Rarity" })
+    ingest("Mushrooms", getRequiredSharedModule("MushroomData"),
+        { "Name", "ItemName" }, { "IMG", "Image", "Icon" }, { "Rarity" })
+    ingest("Raccoons", getRequiredSharedModule("RaccoonData"),
+        { "Name", "ItemName" }, { "IMG", "Image", "Icon" }, { "Rarity" })
+    ingest("Gnomes", getRequiredSharedModule("GnomeData"),
+        { "Name", "ItemName" }, { "IMG", "Image", "Icon" }, { "Rarity" })
+    ingest("PowerHoses", getRequiredSharedModule("PowerHoseData"),
+        { "Name", "ItemName" }, { "IMG", "Image", "Icon" }, { "Rarity" })
+    ingest("SeedPacks", getRequiredSharedModule("SeedPackData"),
+        { "PackName", "Name", "ItemName" }, { "IMG", "Image", "Icon" }, { "Rarity" })
+    ingest("Props", getRequiredSharedModule("PropData"),
+        { "PropName", "Name", "ItemName" }, { "IMG", "Image", "Icon" }, { "Rarity" })
+
+    local crateData = getRequiredSharedModule("CrateData")
+    if type(crateData) == "table" and type(crateData.GetAllCrates) == "function" then
+        local ok, crates = pcall(crateData.GetAllCrates)
+        if ok then ingest("Crates", crates, { "Name", "CrateName" }, { "IMG", "Image", "Icon" }, { "Rarity" }) end
+    else
+        ingest("Crates", crateData, { "Name", "CrateName" }, { "IMG", "Image", "Icon" }, { "Rarity" })
+    end
+    local guildCrateData = getRequiredSharedModule("GuildCrateData")
+    ingest("Crates", guildCrateData,
+        { "Name", "CrateName" }, { "IMG", "Image", "Icon" }, { "Rarity" })
+    local eggData = getRequiredSharedModule("EggData")
+    ingest("Eggs", eggData,
+        { "EggName", "Name" }, { "IMG", "Image", "Icon" }, { "Rarity" })
+
+    local sharedData = ReplicatedStorage:FindFirstChild("SharedData")
+    local petData = sharedData and safeRequireModule(sharedData:FindFirstChild("PetData")) or nil
+    ingest("Pets", petData, { "Name", "PetName", "Species" }, { "Image", "IMG", "Icon" }, { "Rarity" })
+
+    for _, folderName in ipairs({ "GearImages", "PropImages" }) do
+        local folder = SharedModules and SharedModules:FindFirstChild(folderName)
+        if folder then
+            local category = folderName == "PropImages" and "Props" or "Gears"
+            for _, child in ipairs(folder:GetChildren()) do
+                add(category, child.Name, readShopImageRef(child), "", child.Name)
+            end
+        end
+    end
+
+    local function find(category, itemName)
+        local itemKey = normalizeName(itemName)
+        if itemKey == "" then return nil end
+        local categoryRows = categories[normalizeName(category)]
+        return categoryRows and categoryRows[itemKey] or allByName[itemKey]
+    end
+
+    cachedMailboxItemCatalog = {
+        Resolve = function(category, itemName, metadata)
+            local lookupName = type(metadata) == "table" and (metadata.FruitName or metadata.Name) or itemName
+            local meta = find(category, lookupName) or find(category, itemName)
+            local categoryKey = normalizeName(category)
+            if not meta and categoryKey == "crates" then
+                for _, module in pairs({ guildCrateData, crateData }) do
+                    if type(module) == "table" and type(module.GetData) == "function" then
+                        local ok, row = pcall(module.GetData, itemName)
+                        if ok and type(row) == "table" then
+                            meta = {
+                                name = row.Name or itemName,
+                                image = readShopImageRef(row.IMG or row.Image or row.Icon),
+                                rarity = type(row.Rarity) == "string" and row.Rarity or ""
+                            }
+                            break
+                        end
+                    end
+                end
+            elseif not meta and categoryKey == "eggs"
+                and type(eggData) == "table" and type(eggData.GetData) == "function" then
+                local ok, row = pcall(eggData.GetData, itemName)
+                if ok and type(row) == "table" then
+                    meta = {
+                        name = row.EggName or row.Name or itemName,
+                        image = readShopImageRef(row.IMG or row.Image or row.Icon),
+                        rarity = type(row.Rarity) == "string" and row.Rarity or ""
+                    }
+                end
+            elseif categoryKey == "pets" and type(petData) == "table" then
+                meta = meta or { name = tostring(itemName or ""), image = nil, rarity = "" }
+                if not meta.image and type(petData.GetImage) == "function" then
+                    local ok, image = pcall(petData.GetImage, lookupName, type(metadata) == "table" and metadata.Size or nil)
+                    if ok then meta.image = readShopImageRef(image) end
+                end
+                if type(petData.GetSpeciesDisplayName) == "function" then
+                    local ok, displayName = pcall(petData.GetSpeciesDisplayName, lookupName)
+                    if ok and type(displayName) == "string" and displayName ~= "" then meta.name = displayName end
+                end
+            end
+            return meta and meta.name or tostring(itemName or ""), meta and meta.image or ""
+        end,
+        ResolveRarity = function(category, itemName)
+            local meta = find(category, itemName)
+            return meta and meta.rarity or ""
+        end
+    }
+    return cachedMailboxItemCatalog
 end
 
 local function wrapRawRemote(remote)
@@ -3545,7 +3733,6 @@ local function callNetworkEndpoint(endpoint, ...)
 
     local methods = { "Fire", "Invoke", "InvokeServer", "FireServer", "Call", "Request", "Send" }
     local lastError = nil
-    local firedWithoutResult = false
     for _, method in ipairs(methods) do
         local okMethod, fn = pcall(function()
             return endpoint[method]
@@ -3554,21 +3741,16 @@ local function callNetworkEndpoint(endpoint, ...)
             local ok, result = pcall(function(...)
                 return fn(endpoint, ...)
             end, ...)
-            if ok and result ~= nil then
-                return true, result
-            elseif ok then
-                firedWithoutResult = true
-            end
+            if ok then return true, result end
             lastError = result
 
+            -- A few executor wrappers expose an already-bound closure instead
+            -- of a normal method. Try that form only when the method call
+            -- failed; a successful nil-returning event must never be fired twice.
             ok, result = pcall(function(...)
                 return fn(...)
             end, ...)
-            if ok and result ~= nil then
-                return true, result
-            elseif ok then
-                firedWithoutResult = true
-            end
+            if ok then return true, result end
             lastError = result
         end
     end
@@ -3582,9 +3764,6 @@ local function callNetworkEndpoint(endpoint, ...)
         end, ...)
     end
 
-    if firedWithoutResult then
-        return true, nil
-    end
     return false, lastError
 end
 
@@ -4096,7 +4275,7 @@ function resolveAuctionCatalogImage(lot)
 
     for _, category in ipairs(categories) do
         for _, item in ipairs(items) do
-            local ok, result = pcall(function()
+            local ok, _, result = pcall(function()
                 return catalog.Resolve(category, item, {
                     Name = item,
                     FruitName = item,
@@ -4899,12 +5078,18 @@ function getAuctionData()
         requestAuctionSnapshot(false)
     end
     local snapshot = latestAuctionSnapshot
-    if type(snapshot) ~= "table" then return finish(getAuctionDataFromGui()) end
+    if type(snapshot) ~= "table" then
+        return finish(ALLOW_GUI_FALLBACK and getAuctionDataFromGui() or nil)
+    end
 
     local rawLots = getAuctionRawLots(snapshot)
-    if type(rawLots) ~= "table" then return finish(getAuctionDataFromGui()) end
+    if type(rawLots) ~= "table" then
+        return finish(ALLOW_GUI_FALLBACK and getAuctionDataFromGui() or nil)
+    end
 
-    local guiData = getAuctionDataFromGui()
+    -- Snapshot/StockUpdate are authoritative in v185. GUI cards are delayed,
+    -- animated presentation objects and must not be read during normal work.
+    local guiData = nil
     local guiLotsById = {}
     local guiLotsByIndex = {}
     local guiLotsByPosition = {}
@@ -5060,6 +5245,10 @@ function getAuctionData()
                 stockUnlimited = stockUnlimited,
                 currentPrice = currentPrice,
                 priceUnknown = not priceKnown,
+                startPrice = tonumber(lot.startPrice),
+                minPrice = tonumber(lot.minPrice),
+                decrementIntervalSeconds = tonumber(lot.decrementIntervalSeconds),
+                decrementPercent = tonumber(lot.decrementPercent),
                 robuxPrice = lot.robuxPrice,
                 rolledAt = lot.rolledAt,
                 expiresAt = useGuiDynamic and guiLot.expiresAt and guiLot.expiresAt > 0 and guiLot.expiresAt or lotExpiresAt,
@@ -5091,13 +5280,10 @@ function getAuctionData()
     end)
 
     if #lots == 0 then
-        return finish(getAuctionDataFromGui())
+        return finish(ALLOW_GUI_FALLBACK and getAuctionDataFromGui() or nil)
     end
 
     local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds) or 0
-    if rollIntervalSeconds <= 0 then
-        rollIntervalSeconds = 1800
-    end
     local rollWindowUnix = tonumber(snapshot.rollWindowUnix) or 0
     local serverNow = math.floor(getServerNow())
     if rollWindowUnix == 0 then
@@ -5110,13 +5296,6 @@ function getAuctionData()
         end
         if maxRolledAt > 0 then
             rollWindowUnix = maxRolledAt
-        else
-            local epochAligned = math.floor(serverNow / rollIntervalSeconds) * rollIntervalSeconds
-            if latestAuctionRollTime > 0 and math.abs(serverNow - epochAligned) > 300 then
-                rollWindowUnix = latestAuctionRollTime
-            else
-                rollWindowUnix = epochAligned
-            end
         end
     end
     local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
@@ -5132,7 +5311,7 @@ function getAuctionData()
     -- The native AuctioneerController calculates its header from
     -- rollWindowUnix + rollIntervalSeconds + timerShiftSeconds. A GUI duration
     -- is only a fallback when that cycle anchor is genuinely unavailable.
-    if not hasStableRollWindow and refreshAt <= serverNow and guiData and tonumber(guiData.refreshAt) then
+    if ALLOW_GUI_FALLBACK and not hasStableRollWindow and refreshAt <= serverNow and guiData and tonumber(guiData.refreshAt) then
         local guiRefreshAt = normalizeAuctionRefreshAt(guiData.refreshAt, serverNow)
         if guiRefreshAt > serverNow then
             refreshAt = guiRefreshAt
@@ -6208,16 +6387,29 @@ local updateInFlight = false
 local updateAfterFlight = false
 local pendingFruitData = nil
 local pendingFreshFruitScrape = false
+local lastCalculatorPayloadAt = -999
+local CALCULATOR_PAYLOAD_INTERVAL = 180
 -- Shop values often arrive as a small burst (timer + several item values).
 -- Publish the finished state after a tiny coalescing window instead of adding a
 -- visible one-second delay or serializing the same full payload many times.
-local LIVE_UPDATE_DEBOUNCE_SECONDS = 0.75
+local LIVE_UPDATE_DEBOUNCE_SECONDS = 0.25
 
 -- Network requests can yield for several seconds on a weak emulator. Keep at
 -- most one sender alive and retain only the newest payload while it is busy.
 -- This prevents a burst of stock values from becoming dozens of HTTP threads.
 local queuedStockPayload = nil
 local stockPayloadSenderRunning = false
+
+local function getCalculatorPayloadForUpdate()
+    local now = os.clock()
+    if (now - lastCalculatorPayloadAt) < CALCULATOR_PAYLOAD_INTERVAL then return nil end
+    local data = getCalculatorData()
+    if type(data) == "table" then
+        lastCalculatorPayloadAt = now
+        return data
+    end
+    return nil
+end
 
 local function transmitStockPayload(data)
     if not isCurrentScraperRun() then return end
@@ -6325,14 +6517,6 @@ function updateAPI(fruitData)
 
     updateInFlight = true
     local success, err = pcall(function()
-        local function resolveShopPath(shopName, innerName)
-            local shop = findChildByNormalizedName(PlayerGui, { shopName })
-            if not shop then return nil end
-            local frame = findChildByNormalizedName(shop, { "Frame" })
-            if not frame then return nil end
-            return findChildByNormalizedName(frame, { innerName })
-        end
-
         local phase, phaseImage, weathers, endTime = getActiveWeatherAndPhase()
         local isNight = isNightPhase(phase)
         local weatherCatalog = getWeatherCatalog()
@@ -6368,9 +6552,9 @@ function updateAPI(fruitData)
             },
             weatherCatalog = weatherCatalog,
             shops = {
-                CrateShop = getShopData("CrateShop", resolveShopPath("CrateShop", "ScrollingFrame")),
-                GearShop = getShopData("GearShop", resolveShopPath("GearShop", "ScrollingFrame")),
-                SeedShop_Normal = getShopData("SeedShop_Normal", resolveShopPath("SeedShop", "NormalShop"))
+                CrateShop = getShopData("CrateShop"),
+                GearShop = getShopData("GearShop"),
+                SeedShop_Normal = getShopData("SeedShop_Normal")
             },
             -- ALWAYS send live fruit data (never a stale cache) so the website reflects
             -- in-game multiplier changes immediately.
@@ -6382,7 +6566,10 @@ function updateAPI(fruitData)
             fruitMultiplierCatalog = activeFruitNames,
             -- Seconds until the next in-game multiplier refresh (dynamic countdown).
             fruitRefreshTimer = getFruitRefreshTimer(),
-            calculatorData = getCalculatorData(),
+            -- Calculator metadata is large and static for a server session.
+            -- Send it on startup and on the safety cadence, not with every
+            -- individual stock/weather event.
+            calculatorData = getCalculatorPayloadForUpdate(),
             auction = getPublishableAuctionData()
         }
 
@@ -6501,6 +6688,7 @@ local stockShopFolderRemovalConnections = {}
 local stockValuesFolderConnections = {}
 local stockValuesUpdateQueued = false
 local shopPriceOverrideConnections = {}
+local shopLimitedConnections = {}
 
 function invalidateDirectShopCache(shopName)
     local canonicalShopKey = getCanonicalShopKey(shopName)
@@ -6595,6 +6783,58 @@ function watchShopPriceOverrideFlags()
     end
 end
 
+function watchShopLimitedSources()
+    for shopName, config in pairs(SHOP_LIMITED_CONFIG) do
+        local watchedShopName = shopName
+        local function refreshLimitedCatalog()
+            -- Invalidate old delayed callbacks. The rebuilt catalogue schedules
+            -- the new authoritative deadline, if one still exists.
+            for key in pairs(LIMITED_EXPIRY_SCHEDULE) do
+                if string.sub(key, 1, #watchedShopName + 1) == watchedShopName .. ":" then
+                    LIMITED_EXPIRY_SCHEDULE[key] = nil
+                end
+            end
+            scheduleStockValuesUpdate(watchedShopName, 0.08)
+        end
+
+        local limitedModule = getRequiredSharedModule(config.moduleName)
+        local flag = getFastFlagReplica(config.flagName, {}, function(asserts)
+            return asserts.Map(asserts.String, asserts.FiniteNonNegative)
+        end)
+        if not flag and type(limitedModule) == "table" then
+            -- Requiring the native helper registers its LimitedEndTimes flag.
+            flag = getFastFlagReplica(config.flagName)
+        end
+        if flag and not shopLimitedConnections[flag] then
+            local connected = false
+            for _, signalName in ipairs({ "Changed", "Loaded" }) do
+                local ok, connection = pcall(function()
+                    local signal = flag[signalName]
+                    return signal and signal.Connect and connectRunSignal(signal, refreshLimitedCatalog) or nil
+                end)
+                if ok and connection then connected = true end
+            end
+            if connected then shopLimitedConnections[flag] = true end
+        end
+
+        local overrideFolder = ReplicatedStorage:FindFirstChild(config.overrideFolderName)
+        if overrideFolder and not shopLimitedConnections[overrideFolder] then
+            local function watchOverride(valueObject)
+                if valueObject and valueObject:IsA("NumberValue") and not shopLimitedConnections[valueObject] then
+                    shopLimitedConnections[valueObject] = connectRunSignal(valueObject:GetPropertyChangedSignal("Value"), refreshLimitedCatalog) or true
+                end
+            end
+            for _, child in ipairs(overrideFolder:GetChildren()) do watchOverride(child) end
+            connectRunSignal(overrideFolder.ChildAdded, function(child)
+                watchOverride(child)
+                refreshLimitedCatalog()
+            end)
+            connectRunSignal(overrideFolder.ChildRemoved, refreshLimitedCatalog)
+            shopLimitedConnections[overrideFolder] = true
+        end
+    end
+end
+
 function watchStockShopFolder(shopFolder)
     if not shopFolder then return end
     local shopName = shopFolder.Name
@@ -6673,15 +6913,25 @@ end
 
 pcall(function()
     connectRunSignal(ReplicatedStorage.ChildAdded, function(child)
-        if child.Name ~= "StockValues" then return end
-        watchStockValuesFolder(child)
-        for _, shopName in ipairs({ "SeedShop", "GearShop", "CrateShop" }) do
-            scheduleStockValuesUpdate(shopName, 0.15)
+        if child.Name == "StockValues" then
+            watchStockValuesFolder(child)
+            for _, shopName in ipairs({ "SeedShop", "GearShop", "CrateShop" }) do
+                scheduleStockValuesUpdate(shopName, 0.15)
+            end
+            return
+        end
+        for shopName, config in pairs(SHOP_LIMITED_CONFIG) do
+            if child.Name == config.overrideFolderName then
+                watchShopLimitedSources()
+                scheduleStockValuesUpdate(shopName, 0.08)
+                return
+            end
         end
     end)
 end)
 
 watchShopPriceOverrideFlags()
+watchShopLimitedSources()
 
 -- Flags can register a moment after startup. Retrying briefly keeps live price
 -- changes event-driven without adding a permanent polling loop.
@@ -6689,6 +6939,7 @@ safeTaskSpawn(function()
     for _ = 1, 6 do
         if not isCurrentScraperRun() then return end
         watchShopPriceOverrideFlags()
+        watchShopLimitedSources()
         safeTaskWait(2)
     end
 end)
@@ -6703,7 +6954,11 @@ local function getWeatherAttributeChangeMode(attrName)
     if key == "" then return "deep" end
     -- An absolute end time may arrive separately from the state name.  Publish
     -- it promptly, but it does not require rebuilding icon/card indices.
-    if key == "endtime" or key == "endsat" then return "light" end
+    if key == "endtime" or key == "endsat"
+        or string.sub(key, -7) == "playing"
+        or string.sub(key, -7) == "endtime" then
+        return "light"
+    end
     if key == "phaseduration" or key == "duration" or key == "timeleft"
         or key == "remaining" or key == "remainingtime" or key == "timer"
         or key == "countdown"
@@ -6758,9 +7013,9 @@ function scheduleEnvironmentUpdate(delaySeconds, needsDeepInvalidation)
 end
 
 pcall(function()
-    for _, attrName in ipairs({ "ActivePhase", "ActiveWeather", "CurrentWeather", "CurrentPhase", "Phase" }) do
+    for _, attrName in ipairs({ "ActivePhase", "ActiveWeather", "PhaseDuration" }) do
         connectRunSignal(workspace:GetAttributeChangedSignal(attrName), function()
-            scheduleEnvironmentUpdate(0.03)
+            scheduleEnvironmentUpdate(0.03, false)
         end)
     end
 end)
