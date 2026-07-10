@@ -3369,6 +3369,10 @@ local auctionGuiDataCache = nil
 local auctionGuiDataCacheAt = -999
 local auctionDataCache = nil
 local auctionDataCacheAt = -999
+local auctionRelativeRefreshAnchors = {
+    snapshot = { cycleKey = "", refreshAt = 0 },
+    gui = { cycleKey = "", refreshAt = 0 }
+}
 local auctionRefreshProbeToken = 0
 local auctionRefreshProbeActive = false
 local auctionPublishQueued = false
@@ -3723,6 +3727,30 @@ function normalizeAuctionRefreshAt(refreshAt, serverNow)
     return refreshAt > serverNow and refreshAt or 0
 end
 
+function getStableAuctionRelativeRefreshAt(source, cycleKey, duration, serverNow)
+    duration = tonumber(duration) or 0
+    serverNow = math.floor(tonumber(serverNow) or getServerNow())
+    if duration <= 0 then return 0 end
+
+    local anchor = auctionRelativeRefreshAnchors[source]
+    if not anchor then
+        anchor = { cycleKey = "", refreshAt = 0 }
+        auctionRelativeRefreshAnchors[source] = anchor
+    end
+    cycleKey = tostring(cycleKey or "")
+
+    -- A relative GUI/snapshot value is an observation of one fixed deadline,
+    -- not a fresh duration to add on every scrape. Keep it for the whole lot
+    -- cycle, even after it reaches zero; a new lot key starts the next cycle.
+    if cycleKey ~= "" and anchor.cycleKey == cycleKey and anchor.refreshAt > 0 then
+        return anchor.refreshAt
+    end
+
+    anchor.cycleKey = cycleKey
+    anchor.refreshAt = serverNow + math.floor(duration)
+    return anchor.refreshAt
+end
+
 function getAuctionSnapshotRefreshAt(snapshot, serverNow)
     if type(snapshot) ~= "table" then return 0, "unknown" end
     serverNow = math.floor(tonumber(serverNow) or getServerNow())
@@ -3732,10 +3760,18 @@ function getAuctionSnapshotRefreshAt(snapshot, serverNow)
         "auctionRefreshAt", "nextAuctionAt", "nextRollAt", "rollEndsAt"
     }
     for _, key in ipairs(refreshKeys) do
-        local refreshAt = normalizeAuctionRefreshAt(snapshot[key], serverNow)
-        if refreshAt > 0 then
-            return refreshAt, "snapshot-" .. key
+        local rawRefreshAt = tonumber(snapshot[key])
+        if rawRefreshAt and rawRefreshAt > 0 then
+            return normalizeAuctionRefreshAt(rawRefreshAt, serverNow), "snapshot-" .. key
         end
+    end
+
+    local rollWindowUnix = tonumber(snapshot.rollWindowUnix or snapshot.rollWindow or snapshot.startedAt)
+    local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds or snapshot.rollInterval or snapshot.cycleSeconds)
+    local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
+    if rollWindowUnix and rollWindowUnix > 0 and rollIntervalSeconds and rollIntervalSeconds > 0 then
+        local refreshAt = normalizeAuctionRefreshAt(rollWindowUnix + rollIntervalSeconds + timerShiftSeconds, serverNow)
+        return refreshAt, "snapshot-roll-window"
     end
 
     local durationKeys = {
@@ -3745,17 +3781,8 @@ function getAuctionSnapshotRefreshAt(snapshot, serverNow)
     for _, key in ipairs(durationKeys) do
         local duration = tonumber(snapshot[key])
         if duration and duration > 0 then
-            return serverNow + math.floor(duration), "snapshot-" .. key
-        end
-    end
-
-    local rollWindowUnix = tonumber(snapshot.rollWindowUnix or snapshot.rollWindow or snapshot.startedAt)
-    local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds or snapshot.rollInterval or snapshot.cycleSeconds)
-    local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
-    if rollWindowUnix and rollWindowUnix > 0 and rollIntervalSeconds and rollIntervalSeconds > 0 then
-        local refreshAt = normalizeAuctionRefreshAt(rollWindowUnix + rollIntervalSeconds + timerShiftSeconds, serverNow)
-        if refreshAt > 0 then
-            return refreshAt, "snapshot-roll-window"
+            local cycleKey = getAuctionSnapshotLotKey(snapshot)
+            return getStableAuctionRelativeRefreshAt("snapshot", cycleKey, duration, serverNow), "snapshot-" .. key
         end
     end
 
@@ -4704,7 +4731,7 @@ function getAuctionDataFromGui(force)
     local header = frame:FindFirstChild("Header", true)
     local headerTimerText = getAuctionGuiTimerText(header) or ""
     local headerDuration = parseDurationSeconds(headerTimerText)
-    local refreshAt = headerDuration > 0 and (serverNow + headerDuration) or 0
+    local refreshAt = 0
     local refreshSource = headerDuration > 0 and "gui-header" or "unknown"
 
     for _, card in ipairs(scrollingFrame:GetChildren()) do
@@ -4840,6 +4867,10 @@ function getAuctionDataFromGui(force)
     table.sort(lots, function(a, b)
         return tostring(a.lotId or "") < tostring(b.lotId or "")
     end)
+    if headerDuration > 0 then
+        local guiCycleKey = getAuctionSnapshotLotKey({ lots = lots })
+        refreshAt = getStableAuctionRelativeRefreshAt("gui", guiCycleKey, headerDuration, serverNow)
+    end
     refreshAt = normalizeAuctionRefreshAt(refreshAt, serverNow)
     return finish({
         lots = lots,
@@ -5089,15 +5120,19 @@ function getAuctionData()
         end
     end
     local timerShiftSeconds = tonumber(snapshot.timerShiftSeconds) or 0
-    local refreshAt, refreshSource = getAuctionSnapshotRefreshAt(snapshot, serverNow)
-    if refreshAt <= serverNow and rollWindowUnix > 0 and rollIntervalSeconds > 0 then
-        local rollRefreshAt = normalizeAuctionRefreshAt(rollWindowUnix + rollIntervalSeconds + timerShiftSeconds, serverNow)
-        if rollRefreshAt > serverNow then
-            refreshAt = rollRefreshAt
-            refreshSource = "roll-window"
-        end
+    local hasStableRollWindow = rollWindowUnix > 0 and rollIntervalSeconds > 0
+    local refreshAt = 0
+    local refreshSource = "unknown"
+    if hasStableRollWindow then
+        refreshAt = normalizeAuctionRefreshAt(rollWindowUnix + rollIntervalSeconds + timerShiftSeconds, serverNow)
+        refreshSource = "roll-window"
+    else
+        refreshAt, refreshSource = getAuctionSnapshotRefreshAt(snapshot, serverNow)
     end
-    if guiData and tonumber(guiData.refreshAt) then
+    -- The native AuctioneerController calculates its header from
+    -- rollWindowUnix + rollIntervalSeconds + timerShiftSeconds. A GUI duration
+    -- is only a fallback when that cycle anchor is genuinely unavailable.
+    if not hasStableRollWindow and refreshAt <= serverNow and guiData and tonumber(guiData.refreshAt) then
         local guiRefreshAt = normalizeAuctionRefreshAt(guiData.refreshAt, serverNow)
         if guiRefreshAt > serverNow then
             refreshAt = guiRefreshAt
