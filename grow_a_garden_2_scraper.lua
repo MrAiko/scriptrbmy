@@ -3411,7 +3411,10 @@ local originalAuctionFramePosition = nil
 -- minute; this value only gates an occasional RequestSnapshot call.
 local AUCTION_REQUEST_INTERVAL = 3
 local AUCTION_SNAPSHOT_STALE_SECONDS = 90
-local AUCTION_EVENT_HEALTH_INTERVAL = 60
+-- The health loop is only a cheap in-memory check.  A 5-second cadence lets
+-- us recover a missed rollover event quickly without polling the network on
+-- every tick; RequestSnapshot remains throttled separately.
+local AUCTION_EVENT_HEALTH_INTERVAL = 5
 local AUCTION_STARTUP_RETRY_INTERVAL = 2
 local AUCTION_STARTUP_RETRY_COUNT = 20
 local AUCTION_GUI_CACHE_SECONDS = 15
@@ -4248,6 +4251,30 @@ end
 
 function hasAuctionLots(snapshot)
     return getAuctionLotCount(snapshot) > 0
+end
+
+-- Return the deadline encoded by the raw Auctioneer snapshot.  This is kept
+-- separate from getAuctionData(), which intentionally advances an already
+-- passed deadline to a safe future fallback.  The health loop needs the raw
+-- value so it can notice a missed rollover and request a fresh snapshot now.
+function getAuctionRawRollDeadline(snapshot)
+    if type(snapshot) ~= "table" then return 0 end
+    local directKeys = {
+        "refreshAt", "nextRefreshAt", "nextRefreshUnix", "refreshUnix",
+        "auctionRefreshAt", "nextAuctionAt", "nextRollAt", "rollEndsAt"
+    }
+    for _, key in ipairs(directKeys) do
+        local value = tonumber(snapshot[key])
+        if value and value > 0 then return math.floor(value) end
+    end
+
+    local window = tonumber(snapshot.rollWindowUnix or snapshot.rollWindow or snapshot.startedAt) or 0
+    local interval = tonumber(snapshot.rollIntervalSeconds or snapshot.rollInterval or snapshot.cycleSeconds) or 0
+    local shift = tonumber(snapshot.timerShiftSeconds) or 0
+    if window > 0 and interval > 0 then
+        return math.floor(window + interval + shift)
+    end
+    return 0
 end
 
 function getAuctionSnapshotLotKey(snapshot)
@@ -6782,6 +6809,15 @@ safeTaskSpawn(function()
         local snapshotAge = latestAuctionSnapshotAt > 0 and (os.clock() - latestAuctionSnapshotAt) or math.huge
         local eventDriven = auctionSnapshotConnected and auctionStockConnected
         local snapshotStale = not latestAuctionSnapshot or snapshotAge > AUCTION_SNAPSHOT_STALE_SECONDS
+        local serverNow = math.floor(getServerNow())
+        local rawRollDeadline = getAuctionRawRollDeadline(latestAuctionSnapshot)
+        -- If Snapshot was missed exactly at the scheduled roll, keep asking for
+        -- the authoritative state during a short recovery window.  Without
+        -- this, the normal 60-second health poll could leave the old six lots
+        -- visible for an entire extra cycle.
+        local rollDue = rawRollDeadline > 0
+            and serverNow >= rawRollDeadline
+            and (serverNow - rawRollDeadline) <= 120
 
         -- Snapshot/StockUpdate events are authoritative and push changes
         -- immediately.  Poll only as a health fallback when an event is missing
@@ -6789,7 +6825,7 @@ safeTaskSpawn(function()
         if not eventDriven then
             connectAuctionSnapshot()
         end
-        if not eventDriven or snapshotStale then
+        if not eventDriven or snapshotStale or rollDue then
             requestAuctionSnapshot(false)
         end
         safeTaskWait(AUCTION_EVENT_HEALTH_INTERVAL)
