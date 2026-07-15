@@ -116,7 +116,10 @@ local UPDATE_INTERVAL = 180      -- Rare safety refresh; normal updates are even
 local POLL_INTERVAL = 60         -- Lightweight fallback only. Never rebuild every UI/data tree frequently.
 local FRUIT_REQUEST_INTERVAL = 60 -- Fallback remote refresh interval if Snapshot event is missed
 local DEBUG = false             -- Set to true only to diagnose scraper issues
-local ALLOW_GUI_FALLBACK = false -- v185 exposes every tracked value through replicas/attributes/network snapshots.
+-- Network packets remain authoritative, but the Auctioneer UI is a reliable
+-- recovery source when an executor misses the one-shot rollover event.  It is
+-- used only when the packet is missing/stale or contains no live lots.
+local ALLOW_GUI_FALLBACK = true
 local MOBILE_SAFE_MODE = UserInputService and UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 -- MuMu reports itself as touch-only, so headless rendering must be enabled
 -- explicitly.  The visual sweep below is one-shot and property-only: deleting
@@ -624,6 +627,14 @@ function optimizeClient()
 
     local function suspendLocalScript(instance)
         if not instance then return false end
+        -- AuctioneerController owns the game's Snapshot request and rebuilds
+        -- the live cards used by the recovery fallback.  Suspending it can
+        -- disconnect the only post-roll hydration path on some clients.
+        local scriptName = ""
+        pcall(function() scriptName = string.lower(tostring(instance.Name or "")) end)
+        if scriptName == "auctioneercontroller" or string.find(scriptName, "auctioneer", 1, true) then
+            return false
+        end
         local isClientScript = instance:IsA("LocalScript")
         if not isClientScript and instance:IsA("Script") then
             pcall(function()
@@ -3429,6 +3440,8 @@ local auctionRelativeRefreshAnchors = {
 }
 local auctionRefreshProbeToken = 0
 local auctionRefreshProbeActive = false
+local lastAuctionGuiRecoveryAt = -999
+local AUCTION_GUI_RECOVERY_INTERVAL = 20
 local auctionPublishQueued = false
 local AUCTION_PUBLISH_DEBOUNCE_SECONDS = 0.12
 
@@ -5200,6 +5213,30 @@ function getAuctionDataFromGui(force)
     })
 end
 
+function isAuctionGuiDataLive(data)
+    if type(data) ~= "table" or type(data.lots) ~= "table" or #data.lots == 0 then
+        return false
+    end
+    local now = math.floor(getServerNow())
+    for _, lot in ipairs(data.lots) do
+        if type(lot) == "table" then
+            local expiresAt = tonumber(lot.expiresAt) or 0
+            local soldOut = lot.soldOut == true
+            local expired = lot.expired == true or (expiresAt > 0 and expiresAt <= now)
+            if not soldOut and not expired then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function getLiveAuctionGuiRecovery(force)
+    if not ALLOW_GUI_FALLBACK then return nil end
+    local data = getAuctionDataFromGui(force)
+    return isAuctionGuiDataLive(data) and data or nil
+end
+
 function getAuctionData()
     local nowClock = os.clock()
     if auctionDataCache and (nowClock - auctionDataCacheAt) < AUCTION_DATA_CACHE_SECONDS then
@@ -5220,12 +5257,23 @@ function getAuctionData()
     end
     local snapshot = latestAuctionSnapshot
     if type(snapshot) ~= "table" then
-        return finish(ALLOW_GUI_FALLBACK and getAuctionDataFromGui() or nil)
+        return finish(getLiveAuctionGuiRecovery(true))
     end
 
     local rawLots = getAuctionRawLots(snapshot)
     if type(rawLots) ~= "table" then
-        return finish(ALLOW_GUI_FALLBACK and getAuctionDataFromGui() or nil)
+        return finish(getLiveAuctionGuiRecovery(true))
+    end
+
+    local serverNow = math.floor(getServerNow())
+    local rawRollDeadline = getAuctionRawRollDeadline(snapshot)
+    local snapshotRollDue = rawRollDeadline > 0 and serverNow >= rawRollDeadline
+    local snapshotStale = latestAuctionSnapshotAt <= 0
+        or (os.clock() - latestAuctionSnapshotAt) > AUCTION_SNAPSHOT_STALE_SECONDS
+    if ALLOW_GUI_FALLBACK and (snapshotRollDue or snapshotStale) then
+        -- Never republish an old packet after its native roll window. Prefer
+        -- live UI cards until the next authoritative Snapshot arrives.
+        return finish(getLiveAuctionGuiRecovery(true))
     end
 
     -- Snapshot/StockUpdate are authoritative in v185. GUI cards are delayed,
@@ -5426,12 +5474,11 @@ function getAuctionData()
     end)
 
     if #lots == 0 then
-        return finish(ALLOW_GUI_FALLBACK and getAuctionDataFromGui() or nil)
+        return finish(getLiveAuctionGuiRecovery(true))
     end
 
     local rollIntervalSeconds = tonumber(snapshot.rollIntervalSeconds) or 0
     local rollWindowUnix = tonumber(snapshot.rollWindowUnix) or 0
-    local serverNow = math.floor(getServerNow())
     if rollWindowUnix == 0 then
         local maxRolledAt = 0
         for _, lot in ipairs(lots) do
@@ -6811,13 +6858,13 @@ safeTaskSpawn(function()
         local snapshotStale = not latestAuctionSnapshot or snapshotAge > AUCTION_SNAPSHOT_STALE_SECONDS
         local serverNow = math.floor(getServerNow())
         local rawRollDeadline = getAuctionRawRollDeadline(latestAuctionSnapshot)
-        -- If Snapshot was missed exactly at the scheduled roll, keep asking for
-        -- the authoritative state during a short recovery window.  Without
-        -- this, the normal 60-second health poll could leave the old six lots
-        -- visible for an entire extra cycle.
+        -- If Snapshot was missed at the scheduled roll, keep asking for the
+        -- authoritative state. Without this, a single missed event could leave
+        -- the old six lots visible for an entire extra cycle.
         local rollDue = rawRollDeadline > 0
             and serverNow >= rawRollDeadline
             and (serverNow - rawRollDeadline) <= 120
+        local staleRoll = rawRollDeadline > 0 and serverNow >= rawRollDeadline
 
         -- Snapshot/StockUpdate events are authoritative and push changes
         -- immediately.  Poll only as a health fallback when an event is missing
@@ -6827,6 +6874,14 @@ safeTaskSpawn(function()
         end
         if not eventDriven or snapshotStale or rollDue then
             requestAuctionSnapshot(false)
+        end
+        if staleRoll and (os.clock() - lastAuctionGuiRecoveryAt) >= AUCTION_GUI_RECOVERY_INTERVAL then
+            -- Also inspect the live Auction GUI during the recovery window.
+            -- A missed Packet event can leave RequestSnapshot returning the
+            -- previous cycle even though the cards already show the new one.
+            lastAuctionGuiRecoveryAt = os.clock()
+            invalidateAuctionCaches()
+            scheduleAuctionRefreshProbe()
         end
         safeTaskWait(AUCTION_EVENT_HEALTH_INTERVAL)
     end
