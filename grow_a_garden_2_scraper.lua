@@ -5221,7 +5221,14 @@ function getAuctionData()
             if guiHasLots and not guiLot then
                 -- phantom lot: exists in network snapshot but not in the player's GUI
             else
-            local placeholderLot = isDefaultAuctionPlaceholderLot(lot)
+            -- AuctioneerController treats Snapshot.manifest.lots as the
+            -- authoritative initial state (see the game source's
+            -- AuctioneerRequestSnapshot:Fire/applySnapshot path).  The old
+            -- placeholder heuristic (100000 price / stock 16) was copied from
+            -- the GUI template and incorrectly discarded real startup lots
+            -- before the first StockUpdate arrived.  Only GUI fallback data is
+            -- allowed to use that heuristic; network snapshots are trusted.
+            local placeholderLot = false
             local stock = getAuctionStockMapValue(latestAuctionStock, lot, lotId, lotIndex, position, rawIndex)
             local hasLiveStock = stock ~= nil
             if stock == nil and type(snapshot.stock) == "table" then
