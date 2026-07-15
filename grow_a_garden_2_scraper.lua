@@ -1341,6 +1341,25 @@ local wsNextConnectAttemptAt = 0
 -- A short reconnect backoff keeps live shop/weather updates on the socket after
 -- a transient emulator/network hiccup.  Failed sends still have HTTP fallback.
 local WEBSOCKET_RECONNECT_COOLDOWN = 3
+-- WebSocket sends are asynchronous.  Executors may report a successful local
+-- Send() even when the server closes the socket before processing the packet.
+-- Keep one short-lived acknowledgement watchdog for auction rollovers; if the
+-- server does not confirm the compact packet, the normal HTTP publisher retries
+-- the same fresh snapshot without waiting for another game event.
+auctionWsPendingToken = auctionWsPendingToken or 0
+auctionWsAwaitingAckToken = nil
+
+function scheduleAuctionHttpFallback(token)
+    if token == nil then return end
+    safeTaskDelay(4.0, function()
+        if not isCurrentScraperRun() then return end
+        if auctionWsAwaitingAckToken ~= token then return end
+        auctionWsAwaitingAckToken = nil
+        if type(updateAPI) == "function" then
+            pcall(updateAPI, nil)
+        end
+    end)
+end
 
 function getWebSocketClient()
     if wsConnection then return wsConnection end
@@ -1401,6 +1420,7 @@ function getWebSocketClient()
                         print("[Grow a Garden 2 Stocker] WebSocket closed.")
                     end
                     wsConnection = nil
+                    auctionWsAwaitingAckToken = nil
                     wsNextConnectAttemptAt = os.clock() + WEBSOCKET_RECONNECT_COOLDOWN
                     pcall(function()
                         local env = getgenv and getgenv() or nil
@@ -1415,6 +1435,26 @@ function getWebSocketClient()
                 connectRunSignal(onMessage, function(msg)
                     if DEBUG then
                         print("[Grow a Garden 2 Stocker] WebSocket msg: " .. tostring(msg))
+                    end
+                    -- The server acknowledges update-auction packets.  Treat a
+                    -- negative acknowledgement as an immediate HTTP retry and
+                    -- cancel the watchdog on success.
+                    local payload = msg
+                    if type(msg) == "string" and HttpService then
+                        local decodeOk, decoded = pcall(function()
+                            return HttpService:JSONDecode(msg)
+                        end)
+                        if decodeOk then payload = decoded end
+                    end
+                    if type(payload) == "table" and payload.type == "update-auction-response" then
+                        if payload.success == true then
+                            auctionWsAwaitingAckToken = nil
+                        elseif auctionWsAwaitingAckToken ~= nil then
+                            auctionWsAwaitingAckToken = nil
+                            if type(updateAPI) == "function" then
+                                pcall(updateAPI, nil)
+                            end
+                        end
                     end
                 end)
             end
@@ -5240,7 +5280,15 @@ end
 function getAuctionData()
     local nowClock = os.clock()
     if auctionDataCache and (nowClock - auctionDataCacheAt) < AUCTION_DATA_CACHE_SECONDS then
-        return auctionDataCache
+        -- A shop/weather event can call updateAPI in the few seconds around a
+        -- rollover. Never return a cached previous cycle merely because its
+        -- short cache TTL has not elapsed yet; the native controller's deadline
+        -- is authoritative.
+        local cachedDeadline = getAuctionRawRollDeadline(auctionDataCache)
+        if cachedDeadline <= 0 or math.floor(getServerNow()) < cachedDeadline then
+            return auctionDataCache
+        end
+        invalidateAuctionCaches()
     end
     local function finish(data)
         if type(data) == "table" then
@@ -6562,6 +6610,9 @@ function sendAuctionUpdateInstant()
             sendFunc(ws, encoded)
         end)
         if success then
+            auctionWsPendingToken = auctionWsPendingToken + 1
+            auctionWsAwaitingAckToken = auctionWsPendingToken
+            scheduleAuctionHttpFallback(auctionWsAwaitingAckToken)
             if DEBUG then
                 print("[Grow a Garden 2 Stocker] Instant auction update sent via WebSocket!")
             end
@@ -6570,6 +6621,7 @@ function sendAuctionUpdateInstant()
             if DEBUG then
                 warn("[Grow a Garden 2 Stocker] Failed to send instant auction update: " .. tostring(err))
             end
+            auctionWsAwaitingAckToken = nil
             pcall(function() ws:Close() end)
             pcall(function() ws:close() end)
             wsConnection = nil
@@ -6802,6 +6854,10 @@ end)
 pcall(function()
     connectAuctionSnapshot()
     requestAuctionSnapshot(true)
+    -- Do not wait for the next shop/weather event to publish the first auction.
+    -- This probe also reads the live Auction GUI while Packet attributes are
+    -- still propagating, then switches to the authoritative Snapshot path.
+    scheduleAuctionRefreshProbe()
 end)
 
 safeTaskSpawn(function()
@@ -7291,7 +7347,7 @@ safeTaskSpawn(function()
     end
 end)
 
-local loadingScreenBypassApplied = false
+loadingScreenBypassApplied = false
 
 local function bypassLoadingScreen()
     if not BYPASS_LOADING_SCREEN then
