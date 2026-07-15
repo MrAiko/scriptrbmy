@@ -1407,6 +1407,21 @@ function getWebSocketClient()
                     end
                 end)
             end
+
+            -- A socket can finish its handshake after the startup snapshot was
+            -- collected. Re-send the already available auction immediately so
+            -- a successful Lua launch never waits for the next shop update.
+            safeTaskDelay(0.15, function()
+                if not isCurrentScraperRun() or wsConnection ~= ws then return end
+                if type(sendAuctionUpdateInstant) == "function" then
+                    local ok, sent = pcall(sendAuctionUpdateInstant)
+                    if not ok or not sent then
+                        if type(updateAPI) == "function" then pcall(updateAPI, nil) end
+                    end
+                elseif type(updateAPI) == "function" then
+                    pcall(updateAPI, nil)
+                end
+            end)
         else
             wsNextConnectAttemptAt = os.clock() + WEBSOCKET_RECONNECT_COOLDOWN
             warn("[Grow a Garden 2 Stocker] WebSocket connection failed: " .. tostring(ws))
@@ -3968,6 +3983,50 @@ function getAuctionSnapshotRefreshAt(snapshot, serverNow)
     return 0, "unknown"
 end
 
+-- Some clients expose the Auctioneer lots before the header timer and roll
+-- metadata are replicated.  Keep that first snapshot publishable instead of
+-- waiting for the next periodic stock update.  Prefer an authoritative lot
+-- expiry or roll schedule; the bounded startup fallback is replaced by the
+-- next Snapshot event as soon as it arrives.
+function inferAuctionRefreshAt(lots, snapshot, serverNow)
+    if type(lots) ~= "table" then return 0, "unknown" end
+    snapshot = type(snapshot) == "table" and snapshot or {}
+    serverNow = math.floor(tonumber(serverNow) or getServerNow())
+
+    local maxExpiry = 0
+    local maxRolledAt = 0
+    for _, lot in pairs(lots) do
+        if type(lot) == "table" then
+            local expiry = getAuctionLotExpiry(lot)
+            if expiry > maxExpiry then maxExpiry = expiry end
+            local rolledAt = tonumber(lot.rolledAt or lot.startedAt) or 0
+            if rolledAt > maxRolledAt then maxRolledAt = rolledAt end
+        end
+    end
+    if maxExpiry > serverNow then
+        return maxExpiry, "inferred-lot-expiry"
+    end
+
+    local interval = tonumber(snapshot.rollIntervalSeconds or snapshot.rollInterval or snapshot.cycleSeconds) or 0
+    if interval > 0 then
+        local rollWindow = tonumber(snapshot.rollWindowUnix or snapshot.rollWindow or snapshot.startedAt) or maxRolledAt
+        local shift = tonumber(snapshot.timerShiftSeconds) or 0
+        local nextRefresh = rollWindow > 0 and (rollWindow + interval + shift) or (serverNow + interval)
+        local guard = 0
+        while nextRefresh <= serverNow and guard < 120 do
+            nextRefresh = nextRefresh + interval
+            guard = guard + 1
+        end
+        if nextRefresh > serverNow then
+            return math.floor(nextRefresh), "inferred-next-cycle"
+        end
+    end
+
+    -- No timer metadata at all: publish now with a short safety deadline. This
+    -- is intentionally not a long fake auction; the next live event replaces it.
+    return serverNow + 300, "inferred-startup"
+end
+
 function hasAuctionPriceFormula(lot)
     if type(lot) ~= "table" then return false end
     if tonumber(lot.currentPrice or lot.price or lot.cost) then return true end
@@ -5051,6 +5110,9 @@ function getAuctionDataFromGui(force)
         refreshAt = getStableAuctionRelativeRefreshAt("gui", guiCycleKey, headerDuration, serverNow)
     end
     refreshAt = normalizeAuctionRefreshAt(refreshAt, serverNow)
+    if refreshAt <= serverNow then
+        refreshAt, refreshSource = inferAuctionRefreshAt(lots, nil, serverNow)
+    end
     return finish({
         lots = lots,
         refreshAt = refreshAt,
@@ -5319,6 +5381,10 @@ function getAuctionData()
         end
     end
 
+    if refreshAt <= serverNow then
+        refreshAt, refreshSource = inferAuctionRefreshAt(lots, snapshot, serverNow)
+    end
+
 
     return finish({
         lots = lots,
@@ -5326,6 +5392,7 @@ function getAuctionData()
         rollIntervalSeconds = rollIntervalSeconds,
         rollWindowUnix = rollWindowUnix,
         timerShiftSeconds = timerShiftSeconds,
+        cycleKey = snapshot.cycleKey or snapshot.cycleId or snapshot.roundId or snapshot.auctionId,
         refreshAt = refreshAt,
         refreshSource = refreshSource,
         serverNow = serverNow
