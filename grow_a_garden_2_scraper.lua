@@ -3406,11 +3406,14 @@ local auctionGuiAutoHidden = false
 local originalAuctionFramePosition = nil
 -- RequestSnapshot is only a fallback when event delivery is unavailable/stale.
 -- Keep the short value as a remote-call throttle, not a permanent polling rate.
-local AUCTION_REQUEST_INTERVAL = 10
+-- A startup shell is retried quickly so the first auction is visible without
+-- waiting for the next roll.  Normal health polling still runs only every
+-- minute; this value only gates an occasional RequestSnapshot call.
+local AUCTION_REQUEST_INTERVAL = 3
 local AUCTION_SNAPSHOT_STALE_SECONDS = 90
 local AUCTION_EVENT_HEALTH_INTERVAL = 60
 local AUCTION_STARTUP_RETRY_INTERVAL = 2
-local AUCTION_STARTUP_RETRY_COUNT = 8
+local AUCTION_STARTUP_RETRY_COUNT = 20
 local AUCTION_GUI_CACHE_SECONDS = 15
 local AUCTION_DATA_CACHE_SECONDS = 15
 local auctionGuiDataCache = nil
@@ -4195,8 +4198,16 @@ end
 
 function getAuctionRawLots(snapshot)
     if type(snapshot) ~= "table" then return nil end
+    local manifestLots = nil
     if type(snapshot.manifest) == "table" and type(snapshot.manifest.lots) == "table" then
-        return snapshot.manifest.lots
+        manifestLots = snapshot.manifest.lots
+        -- Prefer a populated manifest, but do not let an empty manifest shell
+        -- hide a valid top-level `lots` collection from an executor wrapper.
+        for _, lot in pairs(manifestLots) do
+            if type(lot) == "table" and (lot.lotId or lot.id) then
+                return manifestLots
+            end
+        end
     end
     if type(snapshot.lots) == "table" then
         return snapshot.lots
@@ -4207,7 +4218,7 @@ function getAuctionRawLots(snapshot)
     if type(snapshot.manifest) == "table" then
         local hasIndexedLots = false
         for _, lot in pairs(snapshot.manifest) do
-            if type(lot) == "table" and lot.lotId then
+            if type(lot) == "table" and (lot.lotId or lot.id) then
                 hasIndexedLots = true
                 break
             end
@@ -4216,7 +4227,27 @@ function getAuctionRawLots(snapshot)
             return snapshot.manifest
         end
     end
-    return nil
+    return manifestLots
+end
+
+-- A response such as {manifest = {lots = {}}} is a valid Packet response,
+-- but it is not an auction snapshot that can be published.  The game can
+-- return this short-lived shell while Auctioneer is still hydrating the
+-- player state.  Treat only lots with an actual lotId as ready.
+function getAuctionLotCount(snapshot)
+    local lots = getAuctionRawLots(snapshot)
+    if type(lots) ~= "table" then return 0 end
+    local count = 0
+    for _, lot in pairs(lots) do
+        if type(lot) == "table" and tostring(lot.lotId or lot.id or "") ~= "" then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+function hasAuctionLots(snapshot)
+    return getAuctionLotCount(snapshot) > 0
 end
 
 function getAuctionSnapshotLotKey(snapshot)
@@ -4224,8 +4255,8 @@ function getAuctionSnapshotLotKey(snapshot)
     if type(lots) ~= "table" then return "" end
     local keys = {}
     for _, lot in pairs(lots) do
-        if type(lot) == "table" and lot.lotId then
-            table.insert(keys, normalizeAuctionLotId(lot.lotId))
+        if type(lot) == "table" and (lot.lotId or lot.id) then
+            table.insert(keys, normalizeAuctionLotId(lot.lotId or lot.id))
         end
     end
     table.sort(keys)
@@ -4412,23 +4443,42 @@ function applyAuctionSnapshot(snapshot)
     snapshot = unwrapAuctionSnapshotPayload(snapshot)
     if type(snapshot) ~= "table" then return false end
     invalidateAuctionCaches()
-    local incomingHasLots = type(getAuctionRawLots(snapshot)) == "table"
+    local incomingHasLots = getAuctionLotCount(snapshot) > 0
     if not incomingHasLots and type(snapshot.stock) ~= "table" and not latestAuctionSnapshot then
         return false
     end
     if not incomingHasLots and latestAuctionSnapshot then
+        -- Do not let an empty startup manifest overwrite a real snapshot that
+        -- was received a moment earlier. Merge metadata while preserving the
+        -- previous lot collection and its nested manifest.
         local merged = {}
         for key, value in pairs(latestAuctionSnapshot) do
             merged[key] = value
         end
         for key, value in pairs(snapshot) do
-            merged[key] = value
+            local isLotContainer = key == "lots" or key == "items" or key == "manifest"
+            if not isLotContainer then
+                merged[key] = value
+            elseif type(value) == "table" then
+                local candidate = {}
+                candidate[key] = value
+                -- Empty lots/items/manifest values are hydration shells; keep
+                -- the previous non-empty container instead of erasing it.
+                if getAuctionLotCount(candidate) > 0 then
+                    merged[key] = value
+                end
+            else
+                merged[key] = value
+            end
         end
         snapshot = merged
     end
     local previousLotKey = getAuctionSnapshotLotKey(latestAuctionSnapshot)
     local nextLotKey = getAuctionSnapshotLotKey(snapshot)
-    local lotsChanged = previousLotKey ~= "" and nextLotKey ~= "" and previousLotKey ~= nextLotKey
+    -- A first non-empty snapshot is also a new cycle from the scraper's
+    -- perspective.  Clear any stock-only shell that may have arrived before
+    -- the manifest, otherwise its keys can mask the real lot quantities.
+    local lotsChanged = nextLotKey ~= "" and previousLotKey ~= nextLotKey
     latestAuctionSnapshot = snapshot
     local maxRolledAt = 0
     local rawLots = getAuctionRawLots(snapshot)
@@ -5136,7 +5186,9 @@ function getAuctionData()
         return data
     end
 
-    if not latestAuctionSnapshot or (os.clock() - latestAuctionSnapshotAt) > AUCTION_SNAPSHOT_STALE_SECONDS then
+    if not latestAuctionSnapshot
+        or not hasAuctionLots(latestAuctionSnapshot)
+        or (os.clock() - latestAuctionSnapshotAt) > AUCTION_SNAPSHOT_STALE_SECONDS then
         requestAuctionSnapshot(false)
     end
     local snapshot = latestAuctionSnapshot
@@ -5172,10 +5224,10 @@ function getAuctionData()
     local lots = {}
     local orderedRawLots = {}
     for rawIndex, lot in pairs(rawLots) do
-        if type(lot) == "table" and lot.lotId then
+        if type(lot) == "table" and (lot.lotId or lot.id) then
             table.insert(orderedRawLots, {
                 rawIndex = tonumber(rawIndex),
-                lotId = tostring(lot.lotId),
+                lotId = tostring(lot.lotId or lot.id),
                 lot = lot
             })
         end
@@ -5189,8 +5241,8 @@ function getAuctionData()
 
     for position, raw in ipairs(orderedRawLots) do
             local lot = raw.lot
-            if type(lot) == "table" and lot.lotId then
-            local lotId = normalizeAuctionLotId(lot.lotId)
+            if type(lot) == "table" and (lot.lotId or lot.id) then
+            local lotId = normalizeAuctionLotId(lot.lotId or lot.id)
             local lotIndex = getAuctionLotIndex(lotId)
             local rawIndex = raw.rawIndex
             local guiLot = guiLotsById[lotId]
@@ -5329,16 +5381,14 @@ function getAuctionData()
         end
     end
 
-    -- Filter out useless placeholder lots that have no meaningful data.
-    -- A lot is useless if it has unknown price, no live stock, no timer, and no GUI source.
+    -- Keep authoritative manifest rows even while the first price/stock fields
+    -- are still hydrating.  The old filter discarded every price-unknown row,
+    -- which made the whole auction look empty until the first StockUpdate or
+    -- rollover.  A real lotId is enough to keep the row; the client can show
+    -- a temporary "--" price and replace it on the next packet.
     local filteredLots = {}
     for _, lot in ipairs(lots) do
-        local isUseless = lot.priceUnknown
-            and not lot.soldOut
-            and not lot.expired
-            and lot.dynamicSource ~= "gui"
-            and (lot.expiresAt or 0) <= 0
-        if not isUseless then
+        if type(lot) == "table" and tostring(lot.lotId or "") ~= "" then
             table.insert(filteredLots, lot)
         end
     end
@@ -6682,7 +6732,7 @@ end)
 
 safeTaskSpawn(function()
     for attempt = 1, AUCTION_STARTUP_RETRY_COUNT do
-        if latestAuctionSnapshot and type(getAuctionRawLots(latestAuctionSnapshot)) == "table" then
+        if latestAuctionSnapshot and hasAuctionLots(latestAuctionSnapshot) then
             updateAPI(nil)
             return
         end
@@ -6690,8 +6740,8 @@ safeTaskSpawn(function()
         -- The first request is immediate.  Subsequent retries respect the
         -- endpoint throttle instead of firing many Remote requests during
         -- startup when a RemoteEvent simply has no return value.
-        local gotSnapshot = requestAuctionSnapshot(attempt == 1)
-        if gotSnapshot or (latestAuctionSnapshot and type(getAuctionRawLots(latestAuctionSnapshot)) == "table") then
+        requestAuctionSnapshot(attempt == 1)
+        if hasAuctionLots(latestAuctionSnapshot) then
             writeDebugLog("Auction startup snapshot ready on attempt " .. tostring(attempt))
             updateAPI(nil)
             return
@@ -6720,7 +6770,7 @@ safeTaskSpawn(function()
         if not isCurrentScraperRun() then return end
         safeTaskWait(10)
         connectAuctionSnapshot()
-        if not latestAuctionSnapshot then
+        if not hasAuctionLots(latestAuctionSnapshot) then
             requestAuctionSnapshot(false)
         end
     end
