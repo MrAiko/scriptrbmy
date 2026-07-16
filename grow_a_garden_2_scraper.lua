@@ -5128,8 +5128,7 @@ function getAuctionDataFromGui(force)
                 local cardLotId = normalizeAuctionLotId(card.Name)
                 local cardKey = normalizeName(card.Name)
                 local isAuctionLotCard = string.sub(cardKey, 1, 10) == "lotauction" or string.sub(cardKey, 1, 7) == "auction"
-                local looksLikeTemplateAuctionRow = not isAuctionLotCard
-                    and currentPrice == 1000 and stock == 16 and duration <= 0 and headerDuration <= 0
+                local looksLikeTemplateAuctionRow = not isAuctionLotCard or card.Name == "Template" or card.Name == "DefaultFrame"
                 local looksLikeDefaultDynamic = (currentPrice >= 95000 and currentPrice <= 100000) and stock == 16
                 local rowDynamicTrusted = guiDynamicTrusted and not looksLikeDefaultDynamic
 
@@ -5263,7 +5262,7 @@ function isAuctionGuiDataLive(data)
             local expiresAt = tonumber(lot.expiresAt) or 0
             local soldOut = lot.soldOut == true
             local expired = lot.expired == true or (expiresAt > 0 and expiresAt <= now)
-            if not soldOut and not expired then
+            if expiresAt > now and not soldOut and not expired and not lot.priceUnknown then
                 return true
             end
         end
